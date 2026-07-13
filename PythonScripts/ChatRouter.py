@@ -97,6 +97,22 @@ CLOUD_FALLBACK_ORDER = [
     for part in os.getenv("CLOUD_FALLBACK_ORDER", "claude,gemini").split(",")
     if part.strip()
 ]
+# Master switch: when false, coding never calls Claude/Gemini (local only).
+CLOUD_FALLBACK_ENABLED = os.getenv("CLOUD_FALLBACK_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# When false, keep a "good enough" local answer even if multi-file heuristics look incomplete.
+# Default false — incomplete→cloud was burning Claude credits on simple delete/edit tasks.
+CLOUD_ESCALATE_ON_INCOMPLETE = os.getenv(
+    "CLOUD_ESCALATE_ON_INCOMPLETE", "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+# When false, ignore ESCALATE_CLOUD / ESCALATE_GEMINI markers from the local coder.
+CLOUD_ESCALATE_ON_REQUEST = os.getenv(
+    "CLOUD_ESCALATE_ON_REQUEST", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 LOCAL_CLIENT = OpenAI(base_url=f"{LLAMA_SERVER_URL}/v1", api_key="local")
 
@@ -345,9 +361,22 @@ def _coding_answer_looks_incomplete(user_prompt: str, answer: str) -> bool:
     """
     Heuristic: multi-file CREATE+EDIT asks should produce multiple path-labeled fences.
     Used to fall through to cloud when local clearly collapsed files.
+    Never fires for simple delete/remove-only asks.
     """
     focus = _extract_user_request(user_prompt).lower()
     ans = answer or ""
+
+    # Simple delete/remove: local DELETE markers are enough — do not escalate to cloud.
+    delete_only = bool(
+        re.search(r"\b(delete|remove)\b", focus)
+        and not re.search(
+            r"\b(create|generate|new file|add a (?:page|link)|megaman|about\.html)\b",
+            focus,
+        )
+    )
+    if delete_only:
+        return False
+
     create_words = any(
         w in focus
         for w in (
@@ -591,6 +620,7 @@ def _get_coding_intel(
             f"{packed_prompt}\n\n---\nUse this research context when helpful:\n{web_block}"
         )
 
+    answer = ""
     if server_manager.coder_available():
         try:
             _think(on_progress, "swap_coder", f"Loading coder GGUF ({CODER_MODEL.name})…")
@@ -600,19 +630,41 @@ def _get_coding_intel(
                 user_prompt, on_progress=on_progress, web_block=web_block
             )
             if answer and len(answer.strip()) >= 20:
-                if _local_answer_requests_escalate(answer):
+                wants_escalate = _local_answer_requests_escalate(answer)
+                looks_incomplete = _coding_answer_looks_incomplete(user_prompt, answer)
+                if wants_escalate and CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST:
                     _think(
                         on_progress,
                         "escalate",
                         "Local coder requested cloud escalation; trying cloud…",
                     )
-                elif _coding_answer_looks_incomplete(user_prompt, answer):
+                elif (
+                    looks_incomplete
+                    and CLOUD_FALLBACK_ENABLED
+                    and CLOUD_ESCALATE_ON_INCOMPLETE
+                ):
                     _think(
                         on_progress,
                         "escalate",
                         "Local coder answer looks incomplete for multi-file create/edit; trying cloud…",
                     )
                 else:
+                    if wants_escalate and not (
+                        CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST
+                    ):
+                        _think(
+                            on_progress,
+                            "escalate_skipped",
+                            "Local coder asked to escalate; cloud disabled — keeping local answer.",
+                        )
+                    elif looks_incomplete and not (
+                        CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_INCOMPLETE
+                    ):
+                        _think(
+                            on_progress,
+                            "escalate_skipped",
+                            "Local answer may be incomplete; cloud escalate-on-incomplete is off — keeping local.",
+                        )
                     _think(on_progress, "learn", "Saving local coder answer into coding_lessons…")
                     learn_coding_lesson(
                         _extract_user_request(user_prompt),
@@ -630,6 +682,22 @@ def _get_coding_intel(
             on_progress,
             "fallback",
             f"Coder GGUF missing ({CODER_MODEL.name}); using cloud…",
+        )
+
+    if not CLOUD_FALLBACK_ENABLED:
+        _think(
+            on_progress,
+            "fallback",
+            "Cloud fallback disabled (CLOUD_FALLBACK_ENABLED=false); returning best local answer.",
+        )
+        if answer and len(answer.strip()) >= 20:
+            return answer, "local_coder"
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Local coder unavailable/weak and CLOUD_FALLBACK_ENABLED=false. "
+                "Enable cloud or fix the coder GGUF."
+            ),
         )
 
     answer, provider = _cloud_facts(
@@ -934,11 +1002,14 @@ async def health():
         "local": LLAMA_SERVER_URL,
         "active_role": server_manager.current_role,
         "coder_available": server_manager.coder_available(),
-        "cloud_enabled": bool(GEMINI_CLIENT or CLAUDE_CLIENT),
+        "cloud_enabled": bool(GEMINI_CLIENT or CLAUDE_CLIENT) and CLOUD_FALLBACK_ENABLED,
         "cloud_providers": {
             "claude": CLAUDE_CLIENT is not None,
             "gemini": GEMINI_CLIENT is not None,
             "order": CLOUD_FALLBACK_ORDER,
+            "fallback_enabled": CLOUD_FALLBACK_ENABLED,
+            "escalate_on_incomplete": CLOUD_ESCALATE_ON_INCOMPLETE,
+            "escalate_on_request": CLOUD_ESCALATE_ON_REQUEST,
         },
         "model_voice": LOCAL_VOICE_MODEL,
         "model_coder": LOCAL_CODER_MODEL,
@@ -1163,6 +1234,13 @@ async def route_chat(request: Request):
 
 
 if __name__ == "__main__":
+    logger.info(
+        "Cloud policy: enabled=%s order=%s escalate_incomplete=%s escalate_request=%s",
+        CLOUD_FALLBACK_ENABLED,
+        CLOUD_FALLBACK_ORDER,
+        CLOUD_ESCALATE_ON_INCOMPLETE,
+        CLOUD_ESCALATE_ON_REQUEST,
+    )
     if not server_manager.coder_available():
         logger.warning(
             "Coder model not found yet (%s). Coding routes will use cloud until it exists.",
