@@ -3,6 +3,42 @@
 
 $ErrorActionPreference = "Stop"
 
+# Keep the system awake while ChatRouter runs (screen may still turn off).
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class BlossomKeepAwake {
+    private const uint ES_CONTINUOUS = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED = 0x00000001;
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    public static extern uint SetThreadExecutionState(uint esFlags);
+    public static void Enable() {
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    }
+    public static void Disable() {
+        SetThreadExecutionState(ES_CONTINUOUS);
+    }
+}
+"@ -ErrorAction SilentlyContinue
+
+function Enable-BlossomKeepAwake {
+    try {
+        [BlossomKeepAwake]::Enable()
+        Write-Host "Keep-awake: ON (PC won't sleep until ChatRouter stops)."
+    } catch {
+        Write-Warning "Could not enable keep-awake: $_"
+    }
+}
+
+function Disable-BlossomKeepAwake {
+    try {
+        [BlossomKeepAwake]::Disable()
+        Write-Host "Keep-awake: OFF."
+    } catch {
+        Write-Warning "Could not disable keep-awake: $_"
+    }
+}
+
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ScriptsDir = Join-Path $ProjectRoot "PythonScripts"
 $PidFile = Join-Path $ProjectRoot "Mind\llama-server.pid"
@@ -12,7 +48,7 @@ if (-not $python) {
     Write-Error "python was not found on PATH."
 }
 
-# Surface .env values into this PowerShell process.
+# Surface .env values into this PowerShell process (project .env always wins).
 $EnvFile = Join-Path $ScriptsDir ".env"
 if (Test-Path -LiteralPath $EnvFile) {
     Get-Content -LiteralPath $EnvFile | ForEach-Object {
@@ -21,9 +57,7 @@ if (Test-Path -LiteralPath $EnvFile) {
         $key, $value = $line.Split("=", 2)
         $key = $key.Trim()
         $value = $value.Trim().Trim('"').Trim("'")
-        if ($key -and -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($key))) {
-            return
-        }
+        if (-not $key) { return }
         [Environment]::SetEnvironmentVariable($key, $value, "Process")
         Set-Item -Path "Env:$key" -Value $value
     }
@@ -57,10 +91,13 @@ Write-Host "Point clients at http://${routerHost}:${routerPort}/v1/chat/completi
 Write-Host "(Ctrl+C stops the router and llama-server.)"
 Write-Host ""
 
+Enable-BlossomKeepAwake
+
 Push-Location $ScriptsDir
 try {
     & python (Join-Path $ScriptsDir "ChatRouter.py")
 } finally {
+    Disable-BlossomKeepAwake
     Pop-Location
     if (Test-Path -LiteralPath $PidFile) {
         $llamaPid = (Get-Content -LiteralPath $PidFile -Raw).Trim()

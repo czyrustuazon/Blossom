@@ -34,6 +34,14 @@ from pathlib import Path
 from queue import Queue
 from typing import Any, Callable
 
+from dotenv import load_dotenv
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+# Project .env wins over stale shell / User env (e.g. old CHAT_ROUTER_HOST).
+load_dotenv(SCRIPT_DIR / ".env", override=True)
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -240,6 +248,33 @@ def _message_text(message: Any) -> str:
     return str(content).strip()
 
 
+def _reasoning_text(message: Any) -> str:
+    """Qwen3 / thinking models expose chain-of-thought here (llama-server OpenAI API)."""
+    if isinstance(message, dict):
+        raw = message.get("reasoning_content", "")
+    else:
+        raw = getattr(message, "reasoning_content", "") or ""
+    return str(raw or "").strip()
+
+
+def _emit_model_reasoning(
+    on_progress: ProgressFn | None,
+    message: Any,
+    *,
+    source: str = "local",
+) -> None:
+    reasoning = _reasoning_text(message)
+    if not reasoning:
+        return
+    _think(
+        on_progress,
+        "model_reasoning",
+        reasoning,
+        source=source,
+        label=_label_intel_source(source),
+    )
+
+
 def _think(on_progress: ProgressFn | None, step: str, message: str, **extra: Any) -> dict:
     event = {
         "object": "blossom.thought",
@@ -262,6 +297,22 @@ def _local_completion(messages: list[dict], temperature: float = 0.82) -> dict:
         stream=False,
     )
     return response.model_dump()
+
+
+def _local_completion_with_reasoning(
+    messages: list[dict],
+    *,
+    temperature: float = 0.82,
+    on_progress: ProgressFn | None = None,
+    source: str = "persona",
+) -> dict:
+    final_response = _local_completion(messages, temperature=temperature)
+    _emit_model_reasoning(
+        on_progress,
+        final_response["choices"][0]["message"],
+        source=source,
+    )
+    return final_response
 
 
 def _cloud_system_prompt(purpose: str = "general") -> str:
@@ -523,7 +574,9 @@ def _local_coder_answer(
         temperature=0.2,
         stream=False,
     )
-    return _message_text(response.choices[0].message)
+    msg = response.choices[0].message
+    _emit_model_reasoning(on_progress, msg, source="local_coder")
+    return _message_text(msg)
 
 
 def _get_coding_intel(
@@ -670,7 +723,13 @@ def _persona_wrap(
         )
         return _synthetic_completion(raw_facts)
 
-    return _local_completion(persona_messages, temperature=temperature)
+    final_response = _local_completion(persona_messages, temperature=temperature)
+    _emit_model_reasoning(
+        on_progress,
+        final_response["choices"][0]["message"],
+        source="persona",
+    )
+    return final_response
 
 
 def _label_intel_source(source: str | None) -> str:
@@ -758,7 +817,12 @@ def run_chat_pipeline(
             intel_source = "persona"
             try:
                 _think(progress, "persona", "Answering with local persona…")
-                final_response = _local_completion(persona_messages, temperature=0.82)
+                final_response = _local_completion_with_reasoning(
+                    persona_messages,
+                    temperature=0.82,
+                    on_progress=progress,
+                    source="persona",
+                )
                 local_text = _message_text(final_response["choices"][0]["message"])
                 if len(local_text) < 20 and (GEMINI_CLIENT or CLAUDE_CLIENT):
                     _think(progress, "fallback", "Local answer was thin; enriching via cloud…")
@@ -776,7 +840,12 @@ def run_chat_pipeline(
                         }
                     )
                     _think(progress, "persona", f"Rewriting with {provider} facts…")
-                    final_response = _local_completion(persona_messages, temperature=0.82)
+                    final_response = _local_completion_with_reasoning(
+                        persona_messages,
+                        temperature=0.82,
+                        on_progress=progress,
+                        source="persona",
+                    )
             except Exception as exc:
                 _think(progress, "fallback", f"Japanese local path failed ({exc}); cloud last resort.")
                 raw_facts, provider = _cloud_facts(
@@ -793,7 +862,12 @@ def run_chat_pipeline(
                     }
                 )
                 _think(progress, "persona", f"Rewriting with {provider} facts…")
-                final_response = _local_completion(persona_messages, temperature=0.82)
+                final_response = _local_completion_with_reasoning(
+                    persona_messages,
+                    temperature=0.82,
+                    on_progress=progress,
+                    source="persona",
+                )
         else:
             _think(progress, "route", "Casual chat → persona model.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
@@ -814,7 +888,12 @@ def run_chat_pipeline(
                     }
                 )
             _think(progress, "persona", "Generating companion reply…")
-            final_response = _local_completion(persona_messages, temperature=0.7)
+            final_response = _local_completion_with_reasoning(
+                persona_messages,
+                temperature=0.7,
+                on_progress=progress,
+                source="persona",
+            )
 
     _think(progress, "done", "Pipeline finished.", source=intel_source or "unknown")
     return _finalize_response(
