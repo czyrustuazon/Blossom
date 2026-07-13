@@ -261,9 +261,9 @@ Smoke checks:
 
 ```powershell
 # ChatRouter may be on Tailscale IP — use the host from .env CHAT_ROUTER_HOST
-curl -s http://XXX.XXX.95.26:8081/health
-curl -s "http://XXX.XXX.95.26:8081/v1/memory/coding?q=unused%20file&n=3"
-curl -s http://XXX.XXX.95.26:8081/v1/voices
+curl -s http://XXX.XXX.XXX.XXX:8081/health
+curl -s "http://XXX.XXX.XXX.XXX:8081/v1/memory/coding?q=unused%20file&n=3"
+curl -s http://XXX.XXX.XXX.XXX:8081/v1/voices
 curl -s http://127.0.0.1:8090/health
 ```
 

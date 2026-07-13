@@ -13,7 +13,7 @@ Local-first personal companion: llama.cpp GGUFs + FastAPI ChatRouter (`:8081`) +
 & ".\start-server.ps1"
 ```
 
-Point clients at `http://127.0.0.1:8081/v1/chat/completions`.
+Point clients at `http://127.0.0.1:8081/v1/chat/completions` (or your Tailscale host from `.env` — never commit the real IP; use `XXX.XXX.XXX.XXX` in docs).
 
 ## Clients
 
@@ -27,16 +27,17 @@ Point clients at `http://127.0.0.1:8081/v1/chat/completions`.
 See **[`Voice/README.md`](./Voice/README.md)**.
 
 1. Drop RVC packs under `Voice/characters/<Name>/{Jpn,Eng}/` (`.pth` + `.index`).
-2. Set `VOICE_ENABLED=true` (and usually `VOICE_PYTHON` to a CUDA venv).
-3. In Companion → Personality, pick **Voice pack** (`voice_id`).
-4. `start-server.ps1` launches the Voice service on `:8090`.
+2. Create a CUDA venv for Voice and set `VOICE_PYTHON` (see Voice README).
+3. Set `VOICE_ENABLED=true` in `PythonScripts/.env`.
+4. In Companion → Personality, pick **Voice pack** (`voice_id`).
+5. `start-server.ps1` launches the Voice service on `:8090`.
 
 | Locale | Pipeline |
 |--------|----------|
 | Japanese | Style-Bert-VITS2 → character RVC |
 | English | Edge TTS → character RVC |
 
-Emotion is classified per reply; audio streams as `blossom_audio` after text. Packs are auto-discovered — no path edits in `presets.yaml` per character.
+Emotion is classified per reply (`angry` / `happy` / `sad` / `surprise` / `fear` / `disgust` / `neutral`); `neutral` is speakable. Audio streams as `blossom_audio` after text. Packs are auto-discovered — no path edits in `presets.yaml` per character.
 
 ## Where we’re at
 
