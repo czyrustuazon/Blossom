@@ -44,7 +44,8 @@ load_dotenv(PROJECT_ROOT / ".env", override=True)
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
 from LlamaServerManager import CODER_MODEL, PERSONA_CTX, server_manager
@@ -74,6 +75,20 @@ from WebSearch import (
     format_search_results_for_prompt,
     should_search,
     web_search,
+)
+from VoiceClient import (
+    SPEAK_EMOTIONS,
+    VOICE_DEFER_STREAM,
+    VOICE_ENABLED,
+    VOICE_SERVICE_URL,
+    language_system_nudge,
+    list_voice_packs,
+    maybe_attach_voice,
+    normalize_locale,
+    resolve_audio_path,
+    synthesize_and_attach,
+    voice_service_healthy,
+    voice_system_nudge,
 )
 
 logging.basicConfig(level=logging.INFO, format="[Blossom]: %(message)s")
@@ -224,6 +239,23 @@ async def lifespan(_app: FastAPI):
     logger.info("Bootstrapping persona llama-server...")
     with swap_lock:
         server_manager.ensure("persona")
+    # Compactor needs :11434 — must run after llama is up (not before ChatRouter in start-server.ps1).
+    compact_on_boot = os.getenv("COMPACT_ON_STARTUP", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if compact_on_boot:
+        try:
+            from HistoryCompactor import compact_and_summarize_history
+
+            logger.info("Running history compaction (llama ready)…")
+            await asyncio.get_running_loop().run_in_executor(
+                _executor, compact_and_summarize_history
+            )
+        except Exception:
+            logger.exception("History compaction skipped")
     try:
         yield
     finally:
@@ -234,6 +266,18 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Blossom Chat Router", lifespan=lifespan)
+
+# Local companion UI (Nuxt on :3000). Direct browser calls + CORS preflights.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def is_coding_request(user_prompt: str) -> bool:
@@ -303,6 +347,25 @@ def _think(on_progress: ProgressFn | None, step: str, message: str, **extra: Any
     if on_progress:
         on_progress(event)
     return event
+
+
+def _maybe_language_nudge(messages: list[dict], locale: str) -> list[dict]:
+    messages.append({"role": "system", "content": language_system_nudge(locale)})
+    return messages
+
+
+def _maybe_voice_nudge(messages: list[dict], locale: str = "ja") -> list[dict]:
+    """When voice is on, steer wording for TTS (language-aware)."""
+    if not VOICE_ENABLED:
+        return messages
+    messages.append({"role": "system", "content": voice_system_nudge(locale)})
+    return messages
+
+
+def _apply_chat_mode_nudges(messages: list[dict], locale: str) -> list[dict]:
+    _maybe_language_nudge(messages, locale)
+    _maybe_voice_nudge(messages, locale)
+    return messages
 
 
 def _local_completion(messages: list[dict], temperature: float = 0.82) -> dict:
@@ -713,6 +776,8 @@ def _persona_wrap(
     raw_facts: str,
     kind: str,
     on_progress: ProgressFn | None = None,
+    *,
+    locale: str = "ja",
 ) -> dict:
     focus = _extract_user_request(user_prompt)
     facts_tokens = _approx_tokens(raw_facts)
@@ -769,6 +834,7 @@ def _persona_wrap(
         temperature = 0.55
     else:
         persona_messages = engine.build_chat_messages(user_prompt, history_limit=8)
+        _apply_chat_mode_nudges(persona_messages, locale)
         instruction = (
             "Rewrite the following facts in your natural companion voice. Stay accurate, "
             "avoid canned jokes and emoji spam, and don't sound like a scripted mascot.\n\n"
@@ -832,6 +898,14 @@ def _finalize_response(
     except Exception:
         assistant_text = ""
     if assistant_text:
+        cleaned = engine.break_reply_echo(assistant_text)
+        if cleaned != assistant_text:
+            logger.info("Anti-echo post-pass trimmed sticky opener/closer.")
+            assistant_text = cleaned
+            try:
+                final_response["choices"][0]["message"]["content"] = assistant_text
+            except Exception:
+                pass
         engine._log_message("assistant", assistant_text)
 
     final_response.setdefault("object", "chat.completion")
@@ -844,11 +918,39 @@ def _finalize_response(
     return final_response
 
 
+def _active_voice_id() -> str | None:
+    """Persona voice_id → Voice/characters/<id>/ pack; None lets the voice service use default."""
+    try:
+        persona = engine.get_persona()
+        vid = str(persona.get("voice_id") or "").strip()
+        return vid or None
+    except Exception:
+        return None
+
+
 def run_chat_pipeline(
     last_user_message: str,
     on_progress: ProgressFn | None = None,
-) -> dict:
-    """Synchronous pipeline used by both streaming and non-streaming endpoints."""
+    *,
+    defer_voice: bool | None = None,
+    locale: str = "ja",
+    voice_id: str | None = None,
+) -> tuple[dict, str | None]:
+    """Synchronous pipeline used by both streaming and non-streaming endpoints.
+
+    Returns (final_response, pending_speak_text). When defer_voice is True and
+    TTS is needed, pending_speak_text is set so the caller can synthesize after
+    streaming text to the client.
+    """
+    if defer_voice is None:
+        defer_voice = VOICE_DEFER_STREAM
+    locale = normalize_locale(locale)
+    if voice_id is None:
+        voice_id = _active_voice_id()
+    else:
+        voice_id = str(voice_id).strip() or None
+
+
     thoughts: list[dict] = []
     intel_source: str | None = None
 
@@ -875,13 +977,18 @@ def run_chat_pipeline(
                 label=_label_intel_source(source),
             )
             final_response = _persona_wrap(
-                last_user_message, raw_facts, kind="coding", on_progress=progress
+                last_user_message,
+                raw_facts,
+                kind="coding",
+                on_progress=progress,
+                locale=locale,
             )
         elif japanese:
             _think(progress, "route", "Detected Japanese-study request.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
             server_manager.ensure("persona")
             persona_messages = engine.build_chat_messages(last_user_message)
+            _apply_chat_mode_nudges(persona_messages, locale)
             intel_source = "persona"
             try:
                 _think(progress, "persona", "Answering with local persona…")
@@ -942,6 +1049,7 @@ def run_chat_pipeline(
             server_manager.ensure("persona")
             intel_source = "persona"
             persona_messages = engine.build_chat_messages(last_user_message)
+            _apply_chat_mode_nudges(persona_messages, locale)
             web_block = _gather_web_context(
                 last_user_message, coding=False, on_progress=progress
             )
@@ -964,9 +1072,73 @@ def run_chat_pipeline(
             )
 
     _think(progress, "done", "Pipeline finished.", source=intel_source or "unknown")
-    return _finalize_response(
+    # One-shot rewrite if the draft is a near-copy of a recent assistant reply
+    # (classic small-model habit: swap one noun into an old template).
+    try:
+        draft = _message_text(final_response["choices"][0]["message"])
+    except Exception:
+        draft = ""
+    if draft and engine.reply_looks_like_remix(draft):
+        _think(
+            progress,
+            "anti_echo",
+            "Draft remixed an older reply — rewriting fresh…",
+        )
+        try:
+            repair = _local_completion_with_reasoning(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are rewriting a bad companion draft. The draft recycled an older "
+                            "reply (same structure/phrases with a noun swap). Write a COMPLETELY "
+                            "NEW in-character reply that answers the user's latest message. "
+                            "Do not reuse the draft's sentences, closings, or template. "
+                            "Reply with only the new message text."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"User's latest message:\n{last_user_message}\n\n"
+                            f"Bad draft (do not reuse):\n{draft}\n\n"
+                            "Fresh reply:"
+                        ),
+                    },
+                ],
+                temperature=0.9,
+                on_progress=progress,
+                source="persona",
+            )
+            repaired = _message_text(repair["choices"][0]["message"]).strip()
+            if repaired and not engine.reply_looks_like_remix(repaired, threshold=0.58):
+                final_response = repair
+            elif repaired and len(repaired) > 20:
+                # Prefer any coherent rewrite over an obvious template remix.
+                final_response = repair
+        except Exception:
+            logger.exception("Anti-echo rewrite failed; keeping original draft")
+
+    final_response = _finalize_response(
         final_response, thoughts, intel_source=intel_source
     )
+    if VOICE_ENABLED and not coding and not defer_voice:
+        # Sync path may still use LLM emotion mode; ensure persona is loaded.
+        try:
+            server_manager.ensure("persona")
+        except Exception:
+            logger.exception("Could not ensure persona for voice emotion classify")
+    final_response, pending_speak = maybe_attach_voice(
+        final_response,
+        skip_voice=coding,
+        complete_fn=_local_completion,
+        message_text_fn=_message_text,
+        on_progress=progress,
+        defer_speak=bool(defer_voice and VOICE_ENABLED and not coding),
+        locale=locale,
+        voice_id=voice_id,
+    )
+    return final_response, pending_speak
 
 
 def _openai_content_chunk(text: str, chunk_id: str) -> dict:
@@ -1021,7 +1193,147 @@ async def health():
         },
         "supports_thoughts": True,
         "supports_memory_write": True,
+        "supports_persona": True,
+        "supports_voice": VOICE_ENABLED,
+        "voice": {
+            "enabled": VOICE_ENABLED,
+            "service_url": VOICE_SERVICE_URL if VOICE_ENABLED else None,
+            "service_ok": voice_service_healthy() if VOICE_ENABLED else False,
+        },
     }
+
+
+@app.get("/v1/voices")
+async def get_voices():
+    """List discovered Voice/characters/<id> packs (proxied from the voice service)."""
+    if not VOICE_ENABLED:
+        return {"ok": False, "voices": [], "default_voice": None, "enabled": False}
+    body = await asyncio.get_running_loop().run_in_executor(_executor, list_voice_packs)
+    body = dict(body) if isinstance(body, dict) else {}
+    body.setdefault("ok", False)
+    body.setdefault("voices", [])
+    body["enabled"] = True
+    return body
+
+
+@app.get("/v1/audio/{audio_id}")
+async def get_audio(audio_id: str):
+    """Serve a cached WAV synthesized for an assistant reply."""
+    path = resolve_audio_path(audio_id)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Audio not found")
+    return FileResponse(
+        path,
+        media_type="audio/wav",
+        filename=f"{audio_id}.wav",
+    )
+
+
+@app.get("/v1/persona")
+async def get_persona():
+    """Active companion personality + catalog of all slots."""
+    try:
+        bundle = engine.get_persona_bundle()
+        return {"ok": True, **bundle}
+    except Exception as exc:
+        logger.exception("Failed to load persona")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.put("/v1/persona")
+async def put_persona(request: Request):
+    """Update a personality slot (defaults to the active one)."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    patch = body.get("persona") if isinstance(body.get("persona"), dict) else body
+    if not isinstance(patch, dict):
+        raise HTTPException(status_code=400, detail="Expected persona object")
+    persona_id = body.get("id") or patch.get("id")
+
+    try:
+        persona = await asyncio.get_running_loop().run_in_executor(
+            _executor,
+            lambda: engine.update_persona(patch, persona_id=persona_id),
+        )
+        bundle = engine.get_persona_bundle()
+        return {"ok": True, "persona": persona, **{k: bundle[k] for k in ("active_id", "personas")}}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to save persona")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/v1/personas")
+async def list_personas():
+    try:
+        return {"ok": True, "personas": engine.list_personas(), "active_id": engine.get_persona_bundle()["active_id"]}
+    except Exception as exc:
+        logger.exception("Failed to list personas")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/v1/personas")
+async def create_persona(request: Request):
+    """
+    Create a new personality slot.
+    Body: { "companion_name": str, "copy_from_active": bool, "activate": bool }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    name = str((body or {}).get("companion_name") or "New companion").strip()
+    copy_from = bool((body or {}).get("copy_from_active"))
+    activate = bool((body or {}).get("activate"))
+
+    def _create():
+        created = engine.create_persona(
+            companion_name=name, copy_from_active=copy_from
+        )
+        if activate:
+            return engine.activate_persona(created["id"])
+        return engine.get_persona_bundle()
+
+    try:
+        bundle = await asyncio.get_running_loop().run_in_executor(_executor, _create)
+        return {"ok": True, **bundle}
+    except Exception as exc:
+        logger.exception("Failed to create persona")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/v1/personas/{persona_id}/activate")
+async def activate_persona(persona_id: str):
+    try:
+        bundle = await asyncio.get_running_loop().run_in_executor(
+            _executor, lambda: engine.activate_persona(persona_id)
+        )
+        return {"ok": True, **bundle}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to activate persona")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.delete("/v1/personas/{persona_id}")
+async def delete_persona(persona_id: str):
+    try:
+        bundle = await asyncio.get_running_loop().run_in_executor(
+            _executor, lambda: engine.delete_persona(persona_id)
+        )
+        return {"ok": True, **bundle}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to delete persona")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/memory/coding")
@@ -1110,11 +1422,25 @@ async def route_chat(request: Request):
         raise HTTPException(status_code=400, detail="No user message found")
 
     want_stream = bool(body.get("stream"))
+    locale = normalize_locale(
+        body.get("blossom_locale")
+        or body.get("locale")
+        or body.get("language")
+    )
 
     if not want_stream:
         try:
+            def _run_sync():
+                final, _pending = run_chat_pipeline(
+                    last_user_message,
+                    None,
+                    defer_voice=False,
+                    locale=locale,
+                )
+                return final
+
             return await asyncio.get_running_loop().run_in_executor(
-                _executor, run_chat_pipeline, last_user_message, None
+                _executor, _run_sync
             )
         except HTTPException:
             raise
@@ -1130,8 +1456,62 @@ async def route_chat(request: Request):
 
     def worker() -> None:
         try:
-            final = run_chat_pipeline(last_user_message, on_progress=on_progress)
+            final, pending_speak = run_chat_pipeline(
+                last_user_message,
+                on_progress=on_progress,
+                defer_voice=VOICE_DEFER_STREAM,
+                locale=locale,
+            )
+            # Stream text first; keep SSE open until TTS finishes (stop comes after audio).
             queue.put(("final", final))
+            emotion = str(final.get("blossom_emotion") or "")
+            if pending_speak:
+                logger.info(
+                    "voice: synthesizing emotion=%s chars=%s locale=%s",
+                    emotion,
+                    len(pending_speak),
+                    locale,
+                )
+                updated = synthesize_and_attach(
+                    final,
+                    pending_speak,
+                    locale=locale,
+                    voice_id=_active_voice_id(),
+                    complete_fn=_local_completion,
+                    message_text_fn=_message_text,
+                    on_progress=on_progress,
+                )
+                audio_url = updated.get("blossom_audio_url")
+                if audio_url:
+                    logger.info("voice: ready %s", audio_url)
+                    queue.put(
+                        (
+                            "audio",
+                            {
+                                "audio_url": audio_url,
+                                "emotion": updated.get("blossom_emotion"),
+                            },
+                        )
+                    )
+                else:
+                    logger.warning("voice: synthesize failed emotion=%s", emotion)
+                    queue.put(
+                        (
+                            "audio",
+                            {
+                                "audio_url": None,
+                                "emotion": updated.get("blossom_emotion") or emotion,
+                                "failed": True,
+                            },
+                        )
+                    )
+            else:
+                logger.info(
+                    "voice: skip emotion=%s enabled=%s",
+                    emotion or "(none)",
+                    VOICE_ENABLED,
+                )
+            queue.put(("stop", None))
         except HTTPException as exc:
             queue.put(("error", {"status_code": exc.status_code, "detail": exc.detail}))
         except Exception as exc:
@@ -1170,7 +1550,6 @@ async def route_chat(request: Request):
                         )
                         + "\n\n"
                     )
-                # Also emit the full thought list once for clients that missed mid-flight
                 yield (
                     "data: "
                     + json.dumps(
@@ -1184,8 +1563,56 @@ async def route_chat(request: Request):
                     )
                     + "\n\n"
                 )
+                # Emotion chip can show before Play is ready — only for speakable emotions.
+                emotion = payload.get("blossom_emotion")
+                emotion_l = str(emotion or "").strip().lower()
+                if (
+                    emotion_l in SPEAK_EMOTIONS
+                    and not payload.get("blossom_audio_url")
+                ):
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "object": "blossom.audio",
+                                "audio_url": None,
+                                "emotion": emotion_l,
+                                "pending": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                elif emotion_l:
+                    # Non-speakable label only (should be rare now).
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "object": "blossom.audio",
+                                "audio_url": None,
+                                "emotion": emotion_l,
+                                "pending": False,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                audio_url = payload.get("blossom_audio_url")
+                if audio_url:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "object": "blossom.audio",
+                                "audio_url": audio_url,
+                                "emotion": emotion,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
                 if text:
-                    # Stream content in small slices for smoother UI
                     step = 48
                     for i in range(0, len(text), step):
                         piece = text[i : i + step]
@@ -1198,12 +1625,35 @@ async def route_chat(request: Request):
                             + "\n\n"
                         )
                         await asyncio.sleep(0)
+                # Do not send stop here — worker emits "stop" after TTS so the
+                # client keeps the SSE open for blossom.audio.
+            elif kind == "stop":
                 yield (
                     "data: "
                     + json.dumps(_openai_stop_chunk(chunk_id), ensure_ascii=False)
                     + "\n\n"
                 )
-                yield "data: [DONE]\n\n"
+            elif kind == "audio":
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "object": "blossom.audio",
+                            "audio_url": payload.get("audio_url"),
+                            "emotion": payload.get("emotion"),
+                            "failed": bool(payload.get("failed")),
+                            "pending": bool(
+                                payload.get("pending")
+                                or (
+                                    not payload.get("audio_url")
+                                    and not payload.get("failed")
+                                )
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
             elif kind == "error":
                 yield (
                     "data: "
@@ -1217,9 +1667,15 @@ async def route_chat(request: Request):
                     )
                     + "\n\n"
                 )
+                yield (
+                    "data: "
+                    + json.dumps(_openai_stop_chunk(chunk_id), ensure_ascii=False)
+                    + "\n\n"
+                )
                 yield "data: [DONE]\n\n"
                 break
             elif kind == "end":
+                yield "data: [DONE]\n\n"
                 break
 
     return StreamingResponse(
@@ -1231,7 +1687,6 @@ async def route_chat(request: Request):
             "X-Blossom-Thoughts": "1",
         },
     )
-
 
 if __name__ == "__main__":
     logger.info(

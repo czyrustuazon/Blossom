@@ -1,0 +1,83 @@
+# Shared voice knobs (packs live under Voice/characters/<id>/{Jpn,Eng}/).
+# Set default_voice to a folder name, or leave blank to use the first discovered pack.
+# Persona profiles select a pack via voice_id (Companion settings).
+
+device: cuda:0
+
+# Folder name under Voice/characters/ used when speak has no voice_id
+default_voice: Haruhi
+
+shared:
+  style_weight: 2.5
+  sdp_ratio: 0.6
+  index_rate: 0.2
+  protect: 0.4
+  f0method: rmvpe
+
+emotions:
+  # pitch = JA RVC f0; pitch_en = EN RVC f0 
+  angry:
+    style: Angry
+    pitch: 3
+    pitch_en: 7
+    edge_rate: "+18%"
+    edge_pitch: "+4Hz"
+  happy:
+    style: Happy
+    pitch: -3
+    pitch_en: 7
+    edge_rate: "+15%"
+    edge_pitch: "+6Hz"
+  sad:
+    style: Sad
+    pitch: 0
+    pitch_en: 3
+    edge_rate: "+0%"
+    edge_pitch: "+1Hz"
+  surprise:
+    style: Surprise
+    pitch: 1
+    pitch_en: 6
+    edge_rate: "+18%"
+    edge_pitch: "+8Hz"
+  fear:
+    style: Fear
+    pitch: 0
+    pitch_en: 4
+    edge_rate: "+2%"
+    edge_pitch: "+3Hz"
+  disgust:
+    style: Disgust
+    pitch: 1
+    pitch_en: 4
+    edge_rate: "+5%"
+    edge_pitch: "+2Hz"
+  # Calm / unmatched replies — still spoken (mid register, flat Edge prosody)
+  neutral:
+    style: Neutral
+    pitch: 0
+    pitch_en: 4
+    edge_rate: "+0%"
+    edge_pitch: "+0Hz"
+
+english:
+  # Bright/youthful Edge base (Emma had good intonation but adult weight)
+  voice: en-US-AvaNeural
+  # Lower index = less mature RVC weight from the Eng pack
+  index_rate: 0.12
+  protect: 0.4
+  # Extra semitones on all EN emotions
+  pitch_offset: 1
+  # Faster pitch extractor for EN RVC (rmvpe = quality, pm = speed)
+  f0method: pm
+
+sbv2:
+  repo: litagin/style_bert_vits2_jvnv
+  files:
+    - jvnv-F1-jp/jvnv-F1-jp_e160_s14000.safetensors
+    - jvnv-F1-jp/config.json
+    - jvnv-F1-jp/style_vectors.npy
+  bert_model: ku-nlp/deberta-v2-large-japanese-char-wwm
+
+rvc:
+  version: v2

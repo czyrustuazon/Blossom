@@ -46,9 +46,23 @@ LLAMA_PORT = int(os.getenv("LLAMA_SERVER_PORT", "11434"))
 PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "16384"))
 CODER_CTX = int(os.getenv("CODER_CTX_SIZE", "16384"))
 GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
+# Persona chat: off = much faster (no long CoT). Coder can keep thinking.
+PERSONA_REASONING = os.getenv("PERSONA_REASONING", "off").strip().lower()
+CODER_REASONING = os.getenv("CODER_REASONING", "auto").strip().lower()
+FLASH_ATTN = os.getenv("LLAMA_FLASH_ATTN", "on").strip().lower()
 HEALTH_URL = f"{LLAMA_SERVER_URL.rstrip('/')}/health"
 PID_FILE = PROJECT_ROOT / "Mind" / "llama-server.pid"
 ROLE_FILE = PROJECT_ROOT / "Mind" / "llama-server.role"
+
+
+def _normalize_reasoning(value: str) -> str:
+    if value in {"on", "off", "auto"}:
+        return value
+    if value in {"0", "false", "no", "disable", "disabled"}:
+        return "off"
+    if value in {"1", "true", "yes", "enable", "enabled"}:
+        return "on"
+    return "auto"
 
 
 class LlamaServerManager:
@@ -112,13 +126,27 @@ class LlamaServerManager:
             str(LLAMA_PORT),
             "--host",
             "127.0.0.1",
+            "--jinja",
         ]
-        if role == "coder":
-            args.append("--jinja")
+        fa = FLASH_ATTN if FLASH_ATTN in {"on", "off", "auto"} else "auto"
+        args.extend(["--flash-attn", fa])
+
+        reasoning = _normalize_reasoning(
+            PERSONA_REASONING if role == "persona" else CODER_REASONING
+        )
+        args.extend(["--reasoning", reasoning])
+        if reasoning == "off":
+            args.extend(["--reasoning-budget", "0"])
 
         log_path = mind_dir / f"llama-server-{role}.log"
         log_file = open(log_path, "w", encoding="utf-8", errors="replace")
-        logger.info("Starting llama-server role=%s model=%s", role, model_path.name)
+        logger.info(
+            "Starting llama-server role=%s model=%s reasoning=%s flash_attn=%s",
+            role,
+            model_path.name,
+            reasoning,
+            fa,
+        )
         self.process = subprocess.Popen(
             args,
             cwd=str(RUNTIME_DIR),

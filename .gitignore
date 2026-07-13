@@ -19,16 +19,37 @@ venv/
 # Local mind / runtime state
 Mind/chromadb/
 Mind/backups/
+Mind/audio/
 Mind/CompanionMind.db
 Mind/*.db
 Mind/llama-server.pid
 Mind/llama-server.role
-Mind/llama-server-*.log
+
+# Logs
+*.log
 
 # Large local binaries / weights (download separately)
 Brains/models/
 Brains/runtime/
 *.gguf
+
+# Voice service — track code; ignore local weights / runtime
+# (junctions/symlinks need patterns without a trailing slash)
+Voice/.venv
+Voice/.venv/
+Voice/.venv/**
+Voice/model_assets
+Voice/model_assets/
+Voice/model_assets/**
+Voice/characters/**
+!Voice/characters/README.md
+Voice/__pycache__/
+Voice/*.wav
+Voice/*.mp3
+Voice/**/*.pth
+Voice/**/*.index
+Voice/**/*.safetensors
+Voice/**/*.npy
 
 # OS / editor
 .DS_Store

@@ -38,8 +38,12 @@ def compact_and_summarize_history(keep_last_n=50):
         return False
 
     rows_to_process = total_rows - keep_last_n
+    cursor.execute("PRAGMA table_info(chat_logs)")
+    columns = {row["name"] for row in cursor.fetchall()}
+    has_created_at = "created_at" in columns
+    select_cols = "id, role, content, created_at" if has_created_at else "id, role, content"
     cursor.execute(
-        "SELECT id, role, content, created_at FROM chat_logs ORDER BY id ASC LIMIT ?",
+        f"SELECT {select_cols} FROM chat_logs ORDER BY id ASC LIMIT ?",
         (rows_to_process,),
     )
     stale_rows = cursor.fetchall()
@@ -54,9 +58,12 @@ def compact_and_summarize_history(keep_last_n=50):
     transcript_segments = []
     for row in stale_rows:
         speaker = "User" if row["role"] == "user" else "Companion"
-        transcript_segments.append(
-            f"[{row['created_at']}] {speaker}: {row['content']}"
-        )
+        if has_created_at:
+            transcript_segments.append(
+                f"[{row['created_at']}] {speaker}: {row['content']}"
+            )
+        else:
+            transcript_segments.append(f"{speaker}: {row['content']}")
     raw_transcript_block = "\n".join(transcript_segments)
 
     compaction_system_instruction = (
@@ -81,13 +88,16 @@ def compact_and_summarize_history(keep_last_n=50):
             rows_to_process,
             CHAT_COMPLETIONS_URL,
         )
-        compiled_memory_text = chat_completion(messages, temperature=0.2, timeout=60.0)
+        compiled_memory_text = chat_completion(messages, temperature=0.2, timeout=180.0)
         if not compiled_memory_text:
             raise ValueError("Empty compaction response from llama-server")
     except Exception as e:
         logger.error(
-            "LLM compilation request timed out or failed: %s. Aborting compaction to save logs.",
+            "LLM compilation request timed out or failed: %s. "
+            "Aborting compaction to save logs. "
+            "(Needs llama-server on %s — run via ChatRouter startup, not before it.)",
             e,
+            CHAT_COMPLETIONS_URL,
         )
         return False
 
