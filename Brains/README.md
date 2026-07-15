@@ -10,24 +10,55 @@ Cloud-only mode is possible if you set Claude/Gemini keys and skip local GGUFs, 
 
 ```
 Brains/
+  add-model.ps1                 # download any GGUF into models/
+  model-presets.json            # known HF repos (DeepSeek, etc.)
   runtime/
-    llama-server.exe          # required
-    *.dll                     # CUDA / VC runtime deps shipped with the build
+    llama-server.exe            # required
+    *.dll                       # CUDA / VC runtime deps shipped with the build
   models/
     conversational/
-      Qwen3-8B-Q4_K_M.gguf    # default persona / voice model
+      Qwen3-8B-Q4_K_M.gguf      # default persona / voice model
     coding/
-      Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf   # default local coder
+      Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf   # default primary coder
+      DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf  # optional second coder
 ```
 
-Defaults come from `PythonScripts/MemoryUpdater.py` and `LlamaServerManager.py`. Override paths in `PythonScripts/.env`:
+Paths in `PythonScripts/.env` can be **absolute** or **relative to `Brains/models/`**:
 
 ```env
-PERSONA_MODEL_PATH=C:\path\to\your-persona.gguf
-CODER_MODEL_PATH=C:\path\to\your-coder.gguf
-LOCAL_VOICE_MODEL=Qwen3-8B-Q4_K_M.gguf
-LOCAL_CODER_MODEL=Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+PERSONA_MODEL_PATH=conversational/Qwen3-8B-Q4_K_M.gguf
+CODER_MODEL_PATH=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+
+# Agnostic multi-coder ladder (tried in order before cloud when uncertain):
+CODER_MODELS=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf,coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
+
+# Or just primary + one alt (same idea):
+# CODER_ALT_MODEL_PATH=coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
 ```
+
+`CODER_MODELS` wins when set. Otherwise Blossom uses `CODER_MODEL_PATH` then optional `CODER_ALT_MODEL_PATH`.
+
+---
+
+## Add any local LLM (recommended)
+
+From this folder (or repo root):
+
+```powershell
+# List known presets
+.\add-model.ps1 -ListPresets
+
+# Download DeepSeek as second coder (~10GB)
+.\add-model.ps1 -Preset deepseek-coder-v2-lite
+
+# Or any GGUF of your choice
+.\add-model.ps1 -Role coding -Repo "bartowski/SomeModel-GGUF" -File "SomeModel-Q4_K_M.gguf"
+.\add-model.ps1 -Role conversational -Repo "owner/Chat-GGUF" -File "Chat-Q4_K_M.gguf"
+```
+
+The script prints the `.env` line to add. Then restart `start-server.ps1`.
+
+Requires `pip install huggingface_hub` (also listed in `PythonScripts/requirements.txt`).
 
 ---
 
@@ -53,25 +84,27 @@ You need **GGUF** files (not raw Hugging Face safetensors).
 
 ### Persona (required for local casual chat)
 
-1. Create `Brains/models/conversational/`
-2. Download a Q4_K_M (or similar) GGUF for your chat model — default name:
+1. Create `Brains/models/conversational/` (or use `add-model.ps1 -Role conversational …`)
+2. Download a Q4_K_M (or similar) GGUF — default name:
    - `Qwen3-8B-Q4_K_M.gguf`
 3. Place it at:
    - `Brains/models/conversational/Qwen3-8B-Q4_K_M.gguf`
 
 Hugging Face search tip: look for repos with **GGUF** in the name (e.g. community Quants of Qwen3-8B).
 
-### Coder (optional but recommended)
+### Coders (optional but recommended)
 
-1. Create `Brains/models/coding/`
-2. Download the coding GGUF — default name:
-   - `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
-3. Place it at:
-   - `Brains/models/coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
+Primary defaults to:
 
-If the coder file is missing, ChatRouter skips the local coder and falls through to Claude/Gemini (when keys are set).
+- `Brains/models/coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
 
-**VRAM note:** persona (~8B) and coder (~30B) are **hot-swapped** — only one loads at a time. A single high-VRAM GPU is assumed.
+Add DeepSeek (or anything else) with `add-model.ps1`, then set `CODER_MODELS` / `CODER_ALT_MODEL_PATH`.
+
+When coding is uncertain (weak answer, `ESCALATE_CLOUD`, incomplete multi-file heuristics), Blossom tries the **next local coder** before Claude/Gemini.
+
+If no coding GGUF is present, ChatRouter skips local coders and falls through to cloud (when keys are set).
+
+**VRAM note:** persona and coder GGUFs are **hot-swapped** — only one loads at a time. Switching to an alt coder reloads llama-server (seconds). A single high-VRAM GPU is assumed.
 
 ---
 
@@ -95,7 +128,10 @@ From the repo root:
 & ".\start-server.ps1"
 ```
 
-Then open `http://127.0.0.1:8081/health`. You should see `coder_available` true/false depending on whether the coding GGUF is present.
+Then open `http://127.0.0.1:8081/health`. Check:
+
+- `coder_available`
+- `coder_ladder` / `coder_ladder_available`
 
 Point clients (including Blossom Assistant) at:
 
@@ -110,7 +146,8 @@ Point clients (including Blossom Assistant) at:
 | `llama-server.exe not found` | Runtime not extracted into `Brains/runtime/` |
 | Exit code `-1073741515` / missing DLL | Incomplete runtime folder; restore DLLs next to the exe |
 | Wrong GPU / CPU-only | Need CUDA 12 Windows build, not Vulkan/CPU-only or CUDA 13 mismatch |
-| Coder always “cloud” | Coding GGUF missing or `CODER_MODEL_PATH` wrong |
+| Coder always “cloud” | Coding GGUF missing or `CODER_MODEL_PATH` / `CODER_MODELS` wrong |
+| Alt coder never tried | File missing, or not listed in `CODER_MODELS` / `CODER_ALT_MODEL_PATH` |
 | Out of memory / slow load | Ctx size / GPU layers in `.env` (`PERSONA_CTX_SIZE`, `CODER_CTX_SIZE`, `LLAMA_N_GPU_LAYERS`) |
 
 ---
@@ -121,4 +158,4 @@ Point clients (including Blossom Assistant) at:
 - `Brains/runtime/**` (binaries + DLLs)
 - `Mind/chromadb/`, `Mind/*.db` (personal memory)
 
-This `README.md` is tracked so clone → read → download is enough to rebuild `Brains/`.
+This `README.md`, `add-model.ps1`, and `model-presets.json` are tracked so clone → download → env is enough to rebuild `Brains/`.

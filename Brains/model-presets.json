@@ -1,0 +1,9 @@
+{
+  "deepseek-coder-v2-lite": {
+    "role": "coding",
+    "repo": "bartowski/DeepSeek-Coder-V2-Lite-Instruct-GGUF",
+    "file": "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
+    "env_key": "CODER_ALT_MODEL_PATH",
+    "notes": "Second local coder (tried after primary when uncertain). ~10GB GGUF."
+  }
+}

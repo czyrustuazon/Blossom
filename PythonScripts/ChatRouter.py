@@ -4,12 +4,16 @@ OpenAI-compatible chat router with local-first intelligence.
 Flow:
   casual   -> persona llama-server
               (+ optional web search → web_knowledge Chroma when triggered)
-  coding   -> hot-swap to local coder (+ coding_lessons + web_knowledge RAG)
+  coding   -> hot-swap through local coder ladder (CODER_MODELS / CODER_ALT)
+              (+ coding_lessons + web_knowledge RAG)
               -> live web search (DuckDuckGo/Brave/Serper/Bing) when enabled
-              -> Claude/Gemini only if local coder fails (CLOUD_FALLBACK_ORDER)
+              -> Claude/Gemini only if local coders fail (CLOUD_FALLBACK_ORDER)
               -> learn useful answers into coding_lessons / web_knowledge
               -> hot-swap back to persona for voice rewrite
-  japanese -> persona first; cloud last resort for raw facts, then voice
+  japanese -> persona first (+ language_lessons RAG); cloud last resort
+              -> correctness feedback (thumbs) may store language_lessons
+  feedback -> POST /v1/feedback { feedback_id, verdict: correct|incorrect, note? }
+              coding: boost / delete coding_lessons; japanese: learn only on correct
 
 Progress / "thoughts":
   When stream=true, emits SSE events so Blossom (or any client) can show a live trail:
@@ -48,7 +52,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
-from LlamaServerManager import CODER_MODEL, PERSONA_CTX, server_manager
+from LlamaServerManager import PERSONA_CTX, server_manager
+from LocalModels import coder_ladder, primary_coder
 from EditorContext import (
     build_task_brief,
     extract_user_request as _extract_user_request,
@@ -63,11 +68,17 @@ from MemoryUpdater import (
 )
 from SemanticMemory import (
     COLLECTION_CODING,
+    COLLECTION_LANGUAGE,
     COLLECTION_WEB,
     format_memories_for_prompt,
     learn_coding_lesson,
     learn_web_findings,
     query_memories,
+)
+from FeedbackStore import (
+    apply_correctness_feedback,
+    ensure_feedback_table,
+    register_feedback_turn,
 )
 from WebSearch import (
     WEB_SEARCH_ENABLED,
@@ -98,7 +109,7 @@ ROUTER_HOST = os.getenv("CHAT_ROUTER_HOST", "127.0.0.1")
 ROUTER_PORT = int(os.getenv("CHAT_ROUTER_PORT", "8081"))
 
 LOCAL_VOICE_MODEL = os.getenv("LOCAL_VOICE_MODEL", CONVERSATIONAL_MODEL.name)
-LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", CODER_MODEL.name)
+LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", primary_coder().name)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", os.getenv("CLOUD_INTEL_MODEL", "gemini-2.5-flash-lite"))
@@ -239,6 +250,10 @@ async def lifespan(_app: FastAPI):
     logger.info("Bootstrapping persona llama-server...")
     with swap_lock:
         server_manager.ensure("persona")
+    try:
+        ensure_feedback_table()
+    except Exception:
+        logger.exception("Could not ensure feedback_turns table")
     # Compactor needs :11434 — must run after llama is up (not before ChatRouter in start-server.ps1).
     compact_on_boot = os.getenv("COMPACT_ON_STARTUP", "true").strip().lower() in {
         "1",
@@ -674,7 +689,7 @@ def _local_coder_answer(
 def _get_coding_intel(
     user_prompt: str,
     on_progress: ProgressFn | None = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str | None]:
     web_block = _gather_web_context(user_prompt, coding=True, on_progress=on_progress)
     packed_prompt, _pack_stats = pack_editor_context(user_prompt)
     enriched = packed_prompt
@@ -683,25 +698,77 @@ def _get_coding_intel(
             f"{packed_prompt}\n\n---\nUse this research context when helpful:\n{web_block}"
         )
 
+    ladders = coder_ladder(available_only=True)
     answer = ""
-    if server_manager.coder_available():
-        try:
-            _think(on_progress, "swap_coder", f"Loading coder GGUF ({CODER_MODEL.name})…")
-            server_manager.ensure("coder")
-            _think(on_progress, "swap_coder", "Coder model ready.")
-            answer = _local_coder_answer(
-                user_prompt, on_progress=on_progress, web_block=web_block
-            )
-            if answer and len(answer.strip()) >= 20:
+    answer_source = "local_coder"
+    memory_id: str | None = None
+    if not ladders:
+        missing = primary_coder().name
+        _think(
+            on_progress,
+            "fallback",
+            f"Coder GGUF missing ({missing}); using cloud…",
+        )
+    else:
+        for index, model in enumerate(ladders):
+            more_local = index + 1 < len(ladders)
+            try:
+                _think(
+                    on_progress,
+                    "swap_coder",
+                    f"Loading coder GGUF ({model.name})"
+                    + (f" [{index + 1}/{len(ladders)}]" if len(ladders) > 1 else "")
+                    + "…",
+                )
+                server_manager.ensure("coder", model_path=model.path)
+                _think(on_progress, "swap_coder", f"Coder ready ({model.name}).")
+                answer = _local_coder_answer(
+                    user_prompt, on_progress=on_progress, web_block=web_block
+                )
+                answer_source = f"local_coder:{model.name}"
+                if not answer or len(answer.strip()) < 20:
+                    if more_local:
+                        _think(
+                            on_progress,
+                            "fallback",
+                            f"{model.name} answer was weak; trying next local coder…",
+                        )
+                        continue
+                    _think(
+                        on_progress,
+                        "fallback",
+                        "Local coder answer was weak; trying cloud…",
+                    )
+                    break
+
                 wants_escalate = _local_answer_requests_escalate(answer)
-                looks_incomplete = _coding_answer_looks_incomplete(user_prompt, answer)
+                looks_incomplete = _coding_answer_looks_incomplete(
+                    user_prompt, answer
+                )
+
+                if wants_escalate and more_local:
+                    _think(
+                        on_progress,
+                        "escalate",
+                        f"{model.name} requested escalate; trying next local coder…",
+                    )
+                    continue
+                if looks_incomplete and more_local:
+                    _think(
+                        on_progress,
+                        "escalate",
+                        f"{model.name} answer looks incomplete; trying next local coder…",
+                    )
+                    continue
+
                 if wants_escalate and CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST:
                     _think(
                         on_progress,
                         "escalate",
                         "Local coder requested cloud escalation; trying cloud…",
                     )
-                elif (
+                    break
+                if (
                     looks_incomplete
                     and CLOUD_FALLBACK_ENABLED
                     and CLOUD_ESCALATE_ON_INCOMPLETE
@@ -711,41 +778,50 @@ def _get_coding_intel(
                         "escalate",
                         "Local coder answer looks incomplete for multi-file create/edit; trying cloud…",
                     )
-                else:
-                    if wants_escalate and not (
-                        CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST
-                    ):
-                        _think(
-                            on_progress,
-                            "escalate_skipped",
-                            "Local coder asked to escalate; cloud disabled — keeping local answer.",
-                        )
-                    elif looks_incomplete and not (
-                        CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_INCOMPLETE
-                    ):
-                        _think(
-                            on_progress,
-                            "escalate_skipped",
-                            "Local answer may be incomplete; cloud escalate-on-incomplete is off — keeping local.",
-                        )
-                    _think(on_progress, "learn", "Saving local coder answer into coding_lessons…")
-                    learn_coding_lesson(
-                        _extract_user_request(user_prompt),
-                        answer,
-                        source="local_coder",
+                    break
+
+                if wants_escalate and not (
+                    CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST
+                ):
+                    _think(
+                        on_progress,
+                        "escalate_skipped",
+                        "Local coder asked to escalate; cloud disabled — keeping local answer.",
                     )
-                    return answer, "local_coder"
-            else:
-                _think(on_progress, "fallback", "Local coder answer was weak; trying cloud…")
-        except Exception as exc:
-            logger.warning("Local coder failed (%s); falling back to cloud.", exc)
-            _think(on_progress, "fallback", f"Local coder failed ({exc}); trying cloud…")
-    else:
-        _think(
-            on_progress,
-            "fallback",
-            f"Coder GGUF missing ({CODER_MODEL.name}); using cloud…",
-        )
+                elif looks_incomplete and not (
+                    CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_INCOMPLETE
+                ):
+                    _think(
+                        on_progress,
+                        "escalate_skipped",
+                        "Local answer may be incomplete; cloud escalate-on-incomplete is off — keeping local.",
+                    )
+
+                _think(
+                    on_progress,
+                    "learn",
+                    f"Saving {model.name} answer into coding_lessons…",
+                )
+                memory_id = learn_coding_lesson(
+                    _extract_user_request(user_prompt),
+                    answer,
+                    source=answer_source,
+                )
+                return answer, answer_source, memory_id
+            except Exception as exc:
+                logger.warning("Local coder %s failed (%s).", model.name, exc)
+                if more_local:
+                    _think(
+                        on_progress,
+                        "fallback",
+                        f"{model.name} failed ({exc}); trying next local coder…",
+                    )
+                    continue
+                _think(
+                    on_progress,
+                    "fallback",
+                    f"Local coder failed ({exc}); trying cloud…",
+                )
 
     if not CLOUD_FALLBACK_ENABLED:
         _think(
@@ -754,7 +830,7 @@ def _get_coding_intel(
             "Cloud fallback disabled (CLOUD_FALLBACK_ENABLED=false); returning best local answer.",
         )
         if answer and len(answer.strip()) >= 20:
-            return answer, "local_coder"
+            return answer, answer_source, memory_id
         raise HTTPException(
             status_code=503,
             detail=(
@@ -767,8 +843,10 @@ def _get_coding_intel(
         enriched, purpose="coding", on_progress=on_progress
     )
     _think(on_progress, "learn", f"Saving {provider} answer into coding_lessons…")
-    learn_coding_lesson(_extract_user_request(user_prompt), answer, source=provider)
-    return answer, provider
+    memory_id = learn_coding_lesson(
+        _extract_user_request(user_prompt), answer, source=provider
+    )
+    return answer, provider, memory_id
 
 
 def _persona_wrap(
@@ -891,6 +969,8 @@ def _finalize_response(
     thoughts: list[dict],
     *,
     intel_source: str | None = None,
+    route: str | None = None,
+    feedback_id: str | None = None,
 ) -> dict:
     assistant_text = ""
     try:
@@ -915,6 +995,14 @@ def _finalize_response(
     if intel_source:
         final_response["blossom_intel_source"] = intel_source
         final_response["blossom_intel_label"] = _label_intel_source(intel_source)
+    if route:
+        final_response["blossom_route"] = route
+    if feedback_id:
+        final_response["blossom_feedback"] = {
+            "id": feedback_id,
+            "route": route,
+            "enabled": True,
+        }
     return final_response
 
 
@@ -953,6 +1041,9 @@ def run_chat_pipeline(
 
     thoughts: list[dict] = []
     intel_source: str | None = None
+    route = "casual"
+    lesson_memory_id: str | None = None
+    coding_raw_facts: str | None = None
 
     def progress(event: dict) -> None:
         thoughts.append(event)
@@ -964,10 +1055,12 @@ def run_chat_pipeline(
 
     with swap_lock:
         if coding:
+            route = "coding"
             _think(progress, "route", "Detected coding request.")
-            raw_facts, source = _get_coding_intel(
+            raw_facts, source, lesson_memory_id = _get_coding_intel(
                 last_user_message, on_progress=progress
             )
+            coding_raw_facts = raw_facts
             intel_source = source
             _think(
                 progress,
@@ -984,11 +1077,32 @@ def run_chat_pipeline(
                 locale=locale,
             )
         elif japanese:
+            route = "japanese"
             _think(progress, "route", "Detected Japanese-study request.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
             server_manager.ensure("persona")
             persona_messages = engine.build_chat_messages(last_user_message)
             _apply_chat_mode_nudges(persona_messages, locale)
+
+            focus = _extract_user_request(last_user_message)
+            _think(progress, "language_lessons", "Retrieving language lessons…")
+            lang_hits = query_memories(focus, collection=COLLECTION_LANGUAGE)
+            lesson_block = format_memories_for_prompt(
+                lang_hits,
+                heading=(
+                    "[PRIOR JAPANESE LESSONS — prefer these verified notes; "
+                    "correct carefully if a caution says the old answer was wrong]"
+                ),
+            )
+            if lang_hits:
+                _think(
+                    progress,
+                    "language_lessons",
+                    f"Loaded {len(lang_hits)} language lesson(s).",
+                    count=len(lang_hits),
+                )
+                persona_messages.append({"role": "system", "content": lesson_block})
+
             intel_source = "persona"
             try:
                 _think(progress, "persona", "Answering with local persona…")
@@ -1044,6 +1158,7 @@ def run_chat_pipeline(
                     source="persona",
                 )
         else:
+            route = "casual"
             _think(progress, "route", "Casual chat → persona model.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
             server_manager.ensure("persona")
@@ -1119,8 +1234,45 @@ def run_chat_pipeline(
         except Exception:
             logger.exception("Anti-echo rewrite failed; keeping original draft")
 
+    feedback_id: str | None = None
+    if route in {"coding", "japanese"}:
+        try:
+            assistant_for_fb = _message_text(final_response["choices"][0]["message"])
+        except Exception:
+            assistant_for_fb = draft
+        fb_answer = (
+            coding_raw_facts.strip()
+            if route == "coding" and coding_raw_facts and coding_raw_facts.strip()
+            else assistant_for_fb
+        )
+        try:
+            feedback_id = register_feedback_turn(
+                route=route,
+                user_prompt=_extract_user_request(last_user_message),
+                answer=fb_answer,
+                source=str(intel_source or route),
+                memory_id=lesson_memory_id,
+                collection=(
+                    COLLECTION_CODING if route == "coding" else COLLECTION_LANGUAGE
+                ),
+            )
+            if feedback_id:
+                _think(
+                    progress,
+                    "feedback",
+                    f"Correctness feedback ready ({route}).",
+                    feedback_id=feedback_id,
+                    route=route,
+                )
+        except Exception:
+            logger.exception("Failed to register feedback turn")
+
     final_response = _finalize_response(
-        final_response, thoughts, intel_source=intel_source
+        final_response,
+        thoughts,
+        intel_source=intel_source,
+        route=route,
+        feedback_id=feedback_id,
     )
     if VOICE_ENABLED and not coding and not defer_voice:
         # Sync path may still use LLM emotion mode; ensure persona is loaded.
@@ -1169,11 +1321,18 @@ def _openai_stop_chunk(chunk_id: str) -> dict:
 
 @app.get("/health")
 async def health():
+    ladder = coder_ladder(available_only=False)
+    available = [m.name for m in ladder if m.available]
     return {
         "ok": True,
         "local": LLAMA_SERVER_URL,
         "active_role": server_manager.current_role,
+        "active_model": server_manager.current_model.name
+        if server_manager.current_model
+        else None,
         "coder_available": server_manager.coder_available(),
+        "coder_ladder": [m.name for m in ladder],
+        "coder_ladder_available": available,
         "cloud_enabled": bool(GEMINI_CLIENT or CLAUDE_CLIENT) and CLOUD_FALLBACK_ENABLED,
         "cloud_providers": {
             "claude": CLAUDE_CLIENT is not None,
@@ -1193,6 +1352,7 @@ async def health():
         },
         "supports_thoughts": True,
         "supports_memory_write": True,
+        "supports_feedback": True,
         "supports_persona": True,
         "supports_voice": VOICE_ENABLED,
         "voice": {
@@ -1334,6 +1494,52 @@ async def delete_persona(persona_id: str):
     except Exception as exc:
         logger.exception("Failed to delete persona")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/v1/feedback")
+async def post_feedback(request: Request):
+    """
+    Correctness feedback for coding / Japanese-teaching replies.
+    Body: {
+      "feedback_id": str,
+      "verdict": "correct" | "incorrect",
+      "note": str?   // optional correction note
+    }
+    Companionship replies do not issue feedback_id — leave that path alone.
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    feedback_id = str(
+        body.get("feedback_id") or body.get("id") or ""
+    ).strip()
+    verdict = str(body.get("verdict") or body.get("rating") or "").strip()
+    note = body.get("note") or body.get("correction")
+    note_s = str(note).strip() if note is not None else ""
+
+    if not feedback_id:
+        raise HTTPException(status_code=400, detail="feedback_id is required")
+    if not verdict:
+        raise HTTPException(status_code=400, detail="verdict is required")
+
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            _executor,
+            lambda: apply_correctness_feedback(
+                feedback_id, verdict, note=note_s or None
+            ),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("feedback apply failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return result
 
 
 @app.post("/v1/memory/coding")
@@ -1550,6 +1756,34 @@ async def route_chat(request: Request):
                         )
                         + "\n\n"
                     )
+                feedback = payload.get("blossom_feedback")
+                route = payload.get("blossom_route")
+                if isinstance(feedback, dict) and feedback.get("id"):
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "object": "blossom.feedback",
+                                "id": feedback.get("id"),
+                                "route": feedback.get("route") or route,
+                                "enabled": True,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
+                elif route:
+                    yield (
+                        "data: "
+                        + json.dumps(
+                            {
+                                "object": "blossom.route",
+                                "route": route,
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n\n"
+                    )
                 yield (
                     "data: "
                     + json.dumps(
@@ -1699,7 +1933,14 @@ if __name__ == "__main__":
     if not server_manager.coder_available():
         logger.warning(
             "Coder model not found yet (%s). Coding routes will use cloud until it exists.",
-            CODER_MODEL,
+            primary_coder().path,
+        )
+    else:
+        available = coder_ladder(available_only=True)
+        logger.info(
+            "Local coder ladder (%d): %s",
+            len(available),
+            ", ".join(m.name for m in available),
         )
     if CLAUDE_CLIENT is None and GEMINI_CLIENT is None:
         logger.warning(
