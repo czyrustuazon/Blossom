@@ -194,7 +194,16 @@ def extract_user_request(user_prompt: str) -> str:
     marker = "[USER REQUEST]"
     if marker in text:
         tail = text.split(marker, 1)[1].strip()
-        for stop in ("[REPO KNOWLEDGE", "[EDITOR CONTEXT]", "<<<FILE"):
+        for stop in (
+            "[REPO KNOWLEDGE",
+            "[EDITOR CONTEXT",
+            "[AGENT TOOL",
+            "[CONTINUE",
+            "[AGENT LOOP",
+            "[AVAILABLE TOOLS",
+            "[CODING AGENT PROTOCOL",
+            "<<<FILE",
+        ):
             if stop.startswith("<<<"):
                 idx = tail.find(stop)
             else:

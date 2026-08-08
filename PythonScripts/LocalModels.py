@@ -104,6 +104,10 @@ def coder_ladder(*, available_only: bool = False) -> list[LocalModel]:
 
 
 def primary_coder() -> LocalModel:
+    """Prefer the first GGUF that exists on disk (hybrid 70B may still be downloading)."""
+    available = coder_ladder(available_only=True)
+    if available:
+        return available[0]
     ladder = coder_ladder(available_only=False)
     return ladder[0] if ladder else LocalModel(path=DEFAULT_CODER, kind="coder")
 

@@ -1,0 +1,7 @@
+{
+  "id": "example-csharp",
+  "title": "C# modernization (template corpus)",
+  "description": "Template for C# / .NET eval tasks. Add a .csproj beside fixtures when you want dotnet build checks.",
+  "domains": ["csharp", "dotnet"],
+  "tasks_dir": "tasks"
+}

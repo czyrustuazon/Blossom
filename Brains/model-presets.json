@@ -5,5 +5,12 @@
     "file": "DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf",
     "env_key": "CODER_ALT_MODEL_PATH",
     "notes": "Second local coder (tried after primary when uncertain). ~10GB GGUF."
+  },
+  "qwen25-72b": {
+    "role": "coding",
+    "repo": "bartowski/Qwen2.5-72B-Instruct-GGUF",
+    "file": "Qwen2.5-72B-Instruct-Q3_K_M.gguf",
+    "env_key": "CODER_MODEL_PATH",
+    "notes": "70B-class coder via hybrid GPU+CPU. ~35GB Q3_K_M (Q4_K_M ~47GB is tighter on 32GB RAM). Pair with CODER_N_GPU_LAYERS≈48 and CODER_CTX_SIZE=8192 on a 24GB GPU."
   }
 }

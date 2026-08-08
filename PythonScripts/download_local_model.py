@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -53,10 +54,14 @@ def download(repo: str, filename: str, dest_dir: Path) -> Path:
             "  pip install huggingface_hub\n"
         ) from exc
 
+    # XET path can hang at 0 bytes on some Windows setups; prefer classic HTTP.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
+
     dest_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {filename}")
-    print(f"  from {repo}")
-    print(f"  into {dest_dir}")
+    print(f"Downloading {filename}", flush=True)
+    print(f"  from {repo}", flush=True)
+    print(f"  into {dest_dir}", flush=True)
     path = hf_hub_download(
         repo_id=repo,
         filename=filename,

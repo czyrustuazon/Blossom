@@ -1,0 +1,30 @@
+[
+  {
+    "seed_id": "nlpp-zlib-imgbin-splice",
+    "topic": "exact-zlib img.bin splice",
+    "importance": 9,
+    "user_prompt": "How do I patch English text into NLPP img.bin without breaking zlib layout?",
+    "answer": "NLPP img.bin stores zlib-compressed STRI/text blobs with a fixed compressed length field (cmp_len). For exact-size splices:\n\n1. Decompress the target block and measure original byte length.\n2. Compress replacement text with the same zlib settings; the compressed payload must be <= cmp_len.\n3. If shorter, pad with spaces inside the plaintext before compression — never NUL-pad the compressed tail (NUL padding corrupts downstream parsers).\n4. Write back at the same file offset; do not change cmp_len unless you are rebuilding the whole img.bin index.\n5. Verify with round-trip decompress + in-game string load.\n\nAnti-pattern: growing compressed size without rebuilding the offset table — causes silent truncation or crash on load."
+  },
+  {
+    "seed_id": "nlpp-bclim-replace-vs-grow",
+    "topic": "BCLIM same-size replace vs Title.arc grow",
+    "importance": 9,
+    "user_prompt": "When can I replace a BCLIM in-place vs repack Title.arc with absolute alignment?",
+    "answer": "Two different BCLIM workflows in NLPP:\n\n**Same-size replace (in-place):**\n- Texture dimensions (W×H), format, and mip chain byte size match the original.\n- Replace bytes inside the existing .bclim or arc entry without changing TOC sizes.\n- Use when MAD score ≈ 0 against reference dump and dimensions match.\n\n**Title.arc absolute-align grow (package 5261 pattern):**\n- When the new texture is larger (more mips, RGBA vs A8, etc.), in-place replace will overflow the arc slot.\n- Repack Title.arc (pkg 5261) with absolute alignment so new entries get fresh offsets.\n- Update cross-references (UI layout, material refs) — do not assume old file offsets still valid.\n\nDecision rule: if new BCLIM file size != old entry size, you need arc repack + alignment pass, not a blind overwrite."
+  },
+  {
+    "seed_id": "nlpp-textresource-hierarchy",
+    "topic": "TextResource hierarchy FUN_005c0e7c",
+    "importance": 8,
+    "user_prompt": "NLPP TextResource: pack+slot hierarchy vs flat STRI — when does FUN_005c0e7c matter?",
+    "answer": "NLPP dialogue/text uses two retrieval shapes:\n\n**Flat STRI (img.bin / simple tables):**\n- Direct index → string offset.\n- Patching is cmp_len–bounded zlib splice (see zlib-imgbin lesson).\n\n**Hierarchy via FUN_005c0e7c (pack + slot):**\n- Strings keyed by (pack_id, slot_id) through a resolver tree, not a single flat index.\n- Editing one visible line may require updating pack headers, slot counts, or parent pack pointers — not just the STRI blob.\n- Ghidra xref FUN_005c0e7c when a string ID from tools does not match a flat img.bin index.\n\nRule: if your string tool reports pack/slot IDs, use hierarchy path; if it reports raw img.bin offsets only, use flat STRI path. Mixing them produces 'correct hex, wrong line in game' bugs."
+  },
+  {
+    "seed_id": "nlpp-ui-chrome-texture-not-trb",
+    "topic": "UI chrome = texture not TRB when TRB already EN",
+    "importance": 8,
+    "user_prompt": "English UI chrome still shows Japanese glyphs — should I edit TRB or replace a texture?",
+    "answer": "NLPP UI chrome is often **baked into textures** (A8 or RGBA atlases), not TRB string tables.\n\n**When TRB is already English:**\n- If TRB entries for that screen are already EN/placeholder, the visible JP glyphs are almost certainly glyph tiles in a BCLIM/texture atlas.\n- Fix path: identify texture via image_map / MAD against GPU dump, replace BCLIM (same-size or arc repack), not TRB edits.\n\n**Signals it's texture chrome:**\n- mean RGB ≈ 0 on alpha-only dumps (text drawn as alpha mask).\n- W×H matches a UI atlas slice (e.g. 256×64), not a dialogue box string region.\n- TRB search finds no JP for that visual element.\n\n**Signals it's TRB:**\n- Dynamic dialogue / menu labels with clear string IDs in TextResource tools.\n- Editable via img.bin STRI or hierarchy pack/slot without touching .bclim.\n\nDo not spend TRB iteration on chrome that is already localized at the string layer — escalate to texture pipeline (Cursor + MAD scripts) instead."
+  }
+]

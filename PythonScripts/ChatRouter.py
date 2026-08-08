@@ -26,6 +26,7 @@ Progress / "thoughts":
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -60,6 +61,10 @@ from EditorContext import (
     looks_like_editor_dump,
     pack_editor_context,
     parse_editor_files,
+)
+from CloudHandoffCompressor import (
+    append_prior_provider_block,
+    prepare_cloud_coding_prompt,
 )
 from MemoryUpdater import (
     CONVERSATIONAL_MODEL,
@@ -271,9 +276,41 @@ async def lifespan(_app: FastAPI):
             )
         except Exception:
             logger.exception("History compaction skipped")
+
+    eval_on_boot = os.getenv("EVAL_ON_STARTUP", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    eval_task: asyncio.Task | None = None
+
+    async def _run_eval_after_listen() -> None:
+        await asyncio.sleep(2)
+        try:
+            import sys
+
+            eval_root = PROJECT_ROOT / "tools" / "eval"
+            if str(eval_root) not in sys.path:
+                sys.path.insert(0, str(eval_root))
+            from blossom_eval.startup import run_startup_eval_suite
+
+            await asyncio.get_running_loop().run_in_executor(
+                _executor, run_startup_eval_suite
+            )
+        except Exception:
+            logger.exception("Startup eval harness skipped")
+
+    if eval_on_boot:
+        eval_task = asyncio.create_task(_run_eval_after_listen())
+
     try:
         yield
     finally:
+        if eval_task and not eval_task.done():
+            eval_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await eval_task
         logger.info("Shutting down llama-server...")
         with swap_lock:
             server_manager.stop()
@@ -425,9 +462,17 @@ def _cloud_system_prompt(purpose: str = "general") -> str:
 def _coder_system_prompt() -> str:
     return (
         "You are Blossom's local coding engine. Complete multi-step software tasks "
-        "reliably by planning, acting in small steps, and verifying.\n\n"
+        "reliably by researching, planning, acting in small steps, and verifying.\n\n"
         + _coding_rules_text()
     )
+
+
+_AGENT_TOOL_CALL_RE = re.compile(r"```tool_call\b", re.IGNORECASE)
+
+
+def _has_agent_tool_calls(text: str) -> bool:
+    """True when the coder is requesting Blossom Assistant tool execution."""
+    return bool(_AGENT_TOOL_CALL_RE.search(text or ""))
 
 
 def _local_answer_requests_escalate(answer: str) -> bool:
@@ -443,6 +488,10 @@ def _coding_answer_looks_incomplete(user_prompt: str, answer: str) -> bool:
     """
     focus = _extract_user_request(user_prompt).lower()
     ans = answer or ""
+
+    # Mid agent-loop tool requests are complete rounds for the extension host.
+    if _has_agent_tool_calls(ans):
+        return False
 
     # Simple delete/remove: local DELETE markers are enough — do not escalate to cloud.
     delete_only = bool(
@@ -527,12 +576,37 @@ def _claude_facts(user_prompt: str, purpose: str = "general") -> str:
     return "\n".join(parts).strip()
 
 
+def _summarize_for_handoff(raw_summary: str) -> str | None:
+    """Optional LLM summarize before cloud handoff (HANDOFF_SUMMARIZE_PROVIDER)."""
+    provider = os.getenv("HANDOFF_SUMMARIZE_PROVIDER", "local").strip().lower()
+    if provider == "rules-only":
+        return None
+    if provider == "gemini" and GEMINI_CLIENT is not None:
+        try:
+            prompt = (
+                "Compress this Blossom coding session into a handoff summary.\n"
+                "Keep: goal, key decisions, files touched, failures, open questions.\n"
+                "Max 1200 words. Plain text only.\n\n"
+                + raw_summary[:24000]
+            )
+            return _gemini_facts(prompt, purpose="general")
+        except Exception as exc:
+            logger.warning("Gemini handoff summarize failed: %s", exc)
+    if provider in {"local", "gemini"}:
+        from CloudHandoffCompressor import _local_summarize
+
+        return _local_summarize(raw_summary)
+    return None
+
+
 def _cloud_facts(
     user_prompt: str,
     purpose: str = "general",
     on_progress: ProgressFn | None = None,
 ) -> tuple[str, str]:
     errors: list[str] = []
+    base_prompt = user_prompt
+    prompt = base_prompt
     for provider in CLOUD_FALLBACK_ORDER:
         try:
             if provider == "claude":
@@ -540,13 +614,13 @@ def _cloud_facts(
                     errors.append("claude: not configured")
                     continue
                 _think(on_progress, "cloud", f"Asking Claude ({CLAUDE_MODEL})…", provider="claude")
-                return _claude_facts(user_prompt, purpose=purpose), "claude"
+                return _claude_facts(prompt, purpose=purpose), "claude"
             if provider in {"gemini", "google"}:
                 if GEMINI_CLIENT is None:
                     errors.append("gemini: not configured")
                     continue
                 _think(on_progress, "cloud", f"Asking Gemini ({GEMINI_MODEL})…", provider="gemini")
-                return _gemini_facts(user_prompt, purpose=purpose), "gemini"
+                return _gemini_facts(prompt, purpose=purpose), "gemini"
             errors.append(f"{provider}: unknown provider")
         except Exception as exc:
             logger.warning("Cloud provider %s failed: %s", provider, exc)
@@ -557,6 +631,11 @@ def _cloud_facts(
                 provider=provider,
             )
             errors.append(f"{provider}: {exc}")
+            prompt = append_prior_provider_block(
+                base_prompt,
+                provider,
+                f"Failed: {exc}",
+            )
 
     detail = (
         "Local intelligence failed and no cloud fallback succeeded. "
@@ -741,6 +820,15 @@ def _get_coding_intel(
                     )
                     break
 
+                # Assistant host loop: return tool_call turns as-is (no learn / cloud).
+                if _has_agent_tool_calls(answer):
+                    _think(
+                        on_progress,
+                        "agent_tools",
+                        "Coder requested tool round(s); returning raw for Assistant loop.",
+                    )
+                    return answer, answer_source, None
+
                 wants_escalate = _local_answer_requests_escalate(answer)
                 looks_incomplete = _coding_answer_looks_incomplete(
                     user_prompt, answer
@@ -839,9 +927,43 @@ def _get_coding_intel(
             ),
         )
 
-    answer, provider = _cloud_facts(
-        enriched, purpose="coding", on_progress=on_progress
+    local_attempt = answer.strip() if answer and len(answer.strip()) >= 20 else ""
+    cloud_prompt, compress_stats = prepare_cloud_coding_prompt(
+        user_prompt,
+        enriched=enriched,
+        local_attempt=local_attempt,
+        web_block=web_block,
+        summarize_fn=_summarize_for_handoff,
     )
+    if compress_stats.get("compressed"):
+        _think(
+            on_progress,
+            "cloud_compress",
+            (
+                f"Compressed cloud handoff: {compress_stats.get('raw_chars', 0)} raw → "
+                f"{compress_stats.get('compressed_chars', 0)} summary chars "
+                f"({compress_stats.get('cloud_prompt_chars', len(cloud_prompt))} in prompt)."
+            ),
+            **compress_stats,
+        )
+    elif compress_stats.get("skipped"):
+        _think(
+            on_progress,
+            "cloud_compress",
+            "Cloud handoff already compressed — reusing session summary.",
+            **compress_stats,
+        )
+
+    answer, provider = _cloud_facts(
+        cloud_prompt, purpose="coding", on_progress=on_progress
+    )
+    if _has_agent_tool_calls(answer):
+        _think(
+            on_progress,
+            "agent_tools",
+            f"{provider} requested tool round(s); skipping coding_lessons learn.",
+        )
+        return answer, provider, None
     _think(on_progress, "learn", f"Saving {provider} answer into coding_lessons…")
     memory_id = learn_coding_lesson(
         _extract_user_request(user_prompt), answer, source=provider
@@ -859,6 +981,18 @@ def _persona_wrap(
 ) -> dict:
     focus = _extract_user_request(user_prompt)
     facts_tokens = _approx_tokens(raw_facts)
+    # Keep tool_call fences intact for the Blossom Assistant agent loop.
+    if kind == "coding" and _has_agent_tool_calls(raw_facts):
+        log_text = focus if len(user_prompt) > 4000 else user_prompt
+        engine._log_message("user", log_text)
+        _think(
+            on_progress,
+            "persona_skip",
+            "Agent tool_call turn — skipping persona wrap.",
+        )
+        server_manager.ensure("persona")
+        return _synthetic_completion(raw_facts)
+
     # Large coding payloads (full HTML/files) won't fit history+persona+rewrite in one ctx.
     if kind == "coding" and facts_tokens > int(PERSONA_PROMPT_BUDGET * 0.6):
         log_text = focus if len(user_prompt) > 4000 else user_prompt
@@ -915,7 +1049,8 @@ def _persona_wrap(
         _apply_chat_mode_nudges(persona_messages, locale)
         instruction = (
             "Rewrite the following facts in your natural companion voice. Stay accurate, "
-            "avoid canned jokes and emoji spam, and don't sound like a scripted mascot.\n\n"
+            "avoid canned jokes and emoji spam, and don't sound like a scripted mascot. "
+            "Don't bolt on a stock mission/activity pitch.\n\n"
             f"FACTS:\n{raw_facts}"
         )
         persona_messages.append({"role": "user", "content": instruction})
@@ -1193,7 +1328,11 @@ def run_chat_pipeline(
         draft = _message_text(final_response["choices"][0]["message"])
     except Exception:
         draft = ""
-    if draft and engine.reply_looks_like_remix(draft):
+    agent_tool_turn = route == "coding" and (
+        _has_agent_tool_calls(draft)
+        or _has_agent_tool_calls(coding_raw_facts or "")
+    )
+    if draft and not agent_tool_turn and engine.reply_looks_like_remix(draft):
         _think(
             progress,
             "anti_echo",
@@ -1235,7 +1374,7 @@ def run_chat_pipeline(
             logger.exception("Anti-echo rewrite failed; keeping original draft")
 
     feedback_id: str | None = None
-    if route in {"coding", "japanese"}:
+    if route in {"coding", "japanese"} and not agent_tool_turn:
         try:
             assistant_for_fb = _message_text(final_response["choices"][0]["message"])
         except Exception:
@@ -1540,6 +1679,75 @@ async def post_feedback(request: Request):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return result
+
+
+@app.post("/v1/feedback/register")
+async def register_feedback(request: Request):
+    """
+    Register a feedbackable coding turn from Blossom Assistant (e.g. after
+    Cursor/Gemini escalate). Thumbs-up/down via POST /v1/feedback learns or
+    curates Chroma — no auto-learn on escalate.
+    Body: {
+      "route": "coding" | "japanese"  (default coding),
+      "user_prompt": str,
+      "answer": str,
+      "source": str?,
+      "memory_id": str?
+    }
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    route = str(body.get("route") or "coding").strip().lower()
+    user_prompt = str(
+        body.get("user_prompt") or body.get("prompt") or ""
+    ).strip()
+    answer = str(body.get("answer") or body.get("text") or "").strip()
+    source = str(body.get("source") or "extension").strip() or "extension"
+    memory_id = body.get("memory_id")
+    memory_id_s = str(memory_id).strip() if memory_id else None
+
+    if not user_prompt:
+        raise HTTPException(status_code=400, detail="user_prompt is required")
+    if not answer:
+        raise HTTPException(status_code=400, detail="answer is required")
+
+    try:
+        feedback_id = await asyncio.get_running_loop().run_in_executor(
+            _executor,
+            lambda: register_feedback_turn(
+                route=route,
+                user_prompt=user_prompt,
+                answer=answer,
+                source=source,
+                memory_id=memory_id_s,
+                collection=(
+                    COLLECTION_CODING
+                    if route == "coding"
+                    else COLLECTION_LANGUAGE
+                ),
+            ),
+        )
+    except Exception as exc:
+        logger.exception("feedback register failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if not feedback_id:
+        return {
+            "ok": False,
+            "feedback_id": None,
+            "route": route,
+            "reason": "route does not accept feedback",
+        }
+
+    return {
+        "ok": True,
+        "feedback_id": feedback_id,
+        "route": route,
+        "source": source,
+    }
 
 
 @app.post("/v1/memory/coding")

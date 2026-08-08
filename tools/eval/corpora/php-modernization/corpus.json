@@ -1,0 +1,7 @@
+{
+  "id": "php-modernization",
+  "title": "PHP modernization benchmark",
+  "description": "Legacy PHP → PHP 8 safe patterns (PDO, password_hash, no mysql_*). First bundled corpus; plug in blossom-php-modernization-training-set tasks the same way.",
+  "domains": ["php", "web"],
+  "tasks_dir": "tasks"
+}

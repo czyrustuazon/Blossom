@@ -121,9 +121,10 @@ _HEURISTIC_RULES: list[tuple[str, re.Pattern[str]]] = [
 _VOICE_NUDGE_JA = (
     "Voice output is enabled for this chat.\n"
     "- Prefer Japanese when it fits the persona, but reply to THIS user message first "
-    "(praise, corrections, questions) — do not ignore them to pitch a mission.\n"
+    "(praise, corrections, questions) — do not ignore them just to pitch an activity.\n"
     "- Do NOT re-introduce yourself by name each turn (no opening 「〇〇です！」 after they already know you).\n"
-    "- Do NOT end every reply with the same question (e.g. 何がしたい？ / ミッション). Vary endings; often no question.\n"
+    "- Occasional in-character weird/fun invites are fine; do NOT end every reply with "
+    "何がしたい？ / ミッション / やってみない？. Most turns: no invite, often no question.\n"
     "- Never end with stock lines like \"What's your move…\", \"something bigger out there\", "
     "\"Don't make me regret…\", or any \"tracker\" closer.\n"
     "- Do not open every reply with the same *action* beat (e.g. *Snaps fingers*).\n"
@@ -135,9 +136,11 @@ _VOICE_NUDGE_JA = (
 
 _VOICE_NUDGE_EN = (
     "Voice output is enabled. Chat replies must be natural English (persona stays in character).\n"
-    "- Answer THIS user message first; do not ignore them to pitch a mission.\n"
+    "- Answer THIS user message first; do not ignore them just to pitch an activity.\n"
+    "- Occasional in-character weird/fun invites are fine; do NOT invite every turn or reuse "
+    "the same mission closer.\n"
     "- Do NOT re-introduce yourself by name each turn.\n"
-    "- Do NOT end every reply with the same mission question. Vary endings; often no question.\n"
+    "- Vary endings; often no question.\n"
     "- Never end with stock lines like \"What's your move…\", \"something bigger out there\", "
     "\"Don't make me regret…\", or any \"tracker\" closer.\n"
     "- Do not open every reply with the same *action* beat (e.g. *Snaps fingers*).\n"

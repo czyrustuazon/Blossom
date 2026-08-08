@@ -4,7 +4,7 @@ Local-first personal companion stack. **Not** a fine-tuned foundation model.
 
 This document is the running “where we are” note for the Blossom backend (`Documents\Blossom`). The VS Code client lives in a sibling folder: `Documents\Blossom Assistant`.
 
-**Last updated: 2026-07-13** — mind “commit” vs LoRA/safetensors decision + earlier feedback/ladder work.
+**Last updated: 2026-08-02** — P5 NLPP seeds, P6 LoRA export pipeline, P7 README migration; hybrid escalate/de-escalate/eval stack shipped (see Session — 2026-08-02).
 
 ---
 
@@ -50,6 +50,10 @@ Blossom/
   PythonScripts/           # ChatRouter, MemoryUpdater, LocalModels, VoiceClient, …
   Voice/                   # FastAPI TTS+RVC service (:8090)
     characters/            # RVC packs (gitignored); code stays beside them
+  tools/
+    eval/                  # Coding eval harness (P4)
+    lora/                  # LoRA export + QLoRA train (P6)
+    seed/                  # NLPP domain lesson seeds (P5)
   start-server.ps1
 ```
 
@@ -69,10 +73,11 @@ Siblings:
 | `Brains/runtime/` | Trimmed CUDA 12 llama.cpp Windows binaries |
 | `Brains/models/` | Conversational + coding GGUF slots |
 | `Mind/` | SQLite mind, Chroma store, llama pid/role/logs, TTS WAV cache |
-| `MemoryUpdater.py` | SQLite mind, multi-persona book, `voice_id`, reflection every N turns |
+| `MemoryUpdater.py` | SQLite mind, multi-persona book, persona-scoped recent chat/reflection, `voice_id`, temporal + reply-shape prompts |
+| `TemporalContext.py` | Local clock, gap-since-last-chat, history stamps, relative memory ages |
 | `SemanticMemory.py` | Chroma: `relationship_life`, `coding_lessons`, `language_lessons`, `web_knowledge` |
 | `FeedbackStore.py` | SQLite `feedback_turns`; correctness up/down for coding + Japanese teaching |
-| `HistoryCompactor.py` | Old SQLite chats → life memories, prune/VACUUM |
+| `HistoryCompactor.py` | Old SQLite chats compacted per persona → shared life memories, prune/VACUUM |
 | `LocalModels.py` | Resolve GGUF paths (abs or under `Brains/models/`); ordered coder ladder |
 | `LlamaServerManager.py` | Hot-swap persona ↔ any coder GGUF on one GPU |
 | `download_local_model.py` | HF download used by `Brains/add-model.ps1` |
@@ -89,10 +94,20 @@ Siblings:
 
 Dated when landed in this tree (newest first). Detail → Session log.
 
+- **(2026-08-02)** **P7** README migration — vision, hybrid workflow, escalation, compression, learning, eval, LoRA, hardware plan in root `README.md`
+- **(2026-08-02)** **P6** LoRA pipeline — `tools/lora/` export 👍 `feedback_turns` + `coding_rules` habits → ShareGPT/Alpaca JSONL; optional Unsloth `train_qlora.py`
+- **(2026-08-02)** **P5** NLPP domain seeds — one-time into Chroma (`tools/seed/`; no startup hook)
+- **(2026-08-02)** **P4** eval harness — `tools/eval/` corpus runner + `Mind/eval_results.db`; startup eval on ChatRouter boot (`EVAL_ON_STARTUP`)
+- **(2026-08-02)** **P2** ChatRouter cloud handoff compression — `CloudHandoffCompressor.py` before `_cloud_facts()` for Gemini → Claude reuse
+- **(2026-07-27)** Passage of time: `[TEMPORAL CONTEXT]` (local clock + gap since last user turn), stamped short-term history, aged Chroma memories, dated compaction hints (`TemporalContext.py`)
+- **(2026-07-27)** Human invite cadence: occasional in-character weird/fun invites OK; ban every-turn stock mission pitches; soft-migrate `personality_notes` (`[[anti-invite-v2]]`); Haruhi-style notes drafted for Companion paste
+- **(2026-07-26)** Hybrid 70B coder path wired (`PERSONA_N_GPU_LAYERS` / `CODER_N_GPU_LAYERS`, `LLAMA_THREADS`, preset `qwen25-72b`) — **tried then dropped** (~0.35 t/s with GPU+CPU spill); ladder back to 30B MoE + DeepSeek
+- **(2026-07-26)** Voice: `setuptools` 83 broke `pkg_resources` → pin older setuptools in Voice venv
+- **(2026-07-13→live)** Persona **Qwen3-14B** Q4_K_M on disk + `PERSONA_MODEL_PATH` (no longer “plan only”); CoT off (`PERSONA_REASONING=off`); flash-attn
+- **(2026-07-16)** Recent SQLite chat, anti-echo, and reflection cadence scoped per persona; long-term Chroma remains shared
 - **(2026-07-13 evening)** Correctness feedback: `POST /v1/feedback`, `FeedbackStore`, `language_lessons`, Companion Correct/Incorrect
 - **(2026-07-13 evening)** Local coder ladder: `CODER_MODELS` / `CODER_ALT_MODEL_PATH`; DeepSeek-Coder-V2-Lite Q4 alt; `/health` ladder fields
 - **(2026-07-13 evening)** Agnostic model add: `Brains/add-model.ps1` + `model-presets.json` + `download_local_model.py`
-- **(2026-07-13)** Persona CoT off (`PERSONA_REASONING=off`); flash-attn; Qwen3-14B persona plan
 - **(2026-07-13)** Voice EN tuning (AvaNeural, pitch_en); speech sanitization; speakable `neutral`
 - **(2026-07-13)** Persona catchphrase / remix anti-echo hardening
 - **(2026-07-13)** History compaction after llama ready (`COMPACT_ON_STARTUP`)
@@ -108,12 +123,21 @@ Dated when landed in this tree (newest first). Detail → Session log.
 
 ### Extension (Blossom Assistant) — companion to this stack
 
+Shipped 2026-08-02 (v0.1.50–0.1.51); spec in sibling `MustDo.md`.
+
 - Auto-apply / auto-save; path-labeled fences + headings
 - `[LINK CHECK]` (EXISTS / MISSING) and `[UNUSED FILES]`
 - Real file **delete** via Apply / Auto-apply
 - Safe-delete mode: extension deletes orphans; skips model writes that recreate them or add unused links
 - Summary card prefers **disk truth** over model “Deleted…” prose
-- After **Gemini escalate**, POST lesson to ChatRouter (`source=blossom_assistant_gemini`)
+- **Cursor escalate** (`ESCALATE_CURSOR` + `@cursor/sdk`) with shared session compression + 👍/👎 learn
+- **Gemini / Claude escalate** (text completion + ask-first picker)
+- **Manual handoff** — `copyCursorHandoff` for Cursor IDE clipboard
+- **P2-deescalate** — “Retry with local Blossom” after cloud answer
+- **P3** — parse cloud `path=` fences → Apply cards (`blossom.escalate.applyFromCloud`)
+- **P1b** image attach → Cursor handoff (local coder text-only); metadata-only stay-local option
+- **P1c-interrupt** — inject context mid-turn; continue tool loop
+- Lessons via `POST /v1/memory/coding` + feedback sources `blossom_assistant_*`
 
 ### Chat UI (Blossom Companion)
 
@@ -148,12 +172,15 @@ Dated when landed in this tree (newest first). Detail → Session log.
 | User marks Japanese **Incorrect** + note | Caution only |
 | Casual / companionship | Never (no `feedback_id`) |
 
-Model / cloud order in `PythonScripts/.env`:
+Model / cloud order in `PythonScripts/.env` (as of 2026-07-27):
 
 ```env
-# Preferred multi-coder ladder (or use CODER_MODEL_PATH + CODER_ALT_MODEL_PATH)
-# CODER_MODELS=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf,coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
-CODER_ALT_MODEL_PATH=coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
+# Persona chat (live): Qwen3-14B Q4 — CoT off
+PERSONA_MODEL_PATH=…/conversational/Qwen_Qwen3-14B-Q4_K_M.gguf
+PERSONA_REASONING=off
+
+# Fast MoE primary + DeepSeek alt (72B hybrid tried 2026-07-26 — ~0.35 t/s — dropped)
+CODER_MODELS=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf,coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
 CLOUD_FALLBACK_ORDER=gemini,claude
 ```
 
@@ -164,7 +191,7 @@ CLOUD_FALLBACK_ORDER=gemini,claude
 ```
 Client (Companion / Blossom Assist / any OpenAI client)
   → ChatRouter :8081
-       ├─ SQLite (recent chat + persona book / voice_id + feedback_turns)
+       ├─ SQLite (persona-scoped recent chat + persona book / voice_id + feedback_turns)
        ├─ Chroma (life / coding / language / web memories)
        ├─ Web search (optional)
        ├─ llama-server :11434 (persona XOR one coder GGUF; ladder swaps files)
@@ -199,6 +226,9 @@ Client (Companion / Blossom Assist / any OpenAI client)
 18. **EN through JP-trained RVC** — sounded Japanese → separate Eng RVC packs + Edge→RVC path.
 19. **Persona catchphrase loop** — voice/system nudges were too sticky → softened anti-intro prompts.
 20. **SQLite `created_at` migrate** — `ADD COLUMN … DEFAULT CURRENT_TIMESTAMP` failed; plain `ADD COLUMN` instead.
+21. **72B hybrid coder** — Qwen2.5-72B Q3_K_M with CPU spill ran ~0.35 t/s; unusable for Assistant streams → dropped; keep 30B MoE + DeepSeek.
+22. **Voice `pkg_resources`** — newer `setuptools` removed it; pin older setuptools in the Voice venv.
+23. **Every-turn “weird activity” invites** — companion LLMs treat “be engaging” as quest-giver; fixed with reply-shape + notes cadence (occasional OK, stock every-turn banned), not news search.
 
 ---
 
@@ -218,6 +248,9 @@ Client (Companion / Blossom Assist / any OpenAI client)
 - Fine-tune / LoRA would **not** beat RAG for lessons/facts (reversible Correct/Incorrect, situational knowledge); modest token savings vs editor context cost.
 - LoRA later only for **stable always-on** style/skills (persona voice, PLAN→fences→Summary contract) — after modular inject + compress of `coding_rules.txt`, not as first token fix.
 - Situational lessons stay in Chroma forever; plain-text guardrail bloat → conditional injection / shorter core / host enforcement first.
+- **Passage of time** needs prompt injection: timestamps were already in SQLite/Chroma but invisible to the model until `[TEMPORAL CONTEXT]` + stamped history + aged memories.
+- **Dynamism ≠ random web search.** News can add topics; reply-shape + personality notes fix robot invites. Character (e.g. Haruhi) may invite weird stuff *sometimes* — ban the template loop, not the trait.
+- Persona size: **8B drifts more; 14B (current) is the practical step on one 4090**; 32B+ helps more but fights coder VRAM; **LoRA** later only for locked always-on voice. No size = zero drift.
 
 ---
 
@@ -234,21 +267,28 @@ Client (Companion / Blossom Assist / any OpenAI client)
 - Streaming thoughts for UI progress
 - Compact old history into life memory
 - Editor context packing for large dumps
-- Extension: multi-file Apply, link check, unused-file delete, Gemini → memory
+- Extension: multi-file Apply, link check, unused-file delete, Cursor/Gemini/Claude escalate → memory + 👍/👎
+- **Coding eval harness** (`tools/eval/`) with optional startup dry-run/live eval
+- **NLPP domain lesson seeds** (`tools/seed/`) + LoRA export pipeline (`tools/lora/`)
 - **Spoken replies** (optional): JA/EN pipelines, character packs, Companion playback
 - Companion: locale toggle, persona settings, voice pack dropdown
 - Correctness feedback (coding + Japanese teaching) → Chroma boost / gated language lessons
+- **Sense of time** on casual turns (clock, gap since last chat, stamped history, aged life memories)
+- **Human invite cadence** (occasional in-character pitches; no every-turn mission bot)
+- Persona on **Qwen3-14B** Q4 (8B GGUF still on disk as leftover)
 
 ### Not yet (planned / discussed)
 
 - Microphone / STT input (TTS output exists)
 - Live2D / animated avatar
-- Fine-tuning / LoRA for frozen always-on style/skills (not for Chroma lessons; see 2026-07-13 notes)
+- Fine-tuning / LoRA **merge → GGUF on production ladder** (export + train scripts shipped; GPU merge still manual)
 - Hardened public hosting (auth, tunnel, etc.)
 - Native Google Custom Search
-- Claude escalate UI inside the extension
 - Correctness feedback buttons inside Blossom Assistant (API exists; Companion UI only for now)
 - Multi-pass map-reduce over entire repos (single-pass pack only)
+- Optional **ambient daily interest / news** into life memory (gated, not every turn) — discussed; not built
+- Calendar-aware reflection / mood decay between long gaps — discussed; not built
+- Separate **Voice PC / eGPU** for TTS+RVC (notes goal from 2026-07-26) — not built
 
 If GGUFs under `Brains/models/...` are missing, local persona/coder won’t run until those files exist.
 If Voice packs under `Voice/characters/...` are missing, spoken replies won’t run until those files exist.
@@ -280,6 +320,10 @@ If Voice packs under `Voice/characters/...` are missing, spoken replies won’t 
 | Separate Voice service + characters/ | Heavy CUDA deps stay out of ChatRouter; gitignore packs in one folder |
 | Discover packs + persona `voice_id` | Adding a character = drop folder + pick in UI |
 | Edge→RVC for English | JP-trained RVC alone made EN speech sound Japanese |
+| Inject clock/gaps over hoping the model “knows time” | SQLite/`created_at` existed but wasn’t in the prompt |
+| Occasional character invites over hard-ban all invites | Haruhi-style personas need weird pitches; robot = every-turn stock closer |
+| 14B persona over 8B on one 4090 | Better character stickiness; still leaves VRAM for 30B coder hot-swap |
+| Drop 72B hybrid coder | CPU spill “works” but ~0.35 t/s; 30B MoE is the usable local coder |
 
 ---
 
@@ -293,6 +337,7 @@ If Voice packs under `Voice/characters/...` are missing, spoken replies won’t 
 # Add / download a local GGUF (then set .env + restart)
 cd Brains
 .\add-model.ps1 -ListPresets
+.\add-model.ps1 -Preset qwen25-72b
 .\add-model.ps1 -Preset deepseek-coder-v2-lite
 # .\add-model.ps1 -Role coding -Repo "owner/Some-GGUF" -File "Some-Q4_K_M.gguf"
 
@@ -325,6 +370,107 @@ curl -s http://127.0.0.1:8090/health
 ## Session log
 
 Dated work notes (newest first). High-level “what’s built” stays above; this section is the changelog by sitting.
+
+### Session — 2026-08-02
+
+**Hybrid escalate stack (Blossom Assistant v0.1.50–0.1.51)** — spec + checklist in `MustDo.md`
+
+- **P0** Manual handoff: `copyCursorHandoff` compresses session → clipboard for Cursor IDE.
+- **P1** `ESCALATE_CURSOR` + `@cursor/sdk` agent loop; shared `compressHandoff`; 👍/👎 registers `feedback_turns` / `coding_lessons` (not auto-learn or clipboard import).
+- **P1b** Image attach routing: local Qwen3-Coder is text-only; default `vision.onAttach=escalate` → Cursor handoff with paths + metadata; stay-local gets metadata block + explicit no-vision warning.
+- **P1c-interrupt** Mid-turn context inject while agent busy; continue tool loop without full re-ask.
+- **P1c-cloud** Claude escalate + ask-first escalation picker (Cursor vs Gemini vs Claude).
+- **P2-deescalate** “Retry with local Blossom” after cloud appendix; 👎 on cloud answer can trigger same retry; source `blossom_assistant_deescalate`.
+- **P3** Parse cloud/Cursor replies for `path=` fenced blocks → Apply cards (`blossom.escalate.applyFromCloud`).
+
+**ChatRouter backend (same date)**
+
+- **P2 cloud compression** — `CloudHandoffCompressor.py` + `prepare_cloud_coding_prompt()` summarizes large handoffs once; Gemini → Claude reuse via `_cloud_facts()` prior-provider appendix (`HANDOFF_*` env).
+- **P4 startup eval** — background task after listen (~2s delay): pip `tools/eval` deps, optional dry-run/live corpus run (`EVAL_ON_STARTUP`, `EVAL_ON_STARTUP_DRY_RUN_ONLY`, `EVAL_CORPUS`); failures non-fatal.
+
+**P4 — Coding eval harness (`tools/eval/`)**
+
+- Corpus-agnostic runner: copy fixtures → prompt ChatRouter → apply `path=` fences → score checks (contains, regex, shell, response-only for RE).
+- Bundled corpora: `php-modernization`, `example-csharp`, `example-reverse-engineering`.
+- Pass rate in `Mind/eval_results.db`; `run_eval.py report` for trends.
+- Wired into `start-server.ps1` pip install + ChatRouter lifespan background eval.
+
+**P5 — NLPP domain lesson seeds (`tools/seed/`)**
+
+- Four idempotent seeds into Chroma `coding_lessons` via `seed_nlpp_lessons.py`:
+  - exact-zlib img.bin splice (`cmp_len`, no NUL-pad)
+  - BCLIM same-size replace vs Title.arc abs-align grow (pkg 5261)
+  - TextResource hierarchy `FUN_005c0e7c` pack+slot vs flat STRI
+  - UI chrome = texture not TRB when TRB already EN
+- Re-run skips by `seed_id` metadata (lessons persist in Chroma; startup hook removed after one-time apply).
+
+**P6 — LoRA pipeline (`tools/lora/`)**
+
+- `export_dataset.py` — 👍 coding `feedback_turns` + optional `coding_rules.txt` habit chunks → ShareGPT/Alpaca JSONL in `Mind/lora_exports/`.
+- `train_qlora.py` — optional Unsloth QLoRA on Qwen3-Coder-30B family (separate GPU venv, `requirements-train.txt`).
+- Scope: **frozen output habits only** (PLAN → `path=` fences → CREATE vs EDIT → Summary); not Chroma facts or NLPP one-offs.
+- Merge adapter → GGUF → `Brains/models/coding/` + ladder A/B still manual (documented in `tools/lora/README.md`).
+
+**P7 — README migration**
+
+- Root `README.md` now user-facing home: vision, hybrid workflow (Blossom / Cursor / cloud lanes), escalation + de-escalate + Apply from cloud, vision routing, handoff compression, learning (RAG vs LoRA), eval + startup eval, hardware (4090/30B now, 70B future).
+- `MustDo.md` remains implementation spec; P0–P7 marked done in implementation order table.
+
+**Ops / verification**
+
+- Manual try-later checklists in `MustDo.md` (de-escalate, P2 compression, P3 Apply, P4 eval, P5 seeds, P6 export).
+- Eval dry-run on dev machine may warn `php` not on PATH — harness still runs; startup eval does not block boot.
+
+---
+
+### Session — 2026-07-27
+
+**Passage of time**
+- Timestamps already lived on `chat_logs.created_at` and Chroma `created_at`, but live persona prompts never showed them.
+- Added `TemporalContext.py`: local clock, humanized gap since last user turn, chat stamps, relative memory age.
+- `MemoryUpdater`: `[TEMPORAL CONTEXT]` in system prompt; stamp short-term history + reflection logs; new rows store local ISO with offset.
+- `SemanticMemory.format_memories_for_prompt`: `(3 weeks ago)`-style ages; compactor asks for rough timing in summaries.
+- Tests: `test_persona_chat_history.py` temporal cases.
+
+**Invite habit → human cadence (Haruhi-compatible)**
+- Problem: every turn invited “weird stuff” like a quest bot; user still wants occasional weird invites (Suzumiya Haruhi), not zero.
+- Softened global rules: occasional in-character pitches OK; ban every-turn stock closers (`What's your move`, mission, tracker, etc.).
+- Soft-migrate `personality_notes` via `[[anti-invite-v2]]`; always-on `[REPLY SHAPE — human cadence]`; voice nudges + echo-guard updated (repeat invites banned; one-offs allowed).
+- Drafted paste-ready Haruhi notes/quirks for Companion Personality panel.
+- News/random search: discussed as **not** the fix for dynamism; optional ambient interest left as “not yet.”
+
+**Persona size / drift (clarified)**
+- Confirmed live persona is already **Qwen3-14B** Q4 (`PERSONA_MODEL_PATH` + `Mind/llama-server.model`); 8B remains on disk only.
+- Guidance: 14B = practical anti-drift step on 4090; LoRA later for locked character voice; no parameter count = zero drift.
+
+---
+
+### Session — 2026-07-26
+
+**Coder 70B hybrid — try then drop** ([70B coder trial](bdc17952-93da-415d-a858-7237780d67cb))
+- Wired `CODER_N_GPU_LAYERS` / `PERSONA_N_GPU_LAYERS`, longer ready timeout, preset `qwen25-72b`; downloaded `Qwen2.5-72B-Instruct-Q3_K_M.gguf` (~35GB).
+- Runtime ~**0.35 tok/s** with GPU+CPU spill → Assistant streams unusable.
+- User: drop 70B. Ladder restored to **Qwen3-Coder-30B-A3B** + DeepSeek-Coder-V2-Lite.
+- Persona confirmed **Qwen3-14B** (~80 tok/s reported); CPU offload does not speed full-GPU persona.
+
+**Voice break**
+- Companion JA speak HTTP 500: `No module named 'pkg_resources'` after setuptools 83; pin older setuptools in Voice venv.
+
+**Hardware notes (goals, not built)**
+- Discussed separate Voice box / eGPU (e.g. 5060) for TTS+RVC only; headless ok; jot as reminder goal — still “not yet.”
+
+---
+
+### Session — 2026-07-16
+
+**Persona-scoped recent chat**
+- Added `chat_logs.persona_id`; existing rows migrate safely to the original `main` persona.
+- Recent prompt history, anti-echo/remix checks, assistant-turn counts, and reflection markers now follow the active persona.
+- History compaction retains the newest rows independently per persona, then stores summaries in the shared `relationship_life` collection.
+- Deleting a non-main persona also removes its short-term rows; shared Chroma memories and skill collections remain untouched.
+- Added focused migration, isolation, deletion, and compaction tests.
+
+---
 
 ### Session — 2026-07-13
 
@@ -389,6 +535,7 @@ Dated work notes (newest first). High-level “what’s built” stays above; th
 - **Persona CoT off by default:** `PERSONA_REASONING=off`, `--reasoning-budget 0`, flash-attn on (`LlamaServerManager`).
 - Coder keeps `CODER_REASONING=auto`.
 - Plan: Qwen3-**14B** Q4_K_M + no CoT for smarter chat without long thinking tax; user started `hf download bartowski/Qwen_Qwen3-14B-GGUF …`.
+- **Follow-up:** download completed; `.env` `PERSONA_MODEL_PATH` points at `Qwen_Qwen3-14B-Q4_K_M.gguf` (confirmed live by 2026-07-26 / 2026-07-27). 8B GGUF kept on disk unused by default.
 
 **Ops note** — 2026-07-13
 - ChatRouter binds Tailscale `XXX.XXX.XXX.XXX:8081`; Voice stays `127.0.0.1:8090`. Companion must hit Tailscale URL.
@@ -421,4 +568,4 @@ Dated work notes (newest first). High-level “what’s built” stays above; th
 
 ---
 
-*Last updated: 2026-07-13 — mind commit vs LoRA decision; correctness feedback; local coder ladder + DeepSeek alt.*
+*Last updated: 2026-08-02 — P5/P6/P7 shipped; hybrid escalate/de-escalate/eval stack session logged.*

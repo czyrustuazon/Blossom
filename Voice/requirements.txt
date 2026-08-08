@@ -19,4 +19,6 @@ edge-tts>=6.1.0
 style-bert-vits2>=2.5.0
 rvc-python>=0.1.5
 torchcrepe>=0.0.20
+# setuptools 82+ removed pkg_resources; style-bert-vits2 / omegaconf still need it
+setuptools>=69,<81
 # torch / torchaudio: install CUDA builds separately (see setup-venv.ps1)

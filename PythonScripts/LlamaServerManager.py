@@ -42,7 +42,14 @@ CODER_MODEL = primary_coder().path
 LLAMA_PORT = int(os.getenv("LLAMA_SERVER_PORT", "11434"))
 PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "16384"))
 CODER_CTX = int(os.getenv("CODER_CTX_SIZE", "16384"))
-GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
+# Shared default; role-specific overrides let big coders spill layers to CPU/RAM.
+_DEFAULT_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
+PERSONA_GPU_LAYERS = int(os.getenv("PERSONA_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS)))
+CODER_GPU_LAYERS = int(os.getenv("CODER_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS)))
+# Back-compat alias used by health / older callers
+GPU_LAYERS = _DEFAULT_GPU_LAYERS
+LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "0"))  # 0 = llama.cpp default
+READY_TIMEOUT_SEC = int(os.getenv("LLAMA_READY_TIMEOUT_SEC", "600"))
 # Persona chat: off = much faster (no long CoT). Coder can keep thinking.
 PERSONA_REASONING = os.getenv("PERSONA_REASONING", "off").strip().lower()
 CODER_REASONING = os.getenv("CODER_REASONING", "auto").strip().lower()
@@ -61,6 +68,10 @@ def _normalize_reasoning(value: str) -> str:
     if value in {"1", "true", "yes", "enable", "enabled"}:
         return "on"
     return "auto"
+
+
+def _gpu_layers_for(role: str) -> int:
+    return PERSONA_GPU_LAYERS if role == "persona" else CODER_GPU_LAYERS
 
 
 class LlamaServerManager:
@@ -121,6 +132,7 @@ class LlamaServerManager:
         mind_dir = PROJECT_ROOT / "Mind"
         mind_dir.mkdir(parents=True, exist_ok=True)
 
+        gpu_layers = _gpu_layers_for(role)
         args = [
             str(LLAMA_SERVER_EXE),
             "-m",
@@ -128,13 +140,16 @@ class LlamaServerManager:
             "--ctx-size",
             str(ctx),
             "--n-gpu-layers",
-            str(GPU_LAYERS),
+            str(gpu_layers),
             "--port",
             str(LLAMA_PORT),
             "--host",
             "127.0.0.1",
             "--jinja",
         ]
+        if LLAMA_THREADS > 0:
+            args.extend(["--threads", str(LLAMA_THREADS)])
+
         fa = FLASH_ATTN if FLASH_ATTN in {"on", "off", "auto"} else "auto"
         args.extend(["--flash-attn", fa])
 
@@ -146,9 +161,12 @@ class LlamaServerManager:
         log_path = mind_dir / f"llama-server-{role}.log"
         log_file = open(log_path, "w", encoding="utf-8", errors="replace")
         logger.info(
-            "Starting llama-server role=%s model=%s reasoning=%s flash_attn=%s",
+            "Starting llama-server role=%s model=%s gpu_layers=%s ctx=%s "
+            "reasoning=%s flash_attn=%s",
             role,
             model_path.name,
+            gpu_layers,
+            ctx,
             reasoning,
             fa,
         )
@@ -163,7 +181,7 @@ class LlamaServerManager:
         MODEL_FILE.write_text(str(model_path), encoding="utf-8")
         self.current_role = role
         self.current_model = model_path
-        self.wait_until_healthy(timeout_sec=300)
+        self.wait_until_healthy(timeout_sec=READY_TIMEOUT_SEC)
         logger.info("llama-server ready role=%s pid=%s", role, self.process.pid)
 
     def wait_until_healthy(self, timeout_sec: int = 300) -> None:

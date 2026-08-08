@@ -9,6 +9,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from TemporalContext import (
+    build_temporal_context_block,
+    now_local_iso,
+    stamp_message_content,
+)
+
 # Project root = parent of PythonScripts/, so paths stay valid if the project folder moves.
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -33,18 +39,50 @@ PERSONA_BOOK_KEY = "persona_book"
 LEGACY_PROFILE_KEY = "profile"
 DEFAULT_PERSONA_ID = "main"
 
+# Marker keeps invite-cadence soft-migration idempotent across persona notes.
+ANTI_INVITE_MARKER = "[[anti-invite-v2]]"
+_OLD_ANTI_INVITE_MARKERS = ("[[anti-invite-v1]]",)
+DEFAULT_PERSONALITY_NOTES = (
+    f"{ANTI_INVITE_MARKER}\n"
+    "Chat like a real person texting — not a scripted adventure bot.\n"
+    "- Match their energy: short messages get short replies; only go long when they do.\n"
+    "- Default to ordinary moves: react, answer, tease lightly, share a thought, or ask one "
+    "normal follow-up about what THEY said.\n"
+    "- Occasional weird/fun invites are fine when they fit your personality and the moment "
+    "(boredom, banter, a natural opening) — invent something specific, not a generic quest.\n"
+    "- Do NOT pitch an activity, mission, dare, or \"want to try something weird\" every turn. "
+    "Most replies should end with no invite and often no question.\n"
+    "- Never reuse the same closer (\"What's your move…\", \"ready for the mission?\", "
+    "\"Don't make me regret…\", tracker threats)."
+)
+
 DEFAULT_PROFILE = {
     "companion_name": "Blossom",
     "relationship_stage": "just met",
     "internal_mood_diary": "curious and warm",
     "perceived_user_traits": [],
     "linguistic_quirks": ["playful teasing", "clear technical explanations"],
-    "personality_notes": "",
+    "personality_notes": DEFAULT_PERSONALITY_NOTES,
     # Folder name under Voice/characters/<voice_id>/{Jpn,Eng}/; empty → voice service default
     "voice_id": "",
 }
 
+# Always injected into the system prompt (even if the user edits personality_notes).
+REPLY_SHAPE_BLOCK = (
+    "[REPLY SHAPE — human cadence]\n"
+    "- Answer THIS message first. Be a person in a chat, not an event-planning robot.\n"
+    "- Most turns: react, answer, tease, or one ordinary follow-up — no activity pitch.\n"
+    "- Sometimes (not every turn): if personality + mood call for it, invite them to something "
+    "weird/fun — make it specific and in-character, never a stock mission template.\n"
+    "- If you invited last turn, do not invite again this turn. Often end with no question.\n"
+    "- Banned every-turn closers: \"What's your move…\", \"ready for the mission?\", "
+    "\"Don't make me regret…\", tracker threats, identical 「何がしたい？」 loops."
+)
+
 logger = logging.getLogger(__name__)
+
+# Sentinel: build_persona_system_prompt should look up last user time itself.
+_TEMPORAL_UNSET = object()
 
 # Sticky stage-direction openers / stock closings that small models latch onto.
 _ACTION_OPENER_RE = re.compile(r"^\s*\*[^*\n]{1,60}\*\s*", re.UNICODE)
@@ -126,14 +164,25 @@ def _phrase_fingerprints(text: str, n: int = 6, limit: int = 6) -> list[str]:
     return out
 
 
-def _recent_prior_assistants(limit: int = 5) -> list[str]:
+def _recent_prior_assistants(
+    limit: int = 5,
+    *,
+    db_path: str | Path = DB_PATH,
+    persona_id: str = DEFAULT_PERSONA_ID,
+) -> list[str]:
     """Load last N assistant texts from the DB (used by remix checks)."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db_path)
     try:
         cur = conn.cursor()
         cur.execute(
-            "SELECT content FROM chat_logs WHERE role='assistant' ORDER BY id DESC LIMIT ?",
-            (limit,),
+            """
+            SELECT content
+            FROM chat_logs
+            WHERE role='assistant' AND persona_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (persona_id, limit),
         )
         rows = cur.fetchall()
     finally:
@@ -145,6 +194,39 @@ def _slugify_persona_id(name: str) -> str:
     base = re.sub(r"[^a-z0-9]+", "-", (name or "persona").lower()).strip("-")
     base = (base or "persona")[:40]
     return f"{base}-{uuid.uuid4().hex[:6]}"
+
+
+def _ensure_anti_invite_notes(notes: str) -> str:
+    """Fill empty notes or upgrade/append invite-cadence block (idempotent)."""
+    text = (notes or "").strip()
+    block = DEFAULT_PERSONALITY_NOTES.strip()
+    if ANTI_INVITE_MARKER in text:
+        return text
+    for old in _OLD_ANTI_INVITE_MARKERS:
+        if old in text:
+            idx = text.find(old)
+            prefix = text[:idx].rstrip()
+            return f"{prefix}\n\n{block}".strip() if prefix else block
+    # Older body without marker (v1 phrase) → replace that canned block.
+    if "not a game master, quest giver" in text:
+        return block if text.startswith("[[anti-invite") or text.startswith(
+            "Chat like a normal friend"
+        ) else f"{text}\n\n{block}"
+    if "Chat like a real person texting — not a scripted adventure bot" in text:
+        return f"{ANTI_INVITE_MARKER}\n{text}"
+    if not text:
+        return block
+    return f"{text.rstrip()}\n\n{block}"
+
+
+def _notes_for_public(notes: str) -> str:
+    """Hide the migration marker in API/UI while keeping it in stored notes."""
+    lines = [
+        line
+        for line in (notes or "").splitlines()
+        if line.strip() != ANTI_INVITE_MARKER
+    ]
+    return "\n".join(lines).strip()
 
 
 def _normalize_profile(profile: dict | None) -> dict:
@@ -163,7 +245,9 @@ def _normalize_profile(profile: dict | None) -> dict:
     )
     cleaned["relationship_stage"] = str(cleaned.get("relationship_stage") or "").strip()
     cleaned["internal_mood_diary"] = str(cleaned.get("internal_mood_diary") or "").strip()
-    cleaned["personality_notes"] = str(cleaned.get("personality_notes") or "").strip()
+    cleaned["personality_notes"] = _ensure_anti_invite_notes(
+        str(cleaned.get("personality_notes") or "")
+    )
     cleaned["voice_id"] = str(cleaned.get("voice_id") or "").strip()
     # Drop book-only keys if they leaked into a profile blob
     cleaned.pop("id", None)
@@ -179,7 +263,7 @@ def _public_persona(profile: dict, persona_id: str, *, active: bool) -> dict:
         "internal_mood_diary": profile.get("internal_mood_diary", ""),
         "linguistic_quirks": profile.get("linguistic_quirks") or [],
         "perceived_user_traits": profile.get("perceived_user_traits") or [],
-        "personality_notes": profile.get("personality_notes") or "",
+        "personality_notes": _notes_for_public(profile.get("personality_notes") or ""),
         "voice_id": profile.get("voice_id") or "",
     }
 
@@ -197,6 +281,7 @@ def ensure_mind_db() -> Path:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                persona_id TEXT NOT NULL DEFAULT 'main',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -209,6 +294,21 @@ def ensure_mind_db() -> Path:
             cursor.execute(
                 "UPDATE chat_logs SET created_at = datetime('now') WHERE created_at IS NULL"
             )
+        if "persona_id" not in chat_cols:
+            # Legacy history pre-dates personas, so it belongs to the original main slot.
+            cursor.execute(
+                "ALTER TABLE chat_logs "
+                "ADD COLUMN persona_id TEXT NOT NULL DEFAULT 'main'"
+            )
+        cursor.execute(
+            "UPDATE chat_logs SET persona_id=? "
+            "WHERE persona_id IS NULL OR trim(persona_id)=''",
+            (DEFAULT_PERSONA_ID,),
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_logs_persona_id "
+            "ON chat_logs (persona_id, id)"
+        )
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS evolution_matrix (
@@ -307,9 +407,15 @@ class CompanionEngine:
         self.reflection_every_n_turns = max(1, int(reflection_every_n_turns))
         self.static_core = (
             "You are a local AI companion: warm, sharp, and a little teasing when it fits. "
-            "Sound like a real person texting a friend who codes — not a mascot, not a customer-support bot.\n"
+            "Sound like a real person texting a friend who codes — not a mascot, not a "
+            "customer-support bot, and not a quest-vending machine.\n"
             "Style rules (strict):\n"
             "- Be specific to THIS message only. Answer what they just said before anything else.\n"
+            "- Human cadence: most turns just react, answer, joke, or ask one normal follow-up. "
+            "Occasional in-character weird/fun invites are allowed when mood and personality fit — "
+            "make them specific and fresh. Never pitch an activity every single reply.\n"
+            "- If your previous assistant reply already invited / challenged them, do not invite again "
+            "this turn; just continue the chat.\n"
             "- Never reuse stock bits (holy grail, sacred text, passport, Russian nesting doll, "
             "detective game, masterpiece, P.S. gimmicks).\n"
             "- Anti-echo (critical): Do not recycle your previous reply's jokes, metaphors, emoji, "
@@ -317,11 +423,11 @@ class CompanionEngine:
             "If you opened or closed with a line last turn, invent a different beat — or none. "
             "Never remix an older reply by swapping one noun (e.g. reuse a 'sleeping power' refusal "
             "for a new topic like 'dog'). Write a fresh reaction to THIS message.\n"
-            "Banned stock closings include: \"What's your move…\", \"What's next…\", "
-            "\"ready for the mission?\", \"something bigger out there\", "
+            "Banned stock closings (never use these templates): \"What's your move…\", "
+            "\"What's next…\", \"ready for the mission?\", \"something bigger out there\", "
             "\"Don't make me regret…\", any \"tracker\" gift/threat closer, "
             "\"Don't make me come over there…\", "
-            "or the same 「何がしたい？」/ミッション pitch. "
+            "or the same 「何がしたい？」/ミッション pitch every turn. "
             "Often end with no question and no repeated catchphrase.\n"
             "- Do not start every reply with an *action* italic line. Use those rarely, and never "
             "the same action two turns in a row. Hard ban when stuck: *Snaps fingers*.\n"
@@ -360,10 +466,19 @@ class CompanionEngine:
         if active not in profiles:
             active = next(iter(profiles.keys()))
             book["active_id"] = active
-        # Normalize every profile
+        # Normalize every profile; persist if anti-invite notes were soft-migrated.
+        before_notes = {
+            pid: str((prof or {}).get("personality_notes") or "")
+            for pid, prof in profiles.items()
+        }
         book["profiles"] = {
             pid: _normalize_profile(prof) for pid, prof in profiles.items()
         }
+        if any(
+            book["profiles"][pid].get("personality_notes", "") != before_notes.get(pid, "")
+            for pid in book["profiles"]
+        ):
+            return self._write_persona_book(book)
         return book
 
     def _write_persona_book(self, book: dict) -> dict:
@@ -404,6 +519,9 @@ class CompanionEngine:
         book = self._read_persona_book()
         pid = persona_id or book["active_id"]
         return dict(book["profiles"].get(pid) or DEFAULT_PROFILE)
+
+    def _active_persona_id(self) -> str:
+        return str(self._read_persona_book()["active_id"])
 
     def _set_profile(self, profile: dict, persona_id: str | None = None) -> dict:
         book = self._read_persona_book()
@@ -493,7 +611,7 @@ class CompanionEngine:
             seed["internal_mood_diary"] = "curious and new"
             seed["perceived_user_traits"] = []
             seed["linguistic_quirks"] = ["still finding her voice"]
-            seed["personality_notes"] = ""
+            seed["personality_notes"] = DEFAULT_PERSONALITY_NOTES
             seed["voice_id"] = ""
         pid = (persona_id or "").strip() or _slugify_persona_id(name)
         if pid in book["profiles"]:
@@ -525,7 +643,31 @@ class CompanionEngine:
             raise ValueError("The main personality slot cannot be deleted (you can still edit it).")
         del book["profiles"][pid]
         self._write_persona_book(book)
+        # Deleted personas must not leave inaccessible short-term conversations behind.
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM chat_logs WHERE persona_id=?", (pid,))
         return self.get_persona_bundle()
+
+    def _last_user_message_at(self) -> str | None:
+        """created_at of the newest user turn for the active persona (if any)."""
+        persona_id = self._active_persona_id()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT created_at
+            FROM chat_logs
+            WHERE persona_id=? AND role='user'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (persona_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return row[0]
 
     def _get_short_term_context(
         self,
@@ -533,6 +675,7 @@ class CompanionEngine:
         max_chars_per_message: int = 500,
         *,
         sanitize_assistant_loops: bool = False,
+        include_timestamps: bool = True,
     ):
         """Recent chat for the persona. Long coding dumps are truncated so casual chat
         doesn't keep re-anchoring on file/link work from earlier turns.
@@ -540,31 +683,43 @@ class CompanionEngine:
         When sanitize_assistant_loops is True (generation prompts), strip sticky
         *action* openers / stock closings from older assistant turns so the model
         does not few-shot the same catchphrase loop from history.
+
+        When include_timestamps is True, prefix each line with a local time stamp
+        so the model can sense gaps and day boundaries.
         """
+        persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT role, content FROM chat_logs ORDER BY id DESC LIMIT ?",
-            (limit,),
+            """
+            SELECT role, content, created_at
+            FROM chat_logs
+            WHERE persona_id=?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (persona_id, limit),
         )
         rows = cursor.fetchall()
         conn.close()
         ordered = list(reversed(rows))
         out = []
-        for role, content in ordered:
+        for role, content, created_at in ordered:
             text = content or ""
             if sanitize_assistant_loops and role == "assistant":
                 text = _strip_loop_habits(text)
             if len(text) > max_chars_per_message:
                 text = text[:max_chars_per_message].rstrip() + "…"
+            if include_timestamps:
+                text = stamp_message_content(text, created_at)
             out.append({"role": role, "content": text})
         return out
-
     def _recent_assistant_echo_guard(self) -> str:
         """Remind the model not to copy openings/closings or sticky motifs."""
         # Raw history (unsanitized) so bans match what was actually said.
         history = self._get_short_term_context(
-            limit=10, max_chars_per_message=400, sanitize_assistant_loops=False
+            limit=10, max_chars_per_message=400, sanitize_assistant_loops=False,
+            include_timestamps=False,
         )
         prior = [
             m["content"].strip()
@@ -617,6 +772,17 @@ class CompanionEngine:
         # Sticky motifs across the last few turns (even if wording drifts).
         joined = "\n".join(prior).lower()
         motif_hits: list[str] = []
+        sticky_once = {
+            "tracker",
+            "don't make me regret",
+            "do not make me regret",
+            "don't make me come over",
+            "waste my",
+            "snaps fingers",
+            "what's your move",
+            "ready for the mission",
+            "something bigger out there",
+        }
         for motif, label in (
             ("tracker", "tracker / giving you the tracker"),
             ("don't make me regret", "Don't make me regret…"),
@@ -627,19 +793,18 @@ class CompanionEngine:
             ("what's your move", "What's your move…"),
             ("something bigger out there", "something bigger out there"),
             ("ready for the mission", "ready for the mission"),
+            ("something weird", "same 'something weird' pitch"),
+            ("scavenger", "same scavenger/quest pitch"),
+            ("dare you", "same 'I dare you' pitch"),
+            ("shall we", "same 'shall we…' invite"),
+            ("want to try", "same 'want to try…' invite"),
+            ("let's go on", "same 'let's go on a…' pitch"),
         ):
-            if joined.count(motif) >= 1 and motif in (
-                "tracker",
-                "don't make me regret",
-                "do not make me regret",
-                "don't make me come over",
-                "waste my",
-                "snaps fingers",
-            ):
-                # These are sticky enough that one prior hit is enough to ban.
+            if joined.count(motif) >= 1 and motif in sticky_once:
                 motif_hits.append(label)
                 banned.append(label)
             elif joined.count(motif) >= 2:
+                # Repeated invite templates feel robotic; one-off in-character invites are OK.
                 motif_hits.append(label)
                 banned.append(label)
 
@@ -669,6 +834,7 @@ class CompanionEngine:
             "For this turn: answer the latest user message with NEW wording and a NEW structure. "
             "Do not swap one noun into an older reply. "
             "No *Snaps fingers*. No tracker. No recycled closing. "
+            "If you already invited/challenged them recently, do not invite again — just talk. "
             "Often end without a question."
         )
         return "\n".join(lines)
@@ -678,7 +844,11 @@ class CompanionEngine:
         raw = (text or "").strip()
         if len(raw) < 40:
             return False
-        prior = _recent_prior_assistants(6)
+        prior = _recent_prior_assistants(
+            6,
+            db_path=self.db_path,
+            persona_id=self._active_persona_id(),
+        )
         if not prior:
             return False
         return any(_token_jaccard(raw, p) >= threshold for p in prior)
@@ -688,7 +858,11 @@ class CompanionEngine:
         raw = (text or "").strip()
         if not raw:
             return raw
-        prior = _recent_prior_assistants(4)
+        prior = _recent_prior_assistants(
+            4,
+            db_path=self.db_path,
+            persona_id=self._active_persona_id(),
+        )
         if not prior:
             return raw
         joined = "\n".join(prior).lower()
@@ -715,21 +889,34 @@ class CompanionEngine:
         return out.strip() or raw
 
     def _assistant_turn_count(self) -> int:
+        persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM chat_logs WHERE role='assistant'")
+        cursor.execute(
+            "SELECT COUNT(*) FROM chat_logs WHERE role='assistant' AND persona_id=?",
+            (persona_id,),
+        )
         count = cursor.fetchone()[0]
         conn.close()
         return int(count)
 
     def _get_last_reflection_assistant_count(self) -> int:
+        persona_id = self._active_persona_id()
+        state_key = f"{REFLECTION_STATE_KEY}:{persona_id}"
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
             "SELECT value FROM evolution_matrix WHERE key=?",
-            (REFLECTION_STATE_KEY,),
+            (state_key,),
         )
         row = cursor.fetchone()
+        if row is None and persona_id == DEFAULT_PERSONA_ID:
+            # Preserve the pre-persona reflection marker for migrated main history.
+            cursor.execute(
+                "SELECT value FROM evolution_matrix WHERE key=?",
+                (REFLECTION_STATE_KEY,),
+            )
+            row = cursor.fetchone()
         conn.close()
         if not row:
             return 0
@@ -739,6 +926,7 @@ class CompanionEngine:
             return 0
 
     def _set_last_reflection_assistant_count(self, count: int) -> None:
+        state_key = f"{REFLECTION_STATE_KEY}:{self._active_persona_id()}"
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
@@ -746,24 +934,33 @@ class CompanionEngine:
             INSERT INTO evolution_matrix (key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value
             """,
-            (REFLECTION_STATE_KEY, str(count)),
+            (state_key, str(count)),
         )
         conn.commit()
         conn.close()
 
     def _log_message(self, role, content):
+        persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO chat_logs (role, content) VALUES (?, ?)",
-            (role, content),
+            """
+            INSERT INTO chat_logs (role, content, persona_id, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (role, content, persona_id, now_local_iso()),
         )
         conn.commit()
         conn.close()
         if role == "assistant":
             self.maybe_run_self_reflection()
 
-    def build_persona_system_prompt(self, user_text: str | None = None) -> str:
+    def build_persona_system_prompt(
+        self,
+        user_text: str | None = None,
+        *,
+        prior_user_at=_TEMPORAL_UNSET,
+    ) -> str:
         profile = self._get_profile()
         quirks = profile.get("linguistic_quirks") or []
         if isinstance(quirks, list):
@@ -776,8 +973,18 @@ class CompanionEngine:
         else:
             traits_text = str(traits)
 
+        # prior_user_at: pass explicitly from build_chat_messages (None = first chat).
+        # Unset → newest user stamp already in the DB (standalone / CLI calls).
+        gap_at = (
+            self._last_user_message_at()
+            if prior_user_at is _TEMPORAL_UNSET
+            else prior_user_at
+        )
+        temporal = build_temporal_context_block(last_user_at=gap_at)
+
         prompt = (
             f"{self.static_core}\n\n"
+            f"{temporal}\n\n"
             f"[CURRENT EVOLUTION STATE]\n"
             f"- Your name: {profile.get('companion_name', 'Blossom')}\n"
             f"- Relationship Status with User: {profile.get('relationship_stage', 'unknown')}\n"
@@ -785,15 +992,17 @@ class CompanionEngine:
             f"- User Observations: {traits_text}\n"
             f"- Tone notes: {quirk_text}. Keep personality, but never become repetitive or plastic."
         )
+        prompt = f"{prompt}\n\n{REPLY_SHAPE_BLOCK}"
         notes = str(profile.get("personality_notes") or "").strip()
         if notes:
             prompt = (
                 f"{prompt}\n\n"
                 f"[USER PERSONALITY DIRECTION — follow these closely]\n{notes}\n"
                 "Personality still must answer THIS message first. "
-                "Never turn every reply into a name intro + mission pitch template. "
-                "Never end every reply with \"What's your move…\", \"Don't make me regret…\", "
-                "a \"tracker\" closer, or a stock mission closer. "
+                "Do not turn every reply into a name intro + mission/quest pitch. "
+                "Occasional in-character invites are fine; repeating the same invite closer "
+                "(\"What's your move…\", \"Don't make me regret…\", tracker, identical "
+                "\"want to try something weird\") is not. "
                 "Never open every reply with the same *action* line (especially *Snaps fingers*)."
             )
         echo_guard = self._recent_assistant_echo_guard()
@@ -818,9 +1027,15 @@ class CompanionEngine:
 
     def build_chat_messages(self, user_text: str, history_limit: int = 12) -> list:
         """Log the user turn and build persona + memories + recent history."""
+        prior_user_at = self._last_user_message_at()
         self._log_message("user", user_text)
         messages = [
-            {"role": "system", "content": self.build_persona_system_prompt(user_text)}
+            {
+                "role": "system",
+                "content": self.build_persona_system_prompt(
+                    user_text, prior_user_at=prior_user_at
+                ),
+            }
         ]
         messages.extend(
             self._get_short_term_context(
@@ -866,11 +1081,12 @@ class CompanionEngine:
             "Analyze the following recent chat script between you and your creator. "
             "Based strictly on this script, update your internal persona metrics.\n\n"
             f"CURRENT METRICS:\n{json.dumps(profile, indent=2)}\n\n"
-            f"CHAT LOGS:\n{history_text}\n\n"
+            f"CHAT LOGS (timestamps show passage of time):\n{history_text}\n\n"
             "Output a valid, raw JSON block matching the structure above exactly. "
             "Keep 'companion_name' EXACTLY as in CURRENT METRICS — never rename yourself. "
             "Keep 'personality_notes' and 'voice_id' EXACTLY as in CURRENT METRICS — never invent or clear them. "
-            "Adjust your 'internal_mood_diary' to reflect how the conversation would leave you feeling. "
+            "Adjust your 'internal_mood_diary' to reflect how the conversation would leave you feeling "
+            "(notice gaps between timestamps — long silence vs back-and-forth). "
             "Update 'perceived_user_traits' if you noticed new skills, patterns, or behaviors. "
             "Slightly shift your 'relationship_stage' if the emotional distance or closeness has evolved. "
             "Do not include markdown or text wrapping outside the raw JSON object."

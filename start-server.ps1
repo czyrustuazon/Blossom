@@ -169,8 +169,26 @@ Write-Host "Blossom project : $ProjectRoot"
 Write-Host "Scripts         : $ScriptsDir"
 Write-Host ""
 Write-Host "History compaction runs after ChatRouter brings llama-server up (needs :11434)."
+Write-Host "Eval harness runs after ChatRouter is listening (EVAL_ON_STARTUP, default true)."
 Write-Host ""
 
+$EvalDir = Join-Path $ProjectRoot "tools\eval"
+$EvalRequirements = Join-Path $EvalDir "requirements.txt"
+$evalOnStartup = $true
+if ($env:EVAL_ON_STARTUP) {
+    $evalOnStartup = Test-BlossomEnvFlag $env:EVAL_ON_STARTUP
+}
+if ($evalOnStartup -and (Test-Path -LiteralPath $EvalRequirements)) {
+    Write-Host "Eval harness: installing tools/eval requirements..."
+    & python -m pip install -q -r $EvalRequirements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Eval harness pip install failed (exit $LASTEXITCODE). Startup eval may fail."
+    }
+} elseif (-not $evalOnStartup) {
+    Write-Host "Eval harness pip install skipped (EVAL_ON_STARTUP=false)."
+}
+
+Write-Host ""
 if (-not $env:GEMINI_API_KEY -and -not $env:CLAUDE_API_KEY -and -not $env:ANTHROPIC_API_KEY) {
     Write-Warning "No cloud keys set (CLAUDE_API_KEY / GEMINI_API_KEY). Last-resort fallback unavailable."
 } elseif (-not $env:CLAUDE_API_KEY -and -not $env:ANTHROPIC_API_KEY) {

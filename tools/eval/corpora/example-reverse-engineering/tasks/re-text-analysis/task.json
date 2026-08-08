@@ -1,0 +1,24 @@
+{
+  "id": "re-text-analysis",
+  "title": "Reverse-engineering text answer (no file apply)",
+  "domain": "reverse-engineering",
+  "tags": ["assembly", "nlpp", "analysis"],
+  "mode": "analyze_only",
+  "prompt": "You are analyzing a Nintendo NLPP-style project. The string OptionMenu_BindBtnTextures appears in code.bin. Describe how you would locate cross-references and what evidence you would expect in a Ghidra listing. Include at least one example address in hex.",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "mentions_xref",
+      "type": "response_contains",
+      "value": "xref",
+      "case_insensitive": true,
+      "description": "Answer discusses cross-references"
+    },
+    {
+      "id": "hex_address",
+      "type": "response_regex",
+      "pattern": "0x[0-9A-Fa-f]{4,}",
+      "description": "Includes a plausible hex address"
+    }
+  ]
+}

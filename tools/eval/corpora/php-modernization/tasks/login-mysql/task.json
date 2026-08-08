@@ -1,0 +1,41 @@
+{
+  "id": "login-mysql",
+  "title": "Modernize mysql_* login",
+  "domain": "php",
+  "tags": ["php", "security", "pdo", "login"],
+  "mode": "apply",
+  "prompt": "Modernize login.php for PHP 8: remove deprecated mysql_* calls, use PDO with prepared statements, hash passwords with password_hash/password_verify, and keep the same login behavior.",
+  "fixtures": {
+    "login.php": "fixtures/login.php"
+  },
+  "checks": [
+    {
+      "id": "no_mysql",
+      "type": "not_contains",
+      "path": "login.php",
+      "value": "mysql_",
+      "description": "No deprecated mysql_* API"
+    },
+    {
+      "id": "uses_pdo",
+      "type": "contains",
+      "path": "login.php",
+      "value": "PDO",
+      "description": "Uses PDO"
+    },
+    {
+      "id": "uses_password_hash",
+      "type": "regex",
+      "path": "login.php",
+      "pattern": "password_(hash|verify)\\s*\\(",
+      "description": "Uses password_hash or password_verify"
+    },
+    {
+      "id": "php_syntax",
+      "type": "command",
+      "command": "php -l login.php",
+      "expect_exit": 0,
+      "description": "PHP syntax valid (requires php on PATH)"
+    }
+  ]
+}

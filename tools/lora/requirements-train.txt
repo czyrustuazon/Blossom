@@ -1,0 +1,9 @@
+# Optional GPU training stack for tools/lora/train_qlora.py
+# Install in a dedicated venv (CUDA). Not required for ChatRouter daily use.
+unsloth
+trl
+transformers>=4.41.0
+datasets
+accelerate
+bitsandbytes
+torch

@@ -1,0 +1,32 @@
+{
+  "id": "csharp-pdo-stub",
+  "title": "C# pattern stub (apply mode template)",
+  "domain": "csharp",
+  "tags": ["csharp", "template"],
+  "mode": "apply",
+  "prompt": "Update Program.cs to use HttpClient instead of WebClient and make Main async. Return the full updated Program.cs.",
+  "fixtures": {
+    "Program.cs": "fixtures/Program.cs"
+  },
+  "checks": [
+    {
+      "id": "uses_httpclient",
+      "type": "contains",
+      "path": "Program.cs",
+      "value": "HttpClient"
+    },
+    {
+      "id": "no_webclient",
+      "type": "not_contains",
+      "path": "Program.cs",
+      "value": "WebClient"
+    },
+    {
+      "id": "build",
+      "type": "command",
+      "command": "dotnet build --nologo -v q",
+      "expect_exit": 0,
+      "description": "Optional — only when dotnet SDK + project files are present"
+    }
+  ]
+}

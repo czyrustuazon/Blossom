@@ -245,6 +245,9 @@ def update_memory_metadata(
         return False
 
 
+from TemporalContext import relative_age
+
+
 def format_memories_for_prompt(
     memories: list[dict[str, Any]],
     heading: str = "[LONG-TERM SEMANTIC MEMORIES]",
@@ -253,7 +256,10 @@ def format_memories_for_prompt(
         return ""
     lines = [heading]
     for index, memory in enumerate(memories, start=1):
-        lines.append(f"{index}. {memory['text']}")
+        meta = memory.get("metadata") or {}
+        age = relative_age(meta.get("created_at"))
+        prefix = f"({age}) " if age else ""
+        lines.append(f"{index}. {prefix}{memory['text']}")
     return "\n".join(lines)
 
 

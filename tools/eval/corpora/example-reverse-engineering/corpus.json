@@ -1,0 +1,7 @@
+{
+  "id": "example-reverse-engineering",
+  "title": "RE / assembly analysis (response-only)",
+  "description": "Scores model text only — no file apply. Use for Ghidra/xref/assembly tasks where automation is manual or tool-assisted.",
+  "domains": ["reverse-engineering", "assembly", "csharp", "cpp"],
+  "tasks_dir": "tasks"
+}

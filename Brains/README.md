@@ -19,21 +19,28 @@ Brains/
     conversational/
       Qwen3-8B-Q4_K_M.gguf      # default persona / voice model
     coding/
-      Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf   # default primary coder
-      DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf  # optional second coder
+      Qwen2.5-72B-Instruct-Q3_K_M.gguf            # 70B-class hybrid primary (optional)
+      Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf   # fast MoE coder (fits 24GB)
+      DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf  # optional ladder step
 ```
 
 Paths in `PythonScripts/.env` can be **absolute** or **relative to `Brains/models/`**:
 
 ```env
 PERSONA_MODEL_PATH=conversational/Qwen3-8B-Q4_K_M.gguf
-CODER_MODEL_PATH=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+CODER_MODEL_PATH=coding/Qwen2.5-72B-Instruct-Q3_K_M.gguf
 
 # Agnostic multi-coder ladder (tried in order before cloud when uncertain):
-CODER_MODELS=coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf,coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
+CODER_MODELS=coding/Qwen2.5-72B-Instruct-Q3_K_M.gguf,coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf,coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
 
 # Or just primary + one alt (same idea):
 # CODER_ALT_MODEL_PATH=coding/DeepSeek-Coder-V2-Lite-Instruct-Q4_K_M.gguf
+
+# Hybrid 70B on 24GB VRAM + 32GB RAM (persona stays full-GPU):
+PERSONA_N_GPU_LAYERS=999
+CODER_N_GPU_LAYERS=48
+CODER_CTX_SIZE=8192
+LLAMA_THREADS=10
 ```
 
 `CODER_MODELS` wins when set. Otherwise Blossom uses `CODER_MODEL_PATH` then optional `CODER_ALT_MODEL_PATH`.
@@ -47,6 +54,9 @@ From this folder (or repo root):
 ```powershell
 # List known presets
 .\add-model.ps1 -ListPresets
+
+# Download 70B-class hybrid coder (~35GB Q3_K_M)
+.\add-model.ps1 -Preset qwen25-72b
 
 # Download DeepSeek as second coder (~10GB)
 .\add-model.ps1 -Preset deepseek-coder-v2-lite
@@ -94,17 +104,18 @@ Hugging Face search tip: look for repos with **GGUF** in the name (e.g. communit
 
 ### Coders (optional but recommended)
 
-Primary defaults to:
+Primary can be either:
 
-- `Brains/models/coding/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf`
+- `Qwen2.5-72B-Instruct-Q3_K_M.gguf` — 70B-class; use `CODER_N_GPU_LAYERS` so excess layers spill to RAM/CPU
+- `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` — faster MoE that fits a 24GB GPU fully
 
-Add DeepSeek (or anything else) with `add-model.ps1`, then set `CODER_MODELS` / `CODER_ALT_MODEL_PATH`.
+Add more with `add-model.ps1`, then set `CODER_MODELS` / `CODER_ALT_MODEL_PATH`.
 
 When coding is uncertain (weak answer, `ESCALATE_CLOUD`, incomplete multi-file heuristics), Blossom tries the **next local coder** before Claude/Gemini.
 
 If no coding GGUF is present, ChatRouter skips local coders and falls through to cloud (when keys are set).
 
-**VRAM note:** persona and coder GGUFs are **hot-swapped** — only one loads at a time. Switching to an alt coder reloads llama-server (seconds). A single high-VRAM GPU is assumed.
+**VRAM note:** persona and coder GGUFs are **hot-swapped** — only one loads at a time. Switching to an alt coder reloads llama-server (seconds). For 70B, close heavy apps (browsers/IDE extras), keep `CODER_CTX_SIZE` modest (e.g. 8192), and tune `CODER_N_GPU_LAYERS` down if you OOM.
 
 ---
 
