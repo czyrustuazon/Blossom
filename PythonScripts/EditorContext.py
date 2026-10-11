@@ -26,16 +26,32 @@ EDITOR_PACK_ENABLED = os.getenv("EDITOR_CONTEXT_PACK", "true").strip().lower() i
     "yes",
     "on",
 }
-# Leave room for system prompt, lessons, web, and the model reply.
+# Leave room for system prompt, lessons, web, agent protocol, and the model reply.
+_CODER_REPLY_RESERVE = max(1024, int(os.getenv("CODER_REPLY_RESERVE", "4096")))
+_CODER_PROMPT_OVERHEAD = max(1024, int(os.getenv("CODER_PROMPT_OVERHEAD", "6144")))
 EDITOR_TOKEN_BUDGET = max(
     2048,
     int(os.getenv("EDITOR_CONTEXT_BUDGET", "0"))
-    or (int(os.getenv("CODER_CTX_SIZE", "16384")) - int(os.getenv("CODER_REPLY_RESERVE", "4096"))),
+    or (
+        int(os.getenv("CODER_CTX_SIZE", "32768"))
+        - _CODER_REPLY_RESERVE
+        - _CODER_PROMPT_OVERHEAD
+    ),
 )
 EDITOR_MAX_FILES = max(1, int(os.getenv("EDITOR_MAX_FILES", "6")))
 EDITOR_CHUNK_LINES = max(40, int(os.getenv("EDITOR_CHUNK_LINES", "160")))
 EDITOR_CHUNK_OVERLAP = max(0, int(os.getenv("EDITOR_CHUNK_OVERLAP", "20")))
-EDITOR_REPO_KNOWLEDGE_CHARS = max(0, int(os.getenv("EDITOR_REPO_KNOWLEDGE_CHARS", "1200")))
+EDITOR_REPO_KNOWLEDGE_CHARS = max(0, int(os.getenv("EDITOR_REPO_KNOWLEDGE_CHARS", "800")))
+EDITOR_SEQUENTIAL_PREVIEW_CHARS = max(
+    40, int(os.getenv("EDITOR_SEQUENTIAL_PREVIEW_CHARS", "140"))
+)
+
+SEQUENTIAL_CODER_PROMPT = (
+    "You are Blossom's coding agent. Full editor files did not fit the model context.\n"
+    "Use read_file with startLine/endLine from [CHUNK CATALOG] to fetch excerpts before editing.\n"
+    "Workflow: (1) ```tool_call read_file for needed chunk(s), (2) then path-labeled file fences.\n"
+    "One fence per file. Preserve existing content on edits unless a full rewrite was requested."
+)
 
 _FILE_BLOCK_RE = re.compile(
     r"<<<FILE\s+path=(?P<q>[\"']?)(?P<path>.*?)(?P=q)\s*>>>\r?\n"
@@ -359,6 +375,163 @@ def select_files(files: list[EditorFile], ask: str) -> list[EditorFile]:
         by_size = sorted(files, key=lambda f: len(f.body))[: min(3, EDITOR_MAX_FILES)]
         return by_size
     return kept
+
+
+def is_context_overflow_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "exceed_context_size" in msg
+        or "exceeds the available context" in msg
+        or "context size" in msg and "exceed" in msg
+    )
+
+
+def strip_agent_protocol_bloat(user_prompt: str) -> str:
+    """Drop extension agent catalog/transcript bloat; keep ask + file blocks for re-pack."""
+    text = user_prompt or ""
+    upper = text.upper()
+    cut = len(text)
+    for stop in (
+        "[CODING AGENT PROTOCOL",
+        "[AVAILABLE TOOLS",
+        "[AGENT TOOL TRANSCRIPT",
+        "[AGENT LOOP",
+        "[CONTINUE — AGENT ROUND",
+        "[CONTINUE - AGENT ROUND",
+    ):
+        idx = upper.find(stop)
+        if idx >= 0:
+            cut = min(cut, idx)
+    head = text[:cut].strip()
+    if "<<<FILE" in head:
+        return head
+    return text.strip()
+
+
+def _chunk_preview(chunk: FileChunk) -> str:
+    flat = " ".join((chunk.text or "").split())
+    if len(flat) <= EDITOR_SEQUENTIAL_PREVIEW_CHARS:
+        return flat
+    return flat[: EDITOR_SEQUENTIAL_PREVIEW_CHARS].rstrip() + "…"
+
+
+def build_chunk_catalog(
+    user_prompt: str,
+    *,
+    include_previews: bool = True,
+) -> tuple[str, dict]:
+    """
+    Index of file chunks (no bodies) for sequential read mode.
+    Returns (catalog_markdown, stats).
+    """
+    stats: dict = {
+        "mode": "sequential_catalog",
+        "files_in": 0,
+        "chunks_total": 0,
+        "approx_tokens": 0,
+    }
+    ask = extract_user_request(user_prompt)
+    files = parse_editor_files(strip_agent_protocol_bloat(user_prompt))
+    stats["files_in"] = len(files)
+    if not files:
+        return "", stats
+
+    kept_files = select_files(files, ask)
+    ask_tokens = _tokens(ask)
+    entries: list[tuple[str, FileChunk]] = []
+    for f in kept_files:
+        bonus = _file_relevance(f.path, ask)
+        for chunk in _chunk_file(f.path, f.body):
+            chunk.score = _score_chunk(chunk, ask_tokens, bonus)
+            entries.append((f.path, chunk))
+
+    entries.sort(key=lambda pair: pair[1].score, reverse=True)
+    stats["chunks_total"] = len(entries)
+
+    lines = [
+        "[CHUNK CATALOG — use read_file with startLine/endLine]",
+        "Example tool_call:",
+        '```tool_call',
+        '{"name":"read_file","arguments":{"path":"index.html","startLine":1,"endLine":160}}',
+        "```",
+        "",
+    ]
+    current_path = ""
+    for path, chunk in entries:
+        if path != current_path:
+            if current_path:
+                lines.append("")
+            body_len = next((len(f.body.splitlines()) for f in kept_files if f.path == path), 0)
+            n_chunks = sum(1 for p, _ in entries if p == path)
+            lines.append(f"## {path} ({body_len} lines, {n_chunks} chunk(s))")
+            current_path = path
+        preview = f' — "{_chunk_preview(chunk)}"' if include_previews else ""
+        lines.append(
+            f"- lines {chunk.start_line}-{chunk.end_line} (score={chunk.score:.1f}){preview}"
+        )
+
+    dropped = stats["files_in"] - len(kept_files)
+    if dropped > 0:
+        lines.insert(
+            1,
+            f"(Omitted {dropped} unrelated open file(s); call read_file on other paths if needed.)",
+        )
+
+    catalog = "\n".join(lines).strip()
+    stats["approx_tokens"] = approx_tokens(catalog)
+    stats["kept_paths"] = [f.path for f in kept_files]
+    return catalog, stats
+
+
+def pack_editor_context_sequential(
+    user_prompt: str,
+    *,
+    token_budget: int | None = None,
+) -> tuple[str, dict]:
+    """
+    Lightweight prompt for context overflow: task brief + chunk catalog, no file bodies.
+    The model should read_file(startLine/endLine) before editing.
+    """
+    stats: dict = {
+        "packed": True,
+        "mode": "sequential",
+        "files_in": 0,
+        "approx_tokens": 0,
+    }
+    slim = strip_agent_protocol_bloat(user_prompt)
+    ask = extract_user_request(slim)
+    files = parse_editor_files(slim)
+    stats["files_in"] = len(files)
+    catalog, cat_stats = build_chunk_catalog(slim)
+    stats.update({k: v for k, v in cat_stats.items() if k != "mode"})
+
+    brief = build_task_brief(ask, [f.path for f in files])
+    repo = extract_repo_knowledge(slim)
+
+    parts = [
+        "[SEQUENTIAL READ MODE — context overflow recovery]",
+        "Full file bodies were omitted to fit the model. Fetch chunks with read_file before editing.",
+        "",
+        brief,
+        "",
+        f"[USER REQUEST]\n{ask}\n",
+    ]
+    if repo:
+        parts.append(repo)
+    if catalog:
+        parts.append(catalog)
+    else:
+        parts.append(
+            "[CHUNK CATALOG]\nNo editor file blocks found — use list_dir/search_text/read_file on the repo."
+        )
+
+    packed = "\n\n".join(p for p in parts if p).strip()
+    budget = token_budget or max(2048, EDITOR_TOKEN_BUDGET // 2)
+    if approx_tokens(packed) > budget:
+        packed = packed[: budget * _CHARS_PER_TOKEN] + "\n…[catalog truncated for budget]"
+    stats["approx_tokens"] = approx_tokens(packed)
+    stats["budget"] = budget
+    return packed, stats
 
 
 def pack_editor_context(

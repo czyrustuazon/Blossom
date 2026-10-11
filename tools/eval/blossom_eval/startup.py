@@ -13,7 +13,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-EVAL_DIR = Path(__file__).resolve().parents[2]
+# startup.py lives at tools/eval/blossom_eval/ → parent[1] is tools/eval/
+EVAL_DIR = Path(__file__).resolve().parents[1]
 RUN_EVAL = EVAL_DIR / "run_eval.py"
 
 

@@ -38,6 +38,7 @@ MEMORY_COLLECTION = COLLECTION_LIFE
 MEMORY_TOP_K = max(1, int(os.getenv("MEMORY_TOP_K", "5")))
 # Skip memories demoted below this importance when querying.
 MEMORY_MIN_IMPORTANCE = max(0, int(os.getenv("MEMORY_MIN_IMPORTANCE", "2")))
+MEMORY_PROMPT_MAX_CHARS = max(500, int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "3000")))
 
 logger = logging.getLogger(__name__)
 
@@ -251,15 +252,27 @@ from TemporalContext import relative_age
 def format_memories_for_prompt(
     memories: list[dict[str, Any]],
     heading: str = "[LONG-TERM SEMANTIC MEMORIES]",
+    *,
+    max_chars: int | None = None,
 ) -> str:
     if not memories:
         return ""
+    budget = max_chars if max_chars is not None else MEMORY_PROMPT_MAX_CHARS
     lines = [heading]
+    used = len(heading)
+    omitted = 0
     for index, memory in enumerate(memories, start=1):
         meta = memory.get("metadata") or {}
         age = relative_age(meta.get("created_at"))
         prefix = f"({age}) " if age else ""
-        lines.append(f"{index}. {prefix}{memory['text']}")
+        line = f"{index}. {prefix}{memory['text']}"
+        if used + len(line) + 1 > budget:
+            omitted = len(memories) - index + 1
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if omitted:
+        lines.append(f"… ({omitted} more lesson(s) omitted for token budget)")
     return "\n".join(lines)
 
 

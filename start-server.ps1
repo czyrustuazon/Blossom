@@ -45,6 +45,7 @@ $PidFile = Join-Path $ProjectRoot "Mind\llama-server.pid"
 # In-repo Voice service (override with VOICE_DIR if needed)
 $VoiceRootDefault = Join-Path $ProjectRoot "Voice"
 $VoiceProc = $null
+$AgentProc = $null
 
 $python = Get-Command python -ErrorAction SilentlyContinue
 if (-not $python) {
@@ -150,6 +151,73 @@ function Stop-BlossomVoiceService {
     }
 }
 
+function Test-BlossomAgentExecutorHealthy {
+    param(
+        [string]$HostAddr = "127.0.0.1",
+        [string]$Port = "8082"
+    )
+    try {
+        $resp = Invoke-WebRequest -Uri "http://${HostAddr}:${Port}/health" -TimeoutSec 2 -UseBasicParsing
+        return ($resp.StatusCode -eq 200)
+    } catch {
+        return $false
+    }
+}
+
+function Start-BlossomAgentExecutor {
+    param(
+        [string]$AgentRoot,
+        [string]$HostAddr = "127.0.0.1",
+        [string]$Port = "8082"
+    )
+    $executor = Join-Path $AgentRoot "AgentExecutor.py"
+    if (-not (Test-Path -LiteralPath $executor)) {
+        Write-Warning "AGENT_EXECUTION_ENABLED but AgentExecutor.py not found in: $AgentRoot"
+        return $null
+    }
+    if (Test-BlossomAgentExecutorHealthy -HostAddr $HostAddr -Port $Port) {
+        Write-Host "Agent sandbox already listening on http://${HostAddr}:${Port}"
+        return $null
+    }
+    Write-Host "Starting Agent sandbox on http://${HostAddr}:${Port} ..."
+    Write-Host "  Root: $AgentRoot"
+    $env:AGENT_EXEC_HOST = $HostAddr
+    $env:AGENT_EXEC_PORT = $Port
+    $proc = Start-Process -FilePath $python.Source `
+        -ArgumentList @($executor) `
+        -WorkingDirectory $AgentRoot `
+        -WindowStyle Hidden `
+        -PassThru
+    Write-Host "  Agent sandbox PID $($proc.Id)"
+    Start-Sleep -Seconds 2
+    if (-not (Test-BlossomAgentExecutorHealthy -HostAddr $HostAddr -Port $Port)) {
+        Write-Warning "Agent sandbox did not respond on http://${HostAddr}:${Port}/health"
+        Write-Warning "Run once: cd agent_execution; pip install -e ."
+    }
+    return $proc
+}
+
+function Stop-BlossomAgentExecutor {
+    param($Proc)
+    if (-not $Proc) { return }
+    try {
+        if (-not $Proc.HasExited) {
+            Write-Host "Stopping Agent sandbox PID $($Proc.Id) ..."
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.ParentProcessId -eq $Proc.Id -or
+                    ($_.CommandLine -and $_.CommandLine -match "AgentExecutor\.py")
+                } |
+                ForEach-Object {
+                    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+                }
+        }
+    } catch {
+        Write-Warning "Could not stop Agent sandbox: $_"
+    }
+}
+
 # Surface .env values into this PowerShell process (project .env always wins).
 $EnvFile = Join-Path $ScriptsDir ".env"
 if (Test-Path -LiteralPath $EnvFile) {
@@ -220,11 +288,39 @@ if (Test-BlossomEnvFlag $env:VOICE_ENABLED) {
     Write-Host "Voice service skipped (VOICE_ENABLED is not true)."
 }
 
+$agentRoot = Join-Path $ProjectRoot "agent_execution"
+$agentHost = "127.0.0.1"
+$agentPort = "8082"
+if ($env:AGENT_EXECUTOR_URL -match "^https?://([^:/]+):(\d+)") {
+    $agentHost = $Matches[1]
+    $agentPort = $Matches[2]
+} elseif ($env:AGENT_EXEC_PORT) {
+    $agentPort = $env:AGENT_EXEC_PORT
+}
+
+Write-Host ""
+$agentEnabled = $true
+if ($env:AGENT_EXECUTION_ENABLED) {
+    $agentEnabled = Test-BlossomEnvFlag $env:AGENT_EXECUTION_ENABLED
+}
+if ($agentEnabled) {
+    if (Test-Path -LiteralPath (Join-Path $agentRoot "pyproject.toml")) {
+        Write-Host "Agent sandbox: ensuring agent_execution deps..."
+        & python -m pip install -q -e $agentRoot
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Agent sandbox pip install failed (exit $LASTEXITCODE)."
+        }
+    }
+    $AgentProc = Start-BlossomAgentExecutor -AgentRoot $agentRoot -HostAddr $agentHost -Port $agentPort
+} else {
+    Write-Host "Agent sandbox skipped (AGENT_EXECUTION_ENABLED is not true)."
+}
+
 Write-Host ""
 Write-Host "Starting ChatRouter on http://${routerHost}:${routerPort} ..."
 Write-Host "ChatRouter will hot-swap llama-server between persona and coder models."
 Write-Host "Point clients at http://${routerHost}:${routerPort}/v1/chat/completions"
-Write-Host "(Ctrl+C stops the router, Voice service, and llama-server.)"
+Write-Host "(Ctrl+C stops the router, Voice service, Agent sandbox, and llama-server.)"
 Write-Host ""
 
 Enable-BlossomKeepAwake
@@ -236,6 +332,7 @@ try {
     Disable-BlossomKeepAwake
     Pop-Location
     Stop-BlossomVoiceService -Proc $VoiceProc
+    Stop-BlossomAgentExecutor -Proc $AgentProc
     if (Test-Path -LiteralPath $PidFile) {
         $llamaPid = (Get-Content -LiteralPath $PidFile -Raw).Trim()
         if ($llamaPid) {

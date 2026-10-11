@@ -17,6 +17,8 @@ Flow:
 
 Progress / "thoughts":
   When stream=true, emits SSE events so Blossom (or any client) can show a live trail:
+    data: {"object":"blossom.thought","step":"model_reasoning","message":"<delta>"}
+      — streamed token-by-token from llama-server reasoning_content during local infer
     data: {"object":"blossom.thought","step":"...","message":"..."}
     data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"..."}}]}
     data: [DONE]
@@ -58,9 +60,18 @@ from LocalModels import coder_ladder, primary_coder
 from EditorContext import (
     build_task_brief,
     extract_user_request as _extract_user_request,
+    is_context_overflow_error,
     looks_like_editor_dump,
     pack_editor_context,
+    pack_editor_context_sequential,
     parse_editor_files,
+    SEQUENTIAL_CODER_PROMPT,
+)
+from PromptTier import (
+    PromptTier,
+    coder_system_prompt_for_tier,
+    detect_prompt_tier,
+    should_skip_coding_lessons,
 )
 from CloudHandoffCompressor import (
     append_prior_provider_block,
@@ -192,6 +203,14 @@ if CLAUDE_API_KEY:
 
 CLOUD_CLIENT = GEMINI_CLIENT or CLAUDE_CLIENT
 CLOUD_INTEL_MODEL = GEMINI_MODEL
+
+AGENT_EXECUTION_ENABLED = os.getenv("AGENT_EXECUTION_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+AGENT_EXECUTOR_URL = os.getenv("AGENT_EXECUTOR_URL", "http://127.0.0.1:8082").rstrip("/")
 
 CODING_KEYWORDS = (
     "write a function",
@@ -344,6 +363,71 @@ def is_japanese_request(user_prompt: str) -> bool:
     return any(kw in text for kw in JAPANESE_KEYWORDS)
 
 
+def _agent_execution_imports():
+    import sys
+
+    agent_root = PROJECT_ROOT / "agent_execution"
+    if str(agent_root) not in sys.path:
+        sys.path.insert(0, str(agent_root))
+    from AgentRouter import is_agent_execution_request
+    from AgentRunner import agent_executor_healthy, run_agent_execution_turn
+
+    return is_agent_execution_request, agent_executor_healthy, run_agent_execution_turn
+
+
+def _should_use_agent_execution(user_prompt: str) -> bool:
+    if not AGENT_EXECUTION_ENABLED:
+        return False
+    try:
+        is_agent_request, agent_healthy, _run = _agent_execution_imports()
+    except Exception:
+        logger.debug("Agent execution layer unavailable", exc_info=True)
+        return False
+    if not agent_healthy(AGENT_EXECUTOR_URL):
+        return False
+    return is_agent_request(
+        user_prompt,
+        looks_like_editor_dump=looks_like_editor_dump(user_prompt),
+    )
+
+
+def _get_agent_execution_intel(
+    user_prompt: str,
+    on_progress: ProgressFn | None = None,
+) -> tuple[str, str]:
+    _, _, run_agent_execution_turn = _agent_execution_imports()
+
+    def complete_fn(messages: list[dict[str, str]], temperature: float) -> str:
+        ladders = coder_ladder(available_only=True)
+        if not ladders:
+            raise RuntimeError(
+                "Agent execution requires a local coder GGUF or the agent sandbox only."
+            )
+        model = ladders[0]
+        _think(
+            on_progress,
+            "swap_coder",
+            f"Agent layer using coder ({model.name})…",
+        )
+        server_manager.ensure("coder", model_path=model.path)
+        _think(on_progress, "agent_infer", "Drafting sandbox Python…")
+        return _stream_local_chat(
+            messages,
+            model=LOCAL_CODER_MODEL,
+            temperature=temperature,
+            on_progress=on_progress,
+            source="agent_execution",
+        )
+
+    answer = run_agent_execution_turn(
+        user_prompt,
+        complete_fn=complete_fn,
+        on_progress=on_progress,
+        base_url=AGENT_EXECUTOR_URL,
+    )
+    return answer, "agent_execution"
+
+
 def _message_text(message: Any) -> str:
     if isinstance(message, dict):
         content = message.get("content", "")
@@ -387,7 +471,68 @@ def _emit_model_reasoning(
     )
 
 
-def _think(on_progress: ProgressFn | None, step: str, message: str, **extra: Any) -> dict:
+def _delta_text(delta: Any, field: str) -> str:
+    if delta is None:
+        return ""
+    if isinstance(delta, dict):
+        raw = delta.get(field, "")
+    else:
+        raw = getattr(delta, field, "") or ""
+    return str(raw) if raw else ""
+
+
+def _stream_local_chat(
+    messages: list[dict],
+    *,
+    model: str,
+    temperature: float,
+    on_progress: ProgressFn | None = None,
+    source: str = "local_coder",
+) -> str:
+    """
+    Stream from llama-server and emit model_reasoning token deltas live.
+    Blossom Assistant accumulates these in the busy-row reasoning strip.
+    """
+    stream = LOCAL_CLIENT.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        stream=True,
+    )
+    content_parts: list[str] = []
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice0 = choices[0]
+        delta = getattr(choice0, "delta", None)
+        if delta is None and isinstance(choice0, dict):
+            delta = choice0.get("delta")
+        reasoning_piece = _delta_text(delta, "reasoning_content")
+        if reasoning_piece:
+            _think(
+                on_progress,
+                "model_reasoning",
+                reasoning_piece,
+                source=source,
+                label=_label_intel_source(source),
+                log=False,
+            )
+        content_piece = _delta_text(delta, "content")
+        if content_piece:
+            content_parts.append(content_piece)
+    text = "".join(content_parts)
+    return _message_text({"content": text})
+
+
+def _think(
+    on_progress: ProgressFn | None,
+    step: str,
+    message: str,
+    *,
+    log: bool = True,
+    **extra: Any,
+) -> dict:
     event = {
         "object": "blossom.thought",
         "step": step,
@@ -395,7 +540,10 @@ def _think(on_progress: ProgressFn | None, step: str, message: str, **extra: Any
         "ts": time.time(),
         **extra,
     }
-    logger.info("thought step=%s %s", step, message)
+    if log:
+        logger.info("thought step=%s %s", step, message)
+    else:
+        logger.debug("thought step=%s %s", step, message[:120])
     if on_progress:
         on_progress(event)
     return event
@@ -709,68 +857,172 @@ def _local_coder_answer(
     user_prompt: str,
     on_progress: ProgressFn | None = None,
     web_block: str = "",
+    *,
+    sequential: bool = False,
+    force_sequential: bool = False,
 ) -> str:
-    packed_prompt, pack_stats = pack_editor_context(user_prompt)
-    if pack_stats.get("packed"):
-        _think(
-            on_progress,
-            "editor_pack",
-            (
-                f"Packed editor context: {pack_stats.get('files_in', 0)} file(s) in → "
-                f"{pack_stats.get('files_kept', 0)} kept, "
-                f"{pack_stats.get('chunks_kept', 0)} chunk(s), "
-                f"~{pack_stats.get('approx_tokens')} tokens "
-                f"(budget {pack_stats.get('budget')})."
-            ),
-            **{k: v for k, v in pack_stats.items() if k != "ask"},
-        )
+    if force_sequential or sequential:
+        packed_prompt, pack_stats = pack_editor_context_sequential(user_prompt)
+        mode_label = "sequential"
+    else:
+        packed_prompt, pack_stats = pack_editor_context(user_prompt)
+        mode_label = "packed"
+    if pack_stats.get("packed") or pack_stats.get("mode") == "sequential":
+        if pack_stats.get("mode") == "sequential":
+            _think(
+                on_progress,
+                "editor_sequential",
+                (
+                    f"Sequential chunk mode: {pack_stats.get('files_in', 0)} file(s), "
+                    f"{pack_stats.get('chunks_total', 0)} chunk(s) in catalog, "
+                    f"~{pack_stats.get('approx_tokens')} tokens "
+                    f"(budget {pack_stats.get('budget')})."
+                ),
+                **{k: v for k, v in pack_stats.items() if k not in ("ask",)},
+            )
+        else:
+            _think(
+                on_progress,
+                "editor_pack",
+                (
+                    f"Packed editor context: {pack_stats.get('files_in', 0)} file(s) in → "
+                    f"{pack_stats.get('files_kept', 0)} kept, "
+                    f"{pack_stats.get('chunks_kept', 0)} chunk(s), "
+                    f"~{pack_stats.get('approx_tokens')} tokens "
+                    f"(budget {pack_stats.get('budget')})."
+                ),
+                **{k: v for k, v in pack_stats.items() if k != "ask"},
+            )
 
     focus = _extract_user_request(user_prompt)
     attached = [f.path for f in parse_editor_files(user_prompt)]
     task_brief = build_task_brief(focus, attached)
-    if task_brief:
+    if task_brief and not sequential:
         _think(on_progress, "task_brief", "Added create/edit task brief for the coder.")
 
-    _think(on_progress, "coding_lessons", "Retrieving coding lessons from memory…")
-    lessons = query_memories(focus, collection=COLLECTION_CODING)
-    lesson_block = format_memories_for_prompt(
-        lessons, heading="[PRIOR CODING LESSONS — prefer these patterns when relevant]"
-    )
-    if lessons:
+    tier = detect_prompt_tier(user_prompt)
+    if sequential:
+        tier = PromptTier.TINY
+        _think(
+            on_progress,
+            "prompt_tier",
+            "Sequential overflow mode — minimal system prompt, read_file first.",
+            tier="sequential",
+        )
+    elif tier != PromptTier.FULL:
+        _think(
+            on_progress,
+            "prompt_tier",
+            f"Using {tier.value} prompt tier (token savings).",
+            tier=tier.value,
+        )
+
+    lesson_block = ""
+    if not sequential and not should_skip_coding_lessons(tier, user_prompt=user_prompt):
+        _think(on_progress, "coding_lessons", "Retrieving coding lessons from memory…")
+        lessons = query_memories(focus, collection=COLLECTION_CODING)
+        lesson_block = format_memories_for_prompt(
+            lessons, heading="[PRIOR CODING LESSONS — prefer these patterns when relevant]"
+        )
+        if lessons:
+            _think(
+                on_progress,
+                "coding_lessons",
+                f"Loaded {len(lessons)} relevant coding lesson(s).",
+                count=len(lessons),
+            )
+    elif sequential:
+        _think(on_progress, "coding_lessons", "Skipped coding lessons (sequential overflow mode).")
+    else:
         _think(
             on_progress,
             "coding_lessons",
-            f"Loaded {len(lessons)} relevant coding lesson(s).",
-            count=len(lessons),
+            "Skipped coding lessons (tiny edit + editor context).",
         )
+
+    system_content = (
+        SEQUENTIAL_CODER_PROMPT
+        if sequential
+        else coder_system_prompt_for_tier(tier, _coder_system_prompt())
+    )
     messages = [
-        {"role": "system", "content": _coder_system_prompt()},
-        {"role": "system", "content": task_brief},
+        {"role": "system", "content": system_content},
     ]
+    if task_brief and not sequential:
+        messages.append({"role": "system", "content": task_brief})
     if lesson_block:
         messages.append({"role": "system", "content": lesson_block})
-    if web_block:
+    if web_block and not sequential:
         messages.append({"role": "system", "content": web_block})
     messages.append({"role": "user", "content": packed_prompt})
 
-    _think(on_progress, "coder_infer", "Running local coder model…")
-    response = LOCAL_CLIENT.chat.completions.create(
-        model=LOCAL_CODER_MODEL,
-        messages=messages,
-        temperature=0.2,
-        stream=False,
+    _think(
+        on_progress,
+        "coder_infer",
+        "Running local coder (sequential)…" if sequential else "Running local coder model…",
     )
-    msg = response.choices[0].message
-    _emit_model_reasoning(on_progress, msg, source="local_coder")
-    return _message_text(msg)
+    try:
+        return _stream_local_chat(
+            messages,
+            model=LOCAL_CODER_MODEL,
+            temperature=0.2,
+            on_progress=on_progress,
+            source="local_coder",
+        )
+    except Exception as exc:
+        if not sequential and is_context_overflow_error(exc):
+            _think(
+                on_progress,
+                "context_overflow",
+                f"Prompt exceeded context ({exc}); switching to sequential chunk mode…",
+            )
+            return _local_coder_answer(
+                user_prompt,
+                on_progress=on_progress,
+                web_block="",
+                sequential=True,
+            )
+        raise
+
+
+def _defer_cloud_escalation(
+    *,
+    reason: str,
+    local_attempt: str,
+    on_progress: ProgressFn | None,
+) -> None:
+    """Extension owns cloud escalation (Cursor/Gemini/Claude picker) — do not call cloud here."""
+    _think(
+        on_progress,
+        "defer_cloud",
+        "Local coder exhausted — extension will ask how to continue (cloud deferred).",
+        reason=reason,
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "defer_cloud_escalation",
+            "reason": reason,
+            "local_attempt": local_attempt,
+        },
+    )
 
 
 def _get_coding_intel(
     user_prompt: str,
     on_progress: ProgressFn | None = None,
+    *,
+    defer_cloud: bool = False,
+    force_sequential: bool = False,
 ) -> tuple[str, str, str | None]:
-    web_block = _gather_web_context(user_prompt, coding=True, on_progress=on_progress)
-    packed_prompt, _pack_stats = pack_editor_context(user_prompt)
+    web_block = "" if force_sequential else _gather_web_context(
+        user_prompt, coding=True, on_progress=on_progress
+    )
+    packed_prompt, _pack_stats = (
+        pack_editor_context_sequential(user_prompt)
+        if force_sequential
+        else pack_editor_context(user_prompt)
+    )
     enriched = packed_prompt
     if web_block:
         enriched = (
@@ -781,14 +1033,67 @@ def _get_coding_intel(
     answer = ""
     answer_source = "local_coder"
     memory_id: str | None = None
+    fallback_reason = ""
+    sequential_tried = False
+
+    def _try_sequential(model_name: str) -> bool:
+        nonlocal answer, answer_source, memory_id, sequential_tried, fallback_reason
+        sequential_tried = True
+        _think(
+            on_progress,
+            "context_overflow",
+            f"{model_name} context overflow — sequential chunk mode (read_file catalog)…",
+        )
+        try:
+            seq_answer = _local_coder_answer(
+                user_prompt,
+                on_progress=on_progress,
+                web_block="",
+                force_sequential=True,
+            )
+        except Exception as seq_exc:
+            logger.warning("Sequential chunk mode failed (%s).", seq_exc)
+            fallback_reason = f"Context overflow — sequential mode failed ({seq_exc})"
+            return False
+        if not seq_answer or len(seq_answer.strip()) < 20:
+            fallback_reason = "Sequential chunk mode returned a weak answer"
+            return False
+        answer = seq_answer
+        answer_source = f"local_coder:{model_name}:sequential"
+        if _has_agent_tool_calls(answer):
+            _think(
+                on_progress,
+                "agent_tools",
+                "Sequential mode requested tool round(s); returning raw for Assistant loop.",
+            )
+            return True
+        _think(on_progress, "learn", f"Saving {model_name} sequential answer into coding_lessons…")
+        memory_id = learn_coding_lesson(
+            _extract_user_request(user_prompt),
+            answer,
+            source=answer_source,
+        )
+        return True
+
     if not ladders:
         missing = primary_coder().name
+        fallback_reason = f"Coder GGUF missing ({missing})"
         _think(
             on_progress,
             "fallback",
-            f"Coder GGUF missing ({missing}); using cloud…",
+            f"{fallback_reason}; using cloud…",
         )
     else:
+        if force_sequential:
+            model = ladders[0]
+            _think(
+                on_progress,
+                "editor_sequential",
+                f"Extension requested sequential chunk mode ({model.name}).",
+            )
+            server_manager.ensure("coder", model_path=model.path)
+            if _try_sequential(model.name):
+                return answer, answer_source, memory_id
         for index, model in enumerate(ladders):
             more_local = index + 1 < len(ladders)
             try:
@@ -802,7 +1107,9 @@ def _get_coding_intel(
                 server_manager.ensure("coder", model_path=model.path)
                 _think(on_progress, "swap_coder", f"Coder ready ({model.name}).")
                 answer = _local_coder_answer(
-                    user_prompt, on_progress=on_progress, web_block=web_block
+                    user_prompt,
+                    on_progress=on_progress,
+                    web_block=web_block,
                 )
                 answer_source = f"local_coder:{model.name}"
                 if not answer or len(answer.strip()) < 20:
@@ -813,10 +1120,11 @@ def _get_coding_intel(
                             f"{model.name} answer was weak; trying next local coder…",
                         )
                         continue
+                    fallback_reason = "Local coder answer was weak"
                     _think(
                         on_progress,
                         "fallback",
-                        "Local coder answer was weak; trying cloud…",
+                        f"{fallback_reason}; trying cloud…",
                     )
                     break
 
@@ -850,10 +1158,11 @@ def _get_coding_intel(
                     continue
 
                 if wants_escalate and CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST:
+                    fallback_reason = "Local coder requested cloud escalation"
                     _think(
                         on_progress,
                         "escalate",
-                        "Local coder requested cloud escalation; trying cloud…",
+                        f"{fallback_reason}; trying cloud…",
                     )
                     break
                 if (
@@ -861,10 +1170,13 @@ def _get_coding_intel(
                     and CLOUD_FALLBACK_ENABLED
                     and CLOUD_ESCALATE_ON_INCOMPLETE
                 ):
+                    fallback_reason = (
+                        "Local coder answer looks incomplete for multi-file create/edit"
+                    )
                     _think(
                         on_progress,
                         "escalate",
-                        "Local coder answer looks incomplete for multi-file create/edit; trying cloud…",
+                        f"{fallback_reason}; trying cloud…",
                     )
                     break
 
@@ -898,6 +1210,9 @@ def _get_coding_intel(
                 return answer, answer_source, memory_id
             except Exception as exc:
                 logger.warning("Local coder %s failed (%s).", model.name, exc)
+                if is_context_overflow_error(exc) and not sequential_tried:
+                    if _try_sequential(model.name):
+                        return answer, answer_source, memory_id
                 if more_local:
                     _think(
                         on_progress,
@@ -905,11 +1220,23 @@ def _get_coding_intel(
                         f"{model.name} failed ({exc}); trying next local coder…",
                     )
                     continue
+                fallback_reason = f"Local coder failed ({exc})"
                 _think(
                     on_progress,
                     "fallback",
-                    f"Local coder failed ({exc}); trying cloud…",
+                    f"{fallback_reason}; trying cloud…",
                 )
+
+    if defer_cloud and CLOUD_FALLBACK_ENABLED:
+        local_attempt = answer.strip() if answer and len(answer.strip()) >= 20 else ""
+        reason = fallback_reason or "Local coder unavailable or insufficient"
+        if sequential_tried:
+            reason = f"{reason} (sequential chunk mode already attempted)"
+        _defer_cloud_escalation(
+            reason=reason,
+            local_attempt=local_attempt,
+            on_progress=on_progress,
+        )
 
     if not CLOUD_FALLBACK_ENABLED:
         _think(
@@ -1156,6 +1483,8 @@ def run_chat_pipeline(
     on_progress: ProgressFn | None = None,
     *,
     defer_voice: bool | None = None,
+    defer_cloud: bool = False,
+    force_sequential: bool = False,
     locale: str = "ja",
     voice_id: str | None = None,
 ) -> tuple[dict, str | None]:
@@ -1187,13 +1516,33 @@ def run_chat_pipeline(
 
     coding = is_coding_request(last_user_message)
     japanese = is_japanese_request(last_user_message)
+    agent_execution = _should_use_agent_execution(last_user_message)
 
     with swap_lock:
-        if coding:
+        if agent_execution:
+            route = "agent"
+            _think(progress, "route", "Detected code-execution agent task.")
+            raw_facts, source = _get_agent_execution_intel(
+                last_user_message, on_progress=progress
+            )
+            coding_raw_facts = raw_facts
+            intel_source = source
+            _think(
+                progress,
+                "intel_ready",
+                f"Agent execution ready (source={source}).",
+                source=source,
+                label="Agent sandbox",
+            )
+            final_response = _synthetic_completion(raw_facts)
+        elif coding:
             route = "coding"
             _think(progress, "route", "Detected coding request.")
             raw_facts, source, lesson_memory_id = _get_coding_intel(
-                last_user_message, on_progress=progress
+                last_user_message,
+                on_progress=progress,
+                defer_cloud=defer_cloud,
+                force_sequential=force_sequential,
             )
             coding_raw_facts = raw_facts
             intel_source = source
@@ -1499,7 +1848,24 @@ async def health():
             "service_url": VOICE_SERVICE_URL if VOICE_ENABLED else None,
             "service_ok": voice_service_healthy() if VOICE_ENABLED else False,
         },
+        "agent_execution": _agent_execution_health(),
     }
+
+
+def _agent_execution_health() -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "enabled": AGENT_EXECUTION_ENABLED,
+        "url": AGENT_EXECUTOR_URL,
+        "ok": False,
+    }
+    if not AGENT_EXECUTION_ENABLED:
+        return body
+    try:
+        _, agent_healthy, _ = _agent_execution_imports()
+        body["ok"] = agent_healthy(AGENT_EXECUTOR_URL)
+    except Exception as exc:
+        body["error"] = str(exc)
+    return body
 
 
 @app.get("/v1/voices")
@@ -1836,6 +2202,8 @@ async def route_chat(request: Request):
         raise HTTPException(status_code=400, detail="No user message found")
 
     want_stream = bool(body.get("stream"))
+    defer_cloud = bool(body.get("blossom_defer_cloud"))
+    force_sequential = bool(body.get("blossom_sequential_mode"))
     locale = normalize_locale(
         body.get("blossom_locale")
         or body.get("locale")
@@ -1849,6 +2217,8 @@ async def route_chat(request: Request):
                     last_user_message,
                     None,
                     defer_voice=False,
+                    defer_cloud=defer_cloud,
+                    force_sequential=force_sequential,
                     locale=locale,
                 )
                 return final
@@ -1874,6 +2244,8 @@ async def route_chat(request: Request):
                 last_user_message,
                 on_progress=on_progress,
                 defer_voice=VOICE_DEFER_STREAM,
+                defer_cloud=defer_cloud,
+                force_sequential=force_sequential,
                 locale=locale,
             )
             # Stream text first; keep SSE open until TTS finishes (stop comes after audio).

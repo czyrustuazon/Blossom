@@ -76,6 +76,41 @@ When you run `start-server.ps1`:
 
 Logs appear as `[Blossom Eval]` in the ChatRouter console. Disable with `EVAL_ON_STARTUP=false` in `PythonScripts/.env`.
 
+### Boot noise: dry-run FAIL (usually ignore)
+
+On startup you may see something like:
+
+```text
+[Blossom Eval] run --corpus php-modernization --dry-run
+[Blossom Eval] Finished 1 task(s): 0 passed, 1 failed
+[Blossom Eval] FAIL login-mysql
+  [x] no_mysql / uses_pdo / …
+  [x] php_syntax: 'php' is not recognized …
+[Blossom Eval] dry-run failed — skipping live eval
+```
+
+**Why it shows up**
+
+- Startup always runs a **dry-run** first. Dry-run does **not** call the coder; fixtures stay as the old broken code.
+- Checks still expect a modernized file (`PDO`, `password_hash`, no `mysql_`) → **expected FAIL**.
+- If `php` is not on PATH, the `php -l` syntax check fails too (environment, not Blossom chat).
+- A non-zero dry-run currently **skips the live LLM eval** on boot — so this is not evidence the coder is bad; the model never ran.
+
+**When it actually matters**
+
+- You are measuring coding quality / PHP modernization pass rate.
+- Then: put `php` on PATH if you want syntax checks, and run a **live** eval with ChatRouter up:
+
+```powershell
+python tools/eval/run_eval.py run --corpus php-modernization
+python tools/eval/run_eval.py report --corpus php-modernization
+```
+
+**When to ignore**
+
+- Daily companion / casual chat / Voice — ChatRouter is fine; this is harness telemetry only.
+- To silence boot eval entirely: `EVAL_ON_STARTUP=false` in `PythonScripts/.env`.
+
 ## Not LoRA training data
 
 Eval corpora measure **pass rate**. Failed runs inform `coding_lessons` / rule updates (Phase A). LoRA (Phase C) is separate.

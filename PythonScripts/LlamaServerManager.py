@@ -41,7 +41,7 @@ CODER_MODEL = primary_coder().path
 
 LLAMA_PORT = int(os.getenv("LLAMA_SERVER_PORT", "11434"))
 PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "16384"))
-CODER_CTX = int(os.getenv("CODER_CTX_SIZE", "16384"))
+CODER_CTX = int(os.getenv("CODER_CTX_SIZE", "32768"))
 # Shared default; role-specific overrides let big coders spill layers to CPU/RAM.
 _DEFAULT_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
 PERSONA_GPU_LAYERS = int(os.getenv("PERSONA_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS)))

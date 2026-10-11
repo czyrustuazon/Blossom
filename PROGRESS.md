@@ -251,6 +251,7 @@ Client (Companion / Blossom Assist / any OpenAI client)
 - **Passage of time** needs prompt injection: timestamps were already in SQLite/Chroma but invisible to the model until `[TEMPORAL CONTEXT]` + stamped history + aged memories.
 - **Dynamism ≠ random web search.** News can add topics; reply-shape + personality notes fix robot invites. Character (e.g. Haruhi) may invite weird stuff *sometimes* — ban the template loop, not the trait.
 - Persona size: **8B drifts more; 14B (current) is the practical step on one 4090**; 32B+ helps more but fights coder VRAM; **LoRA** later only for locked always-on voice. No size = zero drift.
+- **Startup `[Blossom Eval] FAIL` on dry-run is usually noise.** Dry-run does not call the coder (fixtures stay broken → checks fail); missing `php` on PATH fails syntax checks too; dry-run fail currently skips live eval. Ignore for companion chat. Care only when measuring coding pass rate — then run a live `tools/eval/run_eval.py run`. Detail: `tools/eval/README.md` → “Boot noise: dry-run FAIL”.
 
 ---
 
@@ -394,6 +395,7 @@ Dated work notes (newest first). High-level “what’s built” stays above; th
 - Bundled corpora: `php-modernization`, `example-csharp`, `example-reverse-engineering`.
 - Pass rate in `Mind/eval_results.db`; `run_eval.py report` for trends.
 - Wired into `start-server.ps1` pip install + ChatRouter lifespan background eval.
+- **Ops note (2026-08-08):** boot dry-run FAIL (`login-mysql`, no `php` on PATH) is expected harness noise, not a ChatRouter outage — see `tools/eval/README.md` “Boot noise: dry-run FAIL”.
 
 **P5 — NLPP domain lesson seeds (`tools/seed/`)**
 

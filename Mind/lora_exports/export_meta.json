@@ -1,0 +1,15 @@
+{
+  "feedback_examples": 2,
+  "rules_habit_examples": 11,
+  "total": 13,
+  "sharegpt": "C:\\Users\\Zepse\\Documents\\Blossom\\Mind\\lora_exports\\sharegpt.jsonl",
+  "alpaca": "C:\\Users\\Zepse\\Documents\\Blossom\\Mind\\lora_exports\\alpaca.jsonl",
+  "source_patterns": [
+    "blossom_assistant_cursor",
+    "blossom_assistant_gemini",
+    "blossom_assistant_claude",
+    "blossom_assistant_deescalate",
+    "cursor_manual",
+    "local_coder"
+  ]
+}
