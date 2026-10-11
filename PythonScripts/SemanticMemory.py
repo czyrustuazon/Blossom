@@ -3,7 +3,8 @@ Long-term semantic memories in ChromaDB (local persistent vectors).
 
 Collections:
   - relationship_life  : personal / relationship memories
-  - coding_lessons     : bugs, fixes, Gemini/local coding takeaways
+  - coding_lessons     : bugs, fixes, Gemini/local coding takeaways + NLPP lessons
+  - nlpp_hard_bans     : critical NLPP bans (always retrieved on coding)
   - language_lessons   : Japanese-teaching facts (user-verified)
   - web_knowledge      : useful findings learned from web search
 """
@@ -31,14 +32,19 @@ MIND_DIR = PROJECT_ROOT / "Mind"
 CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(MIND_DIR / "chromadb")))
 COLLECTION_LIFE = os.getenv("CHROMA_COLLECTION_LIFE", "relationship_life")
 COLLECTION_CODING = os.getenv("CHROMA_COLLECTION_CODING", "coding_lessons")
+COLLECTION_HARD_BANS = os.getenv("CHROMA_COLLECTION_HARD_BANS", "nlpp_hard_bans")
 COLLECTION_LANGUAGE = os.getenv("CHROMA_COLLECTION_LANGUAGE", "language_lessons")
 COLLECTION_WEB = os.getenv("CHROMA_COLLECTION_WEB", "web_knowledge")
 # Back-compat alias used by older code/docs
 MEMORY_COLLECTION = COLLECTION_LIFE
 MEMORY_TOP_K = max(1, int(os.getenv("MEMORY_TOP_K", "5")))
+# Coding path: hard bans always + broader lesson recall than default MEMORY_TOP_K.
+HARD_BANS_TOP_K = max(1, int(os.getenv("HARD_BANS_TOP_K", "5")))
+CODING_LESSONS_TOP_K = max(1, int(os.getenv("CODING_LESSONS_TOP_K", "10")))
+HARD_BANS_PROMPT_MAX_CHARS = max(400, int(os.getenv("HARD_BANS_PROMPT_MAX_CHARS", "2200")))
 # Skip memories demoted below this importance when querying.
 MEMORY_MIN_IMPORTANCE = max(0, int(os.getenv("MEMORY_MIN_IMPORTANCE", "2")))
-MEMORY_PROMPT_MAX_CHARS = max(500, int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "3000")))
+MEMORY_PROMPT_MAX_CHARS = max(500, int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "4000")))
 
 logger = logging.getLogger(__name__)
 

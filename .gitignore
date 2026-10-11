@@ -51,6 +51,10 @@ Voice/**/*.index
 Voice/**/*.safetensors
 Voice/**/*.npy
 
+# Agent probe scripts (Blossom Assistant research loop)
+.blossom/scratch/*
+!.blossom/scratch/.gitkeep
+
 # OS / editor
 .DS_Store
 Thumbs.db

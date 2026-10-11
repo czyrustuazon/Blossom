@@ -570,4 +570,15 @@ Dated work notes (newest first). High-level “what’s built” stays above; th
 
 ---
 
-*Last updated: 2026-08-02 — P5/P6/P7 shipped; hybrid escalate/de-escalate/eval stack session logged.*
+### Session — 2026-10-11
+
+**P5b nlpp-decomp matching RAG seeds**
+- Chunk pack at `../nlpp-decomp/docs/rag_seeds/` (policy, VA/segments, ARMCC flags, discovery, libraries, match loop, habits, negatives, CLI).
+- `schema.md` maps `symbols/*.csv` row types → document templates.
+- Exported `export/chroma_lessons.jsonl` (**28** rows) and seeded into Chroma `coding_lessons`.
+- Expanded `10_negative/` from `handoff_drafts/` (Lookup, Str::Reserve, BindMSel, OptionMenu size, TaggedStr/Utf8, DrawTextToPane, ctor scheduler) + dedicated cleanup-pads chunk.
+- Spot-check: `docs/rag_seeds/export/retrieval_spotcheck.md` — VA/relink/flags/pads/Lookup/DrawText/BindMSel.
+
+---
+
+*Last updated: 2026-10-11 — P5b nlpp-decomp RAG seed pack authored + seeded.*

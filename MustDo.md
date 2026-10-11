@@ -1215,6 +1215,30 @@ Add or expand these sections in **`README.md`**. Copy/adapt from this file — d
 
 ## API reference
 
+### `POST /v1/research`
+
+Shared multi-agent research pipeline (`ResearchPipeline.py`). Used by ChatRouter chat turns and by Blossom Assistant for documentation-heavy tasks.
+
+**Body:**
+
+```json
+{ "query": "string (required)", "coding": true }
+```
+
+**Success:**
+
+```json
+{
+  "ok": true,
+  "brief": "prompt-ready research block (may be empty)",
+  "mode": "skip | simple | deep",
+  "sources": [{ "title": "...", "url": "...", "snippet": "..." }],
+  "queries": ["..."]
+}
+```
+
+**Assistant orchestrator hook:** when the task looks like docs/version/API research, `POST http://<chatrouter>/v1/research` and prepend `brief` to the model context before the tool loop. No TS reimplementation of roles.
+
 ### `POST /v1/memory/coding`
 
 **Body:**
@@ -1367,6 +1391,22 @@ Ship first, validate when convenient. Do not block the next implementation item 
 - [x] Four lessons inserted into Chroma (`seed_id` metadata)
 - [ ] Optional: confirm RAG inject on img.bin / BCLIM / TRB chrome ask
 - Re-seed only if Chroma wiped: `python tools/seed/seed_nlpp_lessons.py`
+
+### P5b nlpp-decomp matching RAG seeds (chunk pack)
+
+Authoritative chunks: `../nlpp-decomp/docs/rag_seeds/` (policy / address / compiler / discovery / libraries / match loop / habits / negative / CLI). Schema for `symbols/*.csv` → document templates in `schema.md`.
+
+```powershell
+cd ..\nlpp-decomp
+python docs/rag_seeds/export_seeds.py
+cd ..\Blossom
+python tools/seed/seed_chroma_lessons.py --jsonl ..\nlpp-decomp\docs\rag_seeds\export\chroma_lessons.jsonl
+# dry-run first: add --dry-run
+```
+
+- [x] Export + dry-run counts rows (28 after negatives expansion)
+- [x] Seed into `coding_lessons` (idempotent by `seed_id`) — 2026-10-11
+- [x] Spot-check retrieval — see `../nlpp-decomp/docs/rag_seeds/export/retrieval_spotcheck.md`
 
 ### P6 LoRA pipeline (tools/lora)
 

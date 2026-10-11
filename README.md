@@ -22,6 +22,20 @@ Point clients at `http://127.0.0.1:8081/v1/chat/completions` (or your Tailscale 
 | **Blossom Companion** (`Documents\Blossom Companion`) | Chat UI: personas, JA/EN locale, spoken replies, 👍/👎 on coding answers |
 | **Blossom Assistant** (`Documents\Blossom Assistant`) | VS Code extension: agent loop, Apply/delete, escalation, editor context |
 
+## Research pipeline (shared)
+
+ChatRouter gates web research (`skip` / `simple` / `deep`) via [`PythonScripts/ResearchPipeline.py`](./PythonScripts/ResearchPipeline.py). Deep mode plans multiple queries, searches in parallel, optionally fetches page text, and synthesizes a cited brief into `web_knowledge`. Progress streams as `blossom.thought` steps (`research_gate`, `research_plan`, `research_search`, `research_fetch`, `research_synth`).
+
+**API (Blossom Assistant hook):** `POST /v1/research`
+
+```json
+{ "query": "latest FastAPI lifespan docs", "coding": true }
+```
+
+Response: `{ "ok": true, "brief": "...", "mode": "skip|simple|deep", "sources": [...], "queries": [...] }`.
+
+In the Assistant orchestrator, call this when a task looks documentation-heavy and prepend `brief` to the model context. Do not reimplement planner/search roles in TypeScript — ChatRouter owns the pipeline. Env: `RESEARCH_PIPELINE_ENABLED`, `RESEARCH_DEEP_ENABLED`, `RESEARCH_MAX_QUERIES`, `RESEARCH_TIMEOUT_SEC` (see `.env.example`).
+
 ## Vision
 
 Blossom is a **cost-aware hybrid stack**, not a bet that one local model replaces Cursor:
@@ -111,7 +125,7 @@ Env tuning (see `PythonScripts/.env.example`): `HANDOFF_COMPRESS_ENABLED`, `HAND
 
 1. Successful coding paths can auto-learn into Chroma `coding_lessons`
 2. **👍/👎** curates noise via `feedback_turns` (SQLite)
-3. Domain lessons live in Chroma after one-time seed (P5 — already applied; re-run manually only if needed: `python tools/seed/seed_nlpp_lessons.py`)
+3. Domain lessons: `python tools/seed/seed_chroma_lessons.py` → `nlpp_hard_bans` + `coding_lessons` (see `tools/seed/README.md`). Legacy four-pack: `seed_nlpp_lessons.py`.
 4. API: `POST /v1/memory/coding` for extension-verified lessons
 
 **Phase B — Eval harness** (`tools/eval/`):

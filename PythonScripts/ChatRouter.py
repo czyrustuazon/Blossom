@@ -5,13 +5,14 @@ Flow:
   casual   -> persona llama-server
               (+ optional web search → web_knowledge Chroma when triggered)
   coding   -> hot-swap through local coder ladder (CODER_MODELS / CODER_ALT)
-              (+ coding_lessons + web_knowledge RAG)
-              -> live web search (DuckDuckGo/Brave/Serper/Bing) when enabled
+              (+ nlpp_hard_bans always + coding_lessons + web_knowledge RAG)
+              -> gated research pipeline (skip/simple/deep) when enabled
               -> Claude/Gemini only if local coders fail (CLOUD_FALLBACK_ORDER)
               -> learn useful answers into coding_lessons / web_knowledge
               -> hot-swap back to persona for voice rewrite
   japanese -> persona first (+ language_lessons RAG); cloud last resort
               -> correctness feedback (thumbs) may store language_lessons
+  research -> POST /v1/research { query, coding? } → shared ResearchPipeline
   feedback -> POST /v1/feedback { feedback_id, verdict: correct|incorrect, note? }
               coding: boost / delete coding_lessons; japanese: learn only on correct
 
@@ -83,12 +84,15 @@ from MemoryUpdater import (
     CompanionEngine,
 )
 from SemanticMemory import (
+    CODING_LESSONS_TOP_K,
     COLLECTION_CODING,
+    COLLECTION_HARD_BANS,
     COLLECTION_LANGUAGE,
     COLLECTION_WEB,
+    HARD_BANS_PROMPT_MAX_CHARS,
+    HARD_BANS_TOP_K,
     format_memories_for_prompt,
     learn_coding_lesson,
-    learn_web_findings,
     query_memories,
 )
 from FeedbackStore import (
@@ -99,9 +103,14 @@ from FeedbackStore import (
 from WebSearch import (
     WEB_SEARCH_ENABLED,
     WEB_SEARCH_PROVIDER,
-    format_search_results_for_prompt,
     should_search,
-    web_search,
+)
+from ResearchPipeline import (
+    RESEARCH_DEEP_ENABLED,
+    RESEARCH_PIPELINE_ENABLED,
+    classify_research_need,
+    run_research_pipeline,
+    run_simple_search,
 )
 from VoiceClient import (
     SPEAK_EMOTIONS,
@@ -792,13 +801,25 @@ def _cloud_facts(
     raise HTTPException(status_code=503, detail=detail)
 
 
-def _gather_web_context(
+def _research_complete_fn(*, coding: bool) -> Callable[[list[dict[str, str]], float], str]:
+    """Short local completion for research plan/synth (uses coder or persona role)."""
+
+    def complete(messages: list[dict[str, str]], temperature: float) -> str:
+        role = "coder" if coding else "persona"
+        server_manager.ensure(role)
+        response = _local_completion(list(messages), temperature=temperature)
+        return _message_text(response["choices"][0]["message"])
+
+    return complete
+
+
+def _gather_web_context_simple(
     user_prompt: str,
     *,
     coding: bool = False,
     on_progress: ProgressFn | None = None,
 ) -> str:
-    """Retrieve prior web_knowledge and optionally run a live search + learn."""
+    """Legacy single-query web path (rollback when RESEARCH_PIPELINE_ENABLED=false)."""
     blocks: list[str] = []
     focus = _extract_user_request(user_prompt)
 
@@ -821,36 +842,37 @@ def _gather_web_context(
     if not should_search(user_prompt, coding=coding):
         return "\n\n".join(blocks)
 
-    _think(
-        on_progress,
-        "web_search",
-        f"Searching the web ({WEB_SEARCH_PROVIDER}) for: {focus[:80]!r}…",
-        provider=WEB_SEARCH_PROVIDER,
-    )
-    try:
-        results = web_search(focus)
-    except Exception as exc:
-        logger.warning("Web search failed: %s", exc)
-        _think(on_progress, "web_search_error", f"Web search failed: {exc}")
-        return "\n\n".join(blocks)
-
-    if not results:
-        _think(on_progress, "web_search", "No web results.")
-        return "\n\n".join(blocks)
-
-    _think(
-        on_progress,
-        "web_search",
-        f"Got {len(results)} result(s); storing in web_knowledge…",
-        count=len(results),
-    )
-    learn_web_findings(
-        focus,
-        results,
-        source_provider=WEB_SEARCH_PROVIDER,
-    )
-    blocks.append(format_search_results_for_prompt(results))
+    search_block, _sources = run_simple_search(focus, on_progress=on_progress)
+    if search_block:
+        blocks.append(search_block)
     return "\n\n".join(blocks)
+
+
+def _gather_web_context(
+    user_prompt: str,
+    *,
+    coding: bool = False,
+    on_progress: ProgressFn | None = None,
+    complete_fn: Callable[[list[dict[str, str]], float], str] | None = None,
+) -> str:
+    """Retrieve prior web_knowledge and optionally run gated research + learn."""
+    if not RESEARCH_PIPELINE_ENABLED:
+        return _gather_web_context_simple(
+            user_prompt, coding=coding, on_progress=on_progress
+        )
+
+    fn = complete_fn
+    mode = classify_research_need(user_prompt, coding=coding)
+    if mode == "deep" and fn is None:
+        fn = _research_complete_fn(coding=coding)
+
+    result = run_research_pipeline(
+        user_prompt,
+        coding=coding,
+        on_progress=on_progress,
+        complete_fn=fn,
+    )
+    return result.brief
 
 
 def _local_coder_answer(
@@ -918,12 +940,37 @@ def _local_coder_answer(
         )
 
     lesson_block = ""
+    if not sequential:
+        _think(on_progress, "nlpp_hard_bans", "Retrieving NLPP hard bans…")
+        bans = query_memories(
+            focus, collection=COLLECTION_HARD_BANS, top_k=HARD_BANS_TOP_K
+        )
+        ban_block = format_memories_for_prompt(
+            bans,
+            heading="[NLPP HARD BANS — never violate these]",
+            max_chars=HARD_BANS_PROMPT_MAX_CHARS,
+        )
+        if bans:
+            _think(
+                on_progress,
+                "nlpp_hard_bans",
+                f"Loaded {len(bans)} hard ban(s).",
+                count=len(bans),
+            )
+            lesson_block = ban_block
+
     if not sequential and not should_skip_coding_lessons(tier, user_prompt=user_prompt):
         _think(on_progress, "coding_lessons", "Retrieving coding lessons from memory…")
-        lessons = query_memories(focus, collection=COLLECTION_CODING)
-        lesson_block = format_memories_for_prompt(
+        lessons = query_memories(
+            focus, collection=COLLECTION_CODING, top_k=CODING_LESSONS_TOP_K
+        )
+        lessons_text = format_memories_for_prompt(
             lessons, heading="[PRIOR CODING LESSONS — prefer these patterns when relevant]"
         )
+        if lessons_text:
+            lesson_block = (
+                f"{lesson_block}\n\n{lessons_text}" if lesson_block else lessons_text
+            )
         if lessons:
             _think(
                 on_progress,
@@ -937,7 +984,7 @@ def _local_coder_answer(
         _think(
             on_progress,
             "coding_lessons",
-            "Skipped coding lessons (tiny edit + editor context).",
+            "Skipped coding lessons (tiny edit + editor context); hard bans still applied.",
         )
 
     system_content = (
@@ -1838,6 +1885,10 @@ async def health():
             "enabled": WEB_SEARCH_ENABLED,
             "provider": WEB_SEARCH_PROVIDER,
         },
+        "research_pipeline": {
+            "enabled": RESEARCH_PIPELINE_ENABLED,
+            "deep_enabled": RESEARCH_DEEP_ENABLED,
+        },
         "supports_thoughts": True,
         "supports_memory_write": True,
         "supports_feedback": True,
@@ -2114,6 +2165,75 @@ async def register_feedback(request: Request):
         "route": route,
         "source": source,
     }
+
+
+@app.post("/v1/research")
+async def research_endpoint(request: Request):
+    """
+    Shared research pipeline for Blossom Assistant / other clients.
+    Body JSON: { "query": str, "coding": bool }
+    Returns: { brief, mode, sources, queries }
+    """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    query = str(
+        body.get("query") or body.get("q") or body.get("prompt") or ""
+    ).strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    coding = bool(body.get("coding", True))
+
+    def _run() -> dict[str, Any]:
+        if not RESEARCH_PIPELINE_ENABLED:
+            focus = _extract_user_request(query)
+            prior = query_memories(focus, collection=COLLECTION_WEB)
+            blocks: list[str] = []
+            if prior:
+                blocks.append(
+                    format_memories_for_prompt(
+                        prior,
+                        heading="[PRIOR WEB KNOWLEDGE — from earlier searches]",
+                    )
+                )
+            mode = "skip"
+            sources: list[dict[str, str]] = []
+            if should_search(query, coding=coding):
+                block, sources = run_simple_search(focus)
+                if block:
+                    blocks.append(block)
+                    mode = "simple"
+            return {
+                "ok": True,
+                "brief": "\n\n".join(blocks),
+                "mode": mode,
+                "sources": sources,
+                "queries": [focus] if mode == "simple" else [],
+            }
+
+        complete = None
+        if classify_research_need(query, coding=coding) == "deep":
+            complete = _research_complete_fn(coding=coding)
+        result = run_research_pipeline(
+            query,
+            coding=coding,
+            complete_fn=complete,
+        )
+        return {
+            "ok": True,
+            "brief": result.brief,
+            "mode": result.mode,
+            "sources": result.sources,
+            "queries": result.queries,
+        }
+
+    try:
+        return await asyncio.get_running_loop().run_in_executor(_executor, _run)
+    except Exception as exc:
+        logger.exception("research pipeline failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/memory/coding")

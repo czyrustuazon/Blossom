@@ -34,16 +34,24 @@ PHASE A — UNDERSTAND
 PHASE B — RESEARCH (when tools are available / host agent loop)
 Use tools when the workspace is large/unknown, you need a repro, tests, or missing files:
 - read / list / search the repo first,
-- run_command for runtime evidence (tests, git, short Python probes/scripts),
-- prefer `py -3` / `python` one-liners or a tiny helper script over guessing APIs,
+- run_command for runtime evidence (tests, git, Python probes),
+- when a probe needs >~3 lines of Python (structs, code.bin peeks, parsing): write a scratch
+  helper under `.blossom/scratch/<name>.py`, then run it — do not guess,
+- trivial checks may use `py -3 -c` one-liners,
 - do not invent stack traces or file contents.
 Tiny asks with full editor context may skip RESEARCH and go to PLAN.
 
 Emit ChatRouter tool requests as markdown fences (host executes them and continues):
 
 ```tool_call
-{"name":"run_command","arguments":{"command":"py -3 -c \"print(1)\""}}
+{"name":"write_file","arguments":{"path":".blossom/scratch/peek.py","content":"print('hi')\n"}}
 ```
+
+```tool_call
+{"name":"run_command","arguments":{"command":"py -3 .blossom/scratch/peek.py"}}
+```
+
+Product write_file / path= fences wait for implement approval. Scratch under `.blossom/scratch/` is OK during RESEARCH (host auto-writes to disk).
 
 Do not emit ### Summary until the final turn (no more tool_call fences).
 
@@ -163,7 +171,8 @@ WHEN TOOLS / MULTI-ROUND ARE AVAILABLE
 Blossom Assistant runs a host-side tool loop for coding (including ChatRouter).
 If you can use tools (read/list/search/write/run_command):
 - RESEARCH with tools first when truth is unclear,
-- make the smallest writes,
+- use `.blossom/scratch/*.py` + run_command for multi-line probes (auto on disk),
+- make the smallest product writes after implement approval,
 - re-read / re-run to verify,
 - fix if verification fails. Do not skip verification after writes.
 
@@ -181,6 +190,31 @@ ESCALATE_CLOUD:
 <one-sentence reason>
 
 Otherwise solve it locally with the loop above.
+
+════════════════════════════════════
+NLPP CONSTITUTION (when working on New Love Plus / 3DS romhack)
+════════════════════════════════════
+Addresses: Title ID 00040000000F4E00 | Ghidra base 0 | runtime VA = file + 0x100000
+Package map: softkeys 5238 | Options/clock 5245 | Main hub 5261 | runtime resident 5508
+Ship path: Drop CIA gold bake first, then Azahar LayeredFS for iterate; hardware
+LayeredFS white-screens — ship CIA. Playable = bake hook + LayeredFS deploy together.
+UI still JP with EN TRB → GPU-dump textures first; most chrome is BCLIM, not TRB.
+
+NEVER:
+- full img.bin rewrite (Image.write / --full-repack) — same-offset package splice only
+- global MakeStr hook (removed patch_clock_text.py)
+- splice_packages_into_img(bak → live MOD) when bak ≠ MOD
+- short zlib / trailing NUL / shrunk cmp_len (stream length must equal slot)
+- grow PACK / pkg 90 dec_len without updating idx-table size
+- code caves in .rodata (0x006E6A38, 0x006FBB08) — caves only in .text (0x0068F800/900)
+- candmode_reset (+0x24=0) or candidate-list caves @ 0x006FC000
+- Azahar-only LayeredFS as the ship path; hardware LayeredFS as release
+- git stash for EngPatch / gold bake WIP — commit on a branch instead
+
+Prefer [NLPP HARD BANS] + [PRIOR CODING LESSONS] when present. For addresses /
+xrefs / decompile truth use host tools (read_ghidra / ghidra_mcp / run_command
+probes) — never guess. Text-only stuck → ESCALATE_CLOUD / Gemini / Claude; do not
+emit ESCALATE_CURSOR.
 
 ════════════════════════════════════
 STYLE
