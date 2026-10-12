@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "groups": {
+    "process": {
+      "scope": "general",
+      "family": "cross-project",
+      "description": "Agent/process habits usable in any repo"
+    },
+    "security-ops": {
+      "scope": "general",
+      "family": "cross-project",
+      "description": "Auth, networking, cache, VPN operational patterns"
+    },
+    "data": {
+      "scope": "general",
+      "family": "cross-project",
+      "description": "Identity keys, soft-delete, registry hygiene"
+    },
+    "ml-local": {
+      "scope": "general",
+      "family": "cross-project",
+      "description": "Local diffusion/LoRA lessons shared across GPU apps"
+    },
+    "architecture": {
+      "scope": "general",
+      "family": "cross-project",
+      "description": "Service/UI ownership patterns"
+    },
+    "nlpp-re": {
+      "scope": "nlpp",
+      "family": "nlpp-re",
+      "description": "NLPP reverse-engineering hard bans + lessons"
+    },
+    "product-manual": {
+      "scope": "product",
+      "description": "Project-specific operator manuals (retrieved only when workspace matches)"
+    }
+  },
+  "families": {
+    "cross-project": { "match": [] },
+    "nlpp-re": { "match": ["nlpp", "img.bin", "layeredfs", "azahar"] },
+    "decomp-matching": {
+      "match": [
+        "decomp",
+        "ctrdecomp",
+        "nlpp-decomp",
+        "code.bin",
+        "matching-decomp",
+        "decomp-matching"
+      ]
+    },
+    "homelab-media": {
+      "match": ["anime-db-stream", "anime-db-tracker"]
+    },
+    "local-diffusion": {
+      "match": [
+        "waifu redraw",
+        "waifu-redraw",
+        "instagram model ai",
+        "animewallpaper generator",
+        "animewallpaper"
+      ]
+    },
+    "appsec": {
+      "match": ["trace-viper", "trace viper", "pen-tester", "pen-testing"]
+    }
+  },
+  "sources": [
+    {
+      "id": "general-process",
+      "group": "process",
+      "scope": "general",
+      "family": "cross-project",
+      "product": "general",
+      "kind": "product_jsonl",
+      "path": "general/process.jsonl"
+    },
+    {
+      "id": "general-security-ops",
+      "group": "security-ops",
+      "scope": "general",
+      "family": "cross-project",
+      "product": "general",
+      "kind": "product_jsonl",
+      "path": "general/security_ops.jsonl"
+    },
+    {
+      "id": "general-data",
+      "group": "data",
+      "scope": "general",
+      "family": "cross-project",
+      "product": "general",
+      "kind": "product_jsonl",
+      "path": "general/data.jsonl"
+    },
+    {
+      "id": "general-ml-local",
+      "group": "ml-local",
+      "scope": "general",
+      "family": "cross-project",
+      "product": "general",
+      "kind": "product_jsonl",
+      "path": "general/ml_local.jsonl"
+    },
+    {
+      "id": "general-architecture",
+      "group": "architecture",
+      "scope": "general",
+      "family": "cross-project",
+      "product": "general",
+      "kind": "product_jsonl",
+      "path": "general/architecture.jsonl"
+    },
+    {
+      "id": "nlpp-chroma",
+      "group": "nlpp-re",
+      "scope": "nlpp",
+      "family": "nlpp-re",
+      "product": "",
+      "kind": "nlpp_jsonl",
+      "path": "nlpp/chroma_lessons.jsonl"
+    },
+    {
+      "id": "decomp-matching-rag",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "decomp-matching",
+      "product": "decomp-matching",
+      "kind": "meta_jsonl",
+      "path": "C:/Users/Zepse/Documents/nlpp-decomp/docs/rag_seeds/export/chroma_lessons.jsonl"
+    },
+    {
+      "id": "pen-testing",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "appsec",
+      "product": "pen-testing",
+      "kind": "pack",
+      "path": "C:/Users/Zepse/Documents/trace-viper-pen-tester/rag-seeds"
+    },
+    {
+      "id": "anime-db-stream",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "homelab-media",
+      "product": "anime-db-stream",
+      "kind": "md",
+      "path": "C:/Users/Zepse/Documents/anime-db-stream/docs/rag-seed.md"
+    },
+    {
+      "id": "anime-db-tracker",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "homelab-media",
+      "product": "anime-db-tracker",
+      "kind": "dir",
+      "path": "C:/Users/Zepse/Documents/anime-db-tracker/rag-seed"
+    },
+    {
+      "id": "waifu-redraw",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "local-diffusion",
+      "product": "waifu-redraw",
+      "kind": "md",
+      "path": "C:/Users/Zepse/Documents/Waifu Redraw/rag/seed.md"
+    },
+    {
+      "id": "instagram-model-ai",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "local-diffusion",
+      "product": "instagram-model-ai",
+      "kind": "product_jsonl",
+      "path": "C:/Users/Zepse/Documents/Instagram Model AI/docs/llm_train/instagram_model_ai_rag_seed.jsonl"
+    },
+    {
+      "id": "animewallpaper-generator",
+      "group": "product-manual",
+      "scope": "product",
+      "family": "local-diffusion",
+      "product": "animewallpaper-generator",
+      "kind": "dir",
+      "path": "C:/Users/Zepse/Documents/AnimeWallpaper Generator/rag"
+    }
+  ]
+}

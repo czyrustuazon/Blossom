@@ -1,0 +1,32 @@
+{
+  "id": "exidx-flags",
+  "title": "Pick compile flags from exidx",
+  "domain": "decomp",
+  "tags": ["exceptions", "exidx", "armcc"],
+  "mode": "analyze_only",
+  "prompt": "A game function has an .ARM.exidx entry of kind extab and ends with bl X; pop {r4, pc} (non-tail last call). Which compiler flag set do you use for matching, and what attribute may be needed on the function? Contrast with a cantunwind leaf.",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "exceptions",
+      "type": "response_contains",
+      "value": "--exceptions",
+      "case_insensitive": true,
+      "description": "Uses --exceptions for extab"
+    },
+    {
+      "id": "throw",
+      "type": "response_regex",
+      "pattern": "throw\\s*\\(\\s*\\)",
+      "case_insensitive": true,
+      "description": "Mentions throw() for non-tail last call"
+    },
+    {
+      "id": "cantunwind_plain",
+      "type": "response_regex",
+      "pattern": "cantunwind|plain flag|without --exceptions|no --exceptions",
+      "case_insensitive": true,
+      "description": "Contrasts cantunwind / plain flags"
+    }
+  ]
+}

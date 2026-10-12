@@ -1,0 +1,25 @@
+{
+  "id": "va-math",
+  "title": "File offset vs runtime VA",
+  "domain": "decomp",
+  "tags": ["address", "ghidra", "code.bin"],
+  "mode": "analyze_only",
+  "prompt": "In a 3DS matching-decomp project (Ghidra image base 0), a function is listed at file offset 0x00542828 in the symbol CSV. What is its runtime virtual address? State the formula and the resulting VA in hex. Mention that FUN_ names use file offsets, not VAs.",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "formula",
+      "type": "response_regex",
+      "pattern": "0x100000|\\+\\s*0x100000|plus\\s+0x100000",
+      "case_insensitive": true,
+      "description": "Mentions VA = file offset + 0x100000"
+    },
+    {
+      "id": "va_value",
+      "type": "response_regex",
+      "pattern": "0x00642828|0x642828",
+      "case_insensitive": true,
+      "description": "Gives VA 0x00642828"
+    }
+  ]
+}

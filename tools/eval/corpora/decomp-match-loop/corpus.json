@@ -1,0 +1,7 @@
+{
+  "id": "decomp-match-loop",
+  "title": "Matching decomp procedure (response-only)",
+  "description": "Scores whether the model recalls the matching-decomp session loop: VA math, relink gate, vanilla target, exidx flags. No file apply / no ARMCC.",
+  "domains": ["reverse-engineering", "decomp", "assembly"],
+  "tasks_dir": "tasks"
+}

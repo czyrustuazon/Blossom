@@ -1,0 +1,25 @@
+{
+  "id": "vanilla-not-patched",
+  "title": "Match vanilla retail, not a patch binary",
+  "domain": "decomp",
+  "tags": ["policy", "vanilla"],
+  "mode": "analyze_only",
+  "prompt": "For a matching decompilation of New Love Plus+, should sources target the English patcher's release/name_input_code.bin or the vanilla ExeFS code.bin? Explain in one short paragraph why matching the patched binary is wrong.",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "vanilla",
+      "type": "response_regex",
+      "pattern": "vanilla|retail|unpatched",
+      "case_insensitive": true,
+      "description": "Chooses vanilla/retail"
+    },
+    {
+      "id": "reject_patched",
+      "type": "response_regex",
+      "pattern": "not (match|target)|avoid|wrong|do not|don't|patched|translation|english cave|localization",
+      "case_insensitive": true,
+      "description": "Rejects matching the patched binary"
+    }
+  ]
+}

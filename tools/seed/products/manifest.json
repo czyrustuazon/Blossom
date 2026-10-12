@@ -1,0 +1,13 @@
+{
+  "note": "Product manuals live in their repos; Blossom indexes them via ../catalog.json sources with scope=product.",
+  "families": {
+    "homelab-media": ["anime-db-stream", "anime-db-tracker"],
+    "local-diffusion": [
+      "waifu-redraw",
+      "instagram-model-ai",
+      "animewallpaper-generator"
+    ],
+    "appsec": ["pen-testing"],
+    "nlpp-re": ["nlpp"]
+  }
+}

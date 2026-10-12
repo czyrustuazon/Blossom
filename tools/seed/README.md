@@ -1,68 +1,89 @@
-# NLPP Chroma lesson seeds
+# Blossom RAG seed catalog
 
-Primary headstart for Blossom coding/RE: JSONL corpus → Chroma `nlpp_hard_bans` + `coding_lessons`.
+Seeds are organized by **scope** and **group**, then stamped into Chroma with
+`family` / `product` so retrieval stays useful across many projects.
 
-## Quick apply
+## Layout
 
-From repo root (ChatRouter not required):
+```
+tools/seed/
+  catalog.json              # registry of all sources
+  general/                  # cross-project lessons (always retrieved)
+    process.jsonl
+    security_ops.jsonl
+    data.jsonl
+    ml_local.jsonl
+    architecture.jsonl
+  nlpp/                     # NLPP RE hard bans + lessons
+    chroma_lessons.jsonl
+    lessons.json            # legacy P5 pack
+  products/manifest.json    # family → product map (docs)
+```
+
+## Taxonomy
+
+| Field | Values |
+|-------|--------|
+| `scope` | `general` (always) · `nlpp` · `product` (only if workspace matches) · `learned` |
+| `group` | `process` · `security-ops` · `data` · `ml-local` · `architecture` · `nlpp-re` · `product-manual` |
+| `family` | `cross-project` · `homelab-media` · `local-diffusion` · `appsec` · `nlpp-re` · `decomp-matching` |
+| `product` | e.g. `anime-db-stream`, `waifu-redraw`, `decomp-matching`, `general` |
+
+**Families**
+
+| Family | Products |
+|--------|----------|
+| `homelab-media` | anime-db-stream, anime-db-tracker |
+| `local-diffusion` | waifu-redraw, instagram-model-ai, animewallpaper-generator |
+| `appsec` | pen-testing (Trace Viper pack) |
+| `nlpp-re` | NLPP EngPatcher hard bans + lessons |
+| `decomp-matching` | Shared matching-decomp loop (any title; needles: `decomp`, `ctrdecomp`, `code.bin`, …) |
+| `cross-project` | `general/*` lessons |
+
+ChatRouter coding RAG uses `query_coding_lessons`: keeps `general` / `nlpp` /
+`learned`, plus `product` manuals only when editor paths match that product/family.
+
+## Apply everything
 
 ```powershell
+python tools/seed/seed_chroma_lessons.py --catalog --dry-run
+python tools/seed/seed_chroma_lessons.py --catalog --replace
+```
+
+### Apply one group / scope
+
+```powershell
+python tools/seed/seed_chroma_lessons.py --catalog --scope general --replace
+python tools/seed/seed_chroma_lessons.py --catalog --group ml-local --replace
+python tools/seed/seed_chroma_lessons.py --catalog --scope product --replace
+```
+
+## One-off sources (still supported)
+
+```powershell
+# NLPP default JSONL
 python tools/seed/seed_chroma_lessons.py --dry-run
 python tools/seed/seed_chroma_lessons.py
-```
 
-### Pen-testing rag-seeds pack
-
-Ingest `chunks/normalized_for_vectorstore.jsonl` (or `corpus.jsonl`) + `qa/qa_pairs.jsonl` into `coding_lessons` with `product=pen-testing` / `domain=pen-testing` (safety_critical → importance 10; never mixed into `nlpp_hard_bans`):
-
-```powershell
-python tools/seed/seed_chroma_lessons.py --pack "C:\Users\Zepse\Documents\trace-viper-pen-tester\rag-seeds" --dry-run
+# Product pack / dir / md / catalog JSONL
 python tools/seed/seed_chroma_lessons.py --pack "C:\Users\Zepse\Documents\trace-viper-pen-tester\rag-seeds" --replace
+python tools/seed/seed_chroma_lessons.py --dir "C:\Users\Zepse\Documents\AnimeWallpaper Generator\rag" --replace
+python tools/seed/seed_chroma_lessons.py --md "C:\Users\Zepse\Documents\anime-db-stream\docs\rag-seed.md" --replace
+python tools/seed/seed_chroma_lessons.py --jsonl "C:\Users\Zepse\Documents\Instagram Model AI\docs\llm_train\instagram_model_ai_rag_seed.jsonl" --replace
 ```
 
-`--replace` purges prior pen-testing / legacy `trace-viper` seed rows before insert.
+## Collections
 
-Idempotent by `seed_id` in metadata. Re-run after wiping `Mind/chromadb/` or after editing the JSONL.
-
-## Corpus
-
-| File | Role |
-|------|------|
-| `nlpp_chroma_lessons.jsonl` | Atomic lessons (symptom → cause → do/don't → pointer) |
-| `nlpp_lessons.json` | Legacy P5 four-lesson pack (`seed_nlpp_lessons.py`) |
-
-### JSONL row shape
-
-```json
-{"id": "ban-…", "text": "Symptom: …\nCause: …\nDo: …\nDon't: …\nPointer: …", "metadata": {"domain": "img", "kind": "hard_ban", "severity": "critical", "source": "technical.md#§0", "collection_target": "hard_bans", "pkg": 5238}}
-```
-
-| `collection_target` | Chroma collection |
-|---------------------|-------------------|
-| `hard_bans` | `nlpp_hard_bans` (always retrieved on coding, top-k=`HARD_BANS_TOP_K`) |
-| `lessons` | `coding_lessons` (RAG, top-k=`CODING_LESSONS_TOP_K`) |
-
-Severity → importance: critical=10, high=9, medium=7.
-
-## Retrieval (ChatRouter)
-
-On coding route (non-sequential):
-
-1. Always query `nlpp_hard_bans` (even on TINY tier).
-2. Query `coding_lessons` unless TINY+editor skip.
-3. System constitution also lives in `PythonScripts/coding_rules.txt` (NLPP CONSTITUTION).
-
-Env knobs: see `PythonScripts/.env.example` (`CHROMA_COLLECTION_HARD_BANS`, `HARD_BANS_TOP_K`, `CODING_LESSONS_TOP_K`, …).
+| `collection_target` / kind | Chroma collection |
+|----------------------------|-------------------|
+| NLPP `hard_bans` | `nlpp_hard_bans` (always on coding) |
+| everything else | `coding_lessons` (scoped retrieval) |
 
 ## Verify
 
-With ChatRouter up:
-
 ```powershell
-Invoke-RestMethod "http://127.0.0.1:8081/v1/memory/coding?q=img.bin%20zlib&n=5"
+Invoke-RestMethod "http://127.0.0.1:8081/v1/memory/coding?q=letterbox%20never%20stretch&n=5"
 ```
-
-Hard bans are a separate collection (not listed by that endpoint); dry-run / seed summary reports both.
 
 ## Legacy
 
@@ -70,4 +91,4 @@ Hard bans are a separate collection (not listed by that endpoint); dry-run / see
 python tools/seed/seed_nlpp_lessons.py
 ```
 
-Prefer `seed_chroma_lessons.py` for new NLPP knowledge.
+Prefer `seed_chroma_lessons.py --catalog` for new knowledge.

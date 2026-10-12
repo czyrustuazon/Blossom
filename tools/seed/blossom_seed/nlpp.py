@@ -18,7 +18,7 @@ from SemanticMemory import (  # noqa: E402
     add_memory,
 )
 
-DEFAULT_JSON = Path(__file__).resolve().parent.parent / "nlpp_lessons.json"
+DEFAULT_JSON = Path(__file__).resolve().parent.parent / "nlpp" / "lessons.json"
 SOURCE = "seed_nlpp"
 
 

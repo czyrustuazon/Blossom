@@ -93,6 +93,7 @@ from SemanticMemory import (
     HARD_BANS_TOP_K,
     format_memories_for_prompt,
     learn_coding_lesson,
+    query_coding_lessons,
     query_memories,
 )
 from FeedbackStore import (
@@ -961,8 +962,10 @@ def _local_coder_answer(
 
     if not sequential and not should_skip_coding_lessons(tier, user_prompt=user_prompt):
         _think(on_progress, "coding_lessons", "Retrieving coding lessons from memory…")
-        lessons = query_memories(
-            focus, collection=COLLECTION_CODING, top_k=CODING_LESSONS_TOP_K
+        lessons = query_coding_lessons(
+            focus,
+            top_k=CODING_LESSONS_TOP_K,
+            path_hints=attached + [focus],
         )
         lessons_text = format_memories_for_prompt(
             lessons, heading="[PRIOR CODING LESSONS — prefer these patterns when relevant]"
@@ -2282,7 +2285,7 @@ async def memory_coding_search(q: str = "", n: int = 5):
     limit = max(1, min(int(n or 5), 20))
 
     def _search():
-        return query_memories(query, collection=COLLECTION_CODING, top_k=limit)
+        return query_coding_lessons(query, top_k=limit)
 
     try:
         hits = await asyncio.get_running_loop().run_in_executor(_executor, _search)

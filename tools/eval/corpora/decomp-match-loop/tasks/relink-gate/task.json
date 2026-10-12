@@ -1,0 +1,25 @@
+{
+  "id": "relink-gate",
+  "title": "Score 0 is not done without relink",
+  "domain": "decomp",
+  "tags": ["relink", "match", "ctrdecomp"],
+  "mode": "analyze_only",
+  "prompt": "You matched a function with `python -m ctrdecomp diff` at score 0. Is the function done? What must you run next to prove whole-image byte identity, and why can score 0 still be wrong?",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "mentions_relink",
+      "type": "response_contains",
+      "value": "relink",
+      "case_insensitive": true,
+      "description": "Requires relink"
+    },
+    {
+      "id": "not_done_at_score0",
+      "type": "response_regex",
+      "pattern": "not (done|sufficient|enough)|necessary but not|not enough|still (be )?wrong|hides|mask",
+      "case_insensitive": true,
+      "description": "Says score 0 alone is insufficient"
+    }
+  ]
+}

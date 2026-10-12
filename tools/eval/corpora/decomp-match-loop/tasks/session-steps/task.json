@@ -1,0 +1,32 @@
+{
+  "id": "session-steps",
+  "title": "Session loop vocabulary",
+  "domain": "decomp",
+  "tags": ["workflow", "ghidra", "diff", "relink"],
+  "mode": "analyze_only",
+  "prompt": "List the hard gates of a matching-decomp session for one function, in order: how you pick a target, how you navigate the binary, how you score, and what proves the whole image. Name the tools (Ghidra or rdis, diff, relink).",
+  "fixtures": {},
+  "checks": [
+    {
+      "id": "nav",
+      "type": "response_regex",
+      "pattern": "ghidra|rdis",
+      "case_insensitive": true,
+      "description": "Mentions Ghidra or rdis"
+    },
+    {
+      "id": "diff",
+      "type": "response_contains",
+      "value": "diff",
+      "case_insensitive": true,
+      "description": "Mentions diff"
+    },
+    {
+      "id": "relink",
+      "type": "response_contains",
+      "value": "relink",
+      "case_insensitive": true,
+      "description": "Mentions relink"
+    }
+  ]
+}

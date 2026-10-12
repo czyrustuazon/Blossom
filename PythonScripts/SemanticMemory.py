@@ -3,10 +3,16 @@ Long-term semantic memories in ChromaDB (local persistent vectors).
 
 Collections:
   - relationship_life  : personal / relationship memories
-  - coding_lessons     : bugs, fixes, Gemini/local coding takeaways + NLPP lessons
+  - coding_lessons     : general + NLPP lessons + workspace-matched product manuals
   - nlpp_hard_bans     : critical NLPP bans (always retrieved on coding)
   - language_lessons   : Japanese-teaching facts (user-verified)
   - web_knowledge      : useful findings learned from web search
+
+coding_lessons metadata taxonomy:
+  - scope: general | product | nlpp | learned
+  - group: process | security-ops | data | ml-local | architecture | nlpp-re | product-manual | learned
+  - family: cross-project | homelab-media | local-diffusion | appsec | nlpp-re | decomp-matching
+  - product: optional project id (anime-db-stream, waifu-redraw, decomp-matching, …)
 """
 
 from __future__ import annotations
@@ -165,6 +171,129 @@ def query_memories(
 
     memories.sort(key=lambda m: (-m["importance"], m["distance"] if m["distance"] is not None else 9.0))
     return memories[:n]
+
+
+def _infer_scope(meta: dict[str, Any]) -> str:
+    scope = str(meta.get("scope") or "").strip().lower()
+    if scope:
+        return scope
+    product = str(meta.get("product") or "").strip().lower()
+    batch = str(meta.get("seed_batch") or "").strip().lower()
+    source = str(meta.get("source") or "").strip().lower()
+    seed_id = str(meta.get("seed_id") or "").strip().lower()
+    if product == "general":
+        return "general"
+    if (
+        batch in {"seed_chroma_nlpp", "seed_nlpp"}
+        or source in {"seed_nlpp", "seed_chroma_nlpp"}
+        or str(meta.get("family") or "") == "nlpp-re"
+        or seed_id.startswith("nlpp-")
+        or seed_id.startswith("ban-")
+    ):
+        return "nlpp"
+    if product:
+        return "product"
+    return "learned"
+
+
+def query_coding_lessons(
+    query_text: str,
+    *,
+    top_k: int | None = None,
+    path_hints: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Retrieve coding lessons preferring general/NLPP + workspace-matched products.
+
+    Product manuals for unrelated families are dropped so shared RAG stays useful
+    across many projects.
+    """
+    n = top_k or CODING_LESSONS_TOP_K
+    # Wider candidate pool so filtering still leaves enough hits.
+    raw = query_memories(query_text, top_k=max(n * 6, n), collection=COLLECTION_CODING)
+    if not raw:
+        return []
+
+    allowed_products: set[str] = set()
+    # Always keep cross-project generals. NLPP/product families require a workspace match.
+    allowed_families: set[str] = {"cross-project"}
+    try:
+        seed_catalog = (
+            PROJECT_ROOT / "tools" / "seed" / "blossom_seed" / "catalog.py"
+        )
+        if seed_catalog.is_file():
+            import sys
+
+            seed_root = str(PROJECT_ROOT / "tools" / "seed")
+            if seed_root not in sys.path:
+                sys.path.insert(0, seed_root)
+            from blossom_seed.catalog import (  # type: ignore
+                infer_workspace_targets,
+                load_catalog,
+            )
+
+            products, families = infer_workspace_targets(path_hints, load_catalog())
+            allowed_products |= products
+            allowed_families |= families
+    except Exception as exc:
+        logger.debug("coding lesson taxonomy filter unavailable: %s", exc)
+        # Heuristic fallback from path hints alone
+        blob = " ".join(path_hints or []).lower().replace("\\", "/")
+        for needle, family in (
+            ("anime-db-stream", "homelab-media"),
+            ("anime-db-tracker", "homelab-media"),
+            ("waifu redraw", "local-diffusion"),
+            ("waifu-redraw", "local-diffusion"),
+            ("instagram model ai", "local-diffusion"),
+            ("animewallpaper", "local-diffusion"),
+            ("trace-viper", "appsec"),
+            ("pen-tester", "appsec"),
+            ("img.bin", "nlpp-re"),
+            ("layeredfs", "nlpp-re"),
+            ("nlpp", "nlpp-re"),
+            ("decomp", "decomp-matching"),
+            ("ctrdecomp", "decomp-matching"),
+            ("code.bin", "decomp-matching"),
+            ("matching-decomp", "decomp-matching"),
+        ):
+            if needle in blob:
+                allowed_families.add(family)
+
+    kept: list[dict[str, Any]] = []
+    for row in raw:
+        meta = dict(row.get("metadata") or {})
+        scope = _infer_scope(meta)
+        product = str(meta.get("product") or "").strip().lower()
+        family = str(meta.get("family") or "").strip().lower()
+        if scope == "general":
+            row = dict(row)
+            row["importance"] = int(row.get("importance") or 5) + 1
+            kept.append(row)
+            continue
+        if scope == "learned":
+            kept.append(row)
+            continue
+        if scope == "nlpp":
+            if "nlpp-re" in allowed_families:
+                kept.append(row)
+            continue
+        if scope == "product":
+            if product and product in allowed_products:
+                kept.append(row)
+                continue
+            if family and family in allowed_families:
+                kept.append(row)
+                continue
+            # Unmatched product manuals stay out of the shared pool.
+            continue
+        kept.append(row)
+
+    kept.sort(
+        key=lambda m: (
+            -int(m.get("importance") or 5),
+            m.get("distance") if m.get("distance") is not None else 9.0,
+        )
+    )
+    return kept[:n]
 
 
 def get_memory(
