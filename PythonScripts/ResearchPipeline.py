@@ -29,7 +29,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 load_dotenv(SCRIPT_DIR / ".env", override=True)
 load_dotenv(PROJECT_ROOT / ".env", override=True)
 
-from EditorContext import extract_user_request, looks_like_editor_dump
+from EditorContext import extract_user_request
 from PromptTier import PromptTier, detect_prompt_tier
 from SemanticMemory import (
     COLLECTION_WEB,
@@ -38,10 +38,10 @@ from SemanticMemory import (
     query_memories,
 )
 from WebSearch import (
-    SEARCH_TRIGGER_KEYWORDS,
     WEB_SEARCH_ENABLED,
     WEB_SEARCH_PROVIDER,
     format_search_results_for_prompt,
+    search_decision,
     should_search,
     web_search,
 )
@@ -87,6 +87,14 @@ DEEP_KEYWORDS = (
     "deep dive",
     "look into",
     "investigate",
+)
+
+EXPLICIT_RESEARCH_KEYWORDS = (
+    "research",
+    "compare sources",
+    "sources for",
+    "deep dive",
+    "survey",
 )
 
 VERSION_API_RE = re.compile(
@@ -183,26 +191,24 @@ def _think(
         on_progress(event)
 
 
-def _prior_web_block(focus: str, on_progress: ProgressFn | None) -> str:
+def _prior_web_block(
+    focus: str, on_progress: ProgressFn | None
+) -> tuple[str, list[dict[str, Any]]]:
     _think(on_progress, "web_memory", "Checking prior web knowledge…")
     prior = query_memories(focus, collection=COLLECTION_WEB)
     if not prior:
-        return ""
+        return "", []
     _think(
         on_progress,
         "web_memory",
         f"Loaded {len(prior)} prior web memory(ies).",
         count=len(prior),
     )
-    return format_memories_for_prompt(
+    block = format_memories_for_prompt(
         prior,
         heading="[PRIOR WEB KNOWLEDGE — from earlier searches]",
     )
-
-
-def _has_search_keywords(text: str) -> bool:
-    lower = (text or "").lower()
-    return any(kw in lower for kw in SEARCH_TRIGGER_KEYWORDS)
+    return block, prior
 
 
 def _count_lib_hints(text: str) -> int:
@@ -216,42 +222,45 @@ def _count_lib_hints(text: str) -> int:
     return len(scored) if scored else 0
 
 
-def classify_research_need(user_prompt: str, *, coding: bool = False) -> str:
-    """Return skip | simple | deep."""
+def classify_research(
+    user_prompt: str,
+    *,
+    coding: bool = False,
+    prior_hits: list[dict] | None = None,
+) -> tuple[str, str]:
+    """Return (skip | simple | deep, human-readable reason)."""
     if not WEB_SEARCH_ENABLED:
-        return "skip"
+        return "skip", "web search disabled"
 
     text = user_prompt or ""
     focus = extract_user_request(text)
     lower = focus.lower()
-    tier = detect_prompt_tier(text)
 
-    if tier == PromptTier.TINY:
-        return "skip"
+    if detect_prompt_tier(text) == PromptTier.TINY:
+        return "skip", "tiny edit"
 
-    editorish = looks_like_editor_dump(text) or "[editor context]" in text.lower()
-    if editorish and not _has_search_keywords(text):
-        return "skip"
-
-    deep_hit = any(kw in lower for kw in DEEP_KEYWORDS) or bool(
-        VERSION_API_RE.search(focus)
-    )
-    multi_lib = _count_lib_hints(focus) >= 2
+    wants_research = any(kw in lower for kw in EXPLICIT_RESEARCH_KEYWORDS)
     wants_citations = any(
         w in lower for w in ("cite", "citation", "citations", "with sources", "sources?")
     )
+    if RESEARCH_DEEP_ENABLED and (wants_research or wants_citations):
+        return "deep", "asked for research"
 
-    if RESEARCH_DEEP_ENABLED and (deep_hit or multi_lib or wants_citations):
-        return "deep"
+    decision = search_decision(text, coding=coding, prior_hits=prior_hits)
+    if not decision.search:
+        return "skip", decision.reason
 
-    if should_search(text, coding=coding):
-        return "simple"
+    # Comparisons / multi-library / version questions only go deep once the gate
+    # already agreed that outside knowledge is needed.
+    deep_hit = any(kw in lower for kw in DEEP_KEYWORDS) or bool(VERSION_API_RE.search(focus))
+    if RESEARCH_DEEP_ENABLED and (deep_hit or _count_lib_hints(focus) >= 2):
+        return "deep", decision.reason
+    return "simple", decision.reason
 
-    # Trivial chitchat / no search signal
-    if len(focus.strip()) < 12 and not _has_search_keywords(text):
-        return "skip"
 
-    return "skip"
+def classify_research_need(user_prompt: str, *, coding: bool = False) -> str:
+    """Return skip | simple | deep."""
+    return classify_research(user_prompt, coding=coding)[0]
 
 
 def parse_planner_queries(raw: str, *, max_queries: int | None = None) -> list[str]:
@@ -623,13 +632,23 @@ def run_research_pipeline(
     When RESEARCH_PIPELINE_ENABLED is false, callers should use the simple path only.
     """
     focus = extract_user_request(user_prompt)
-    prior = _prior_web_block(focus, on_progress)
-    mode = force_mode or classify_research_need(user_prompt, coding=coding)
+    prior, prior_hits = _prior_web_block(focus, on_progress)
+    if force_mode:
+        mode, reason = force_mode, "forced"
+    else:
+        mode, reason = classify_research(user_prompt, coding=coding, prior_hits=prior_hits)
 
     if not RESEARCH_PIPELINE_ENABLED and mode == "deep":
         mode = "simple" if should_search(user_prompt, coding=coding) else "skip"
 
-    _think(on_progress, "research_gate", f"Research mode: {mode}", mode=mode)
+    label = "no web search" if mode == "skip" else f"{mode} web search"
+    _think(
+        on_progress,
+        "research_gate",
+        f"Research: {label} ({reason}).",
+        mode=mode,
+        reason=reason,
+    )
 
     if mode == "skip":
         return ResearchResult(brief=prior, mode="skip", sources=[], queries=[])

@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
@@ -41,7 +42,59 @@ CODER_MODEL = primary_coder().path
 
 LLAMA_PORT = int(os.getenv("LLAMA_SERVER_PORT", "11434"))
 PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "16384"))
-CODER_CTX = int(os.getenv("CODER_CTX_SIZE", "32768"))
+PERSONA_VRAM_MIB = int(os.getenv("PERSONA_VRAM_MIB", "13000"))
+
+
+@dataclass(frozen=True)
+class CoderProfile:
+    """One way to launch the coder: context size, KV cache type, MoE layers kept on CPU."""
+
+    ctx: int
+    cache_type: str = "f16"
+    n_cpu_moe: int = 0
+    # Measured VRAM for this launch; 0 = unknown (always let --fit decide).
+    vram_mib: int = 0
+
+
+def _parse_coder_profiles(raw: str) -> list[CoderProfile]:
+    """CODER_CTX_PROFILES="65536:q8_0:0:21400,…" (ctx[:cache[:n_cpu_moe[:vram_mib]]])."""
+    profiles: list[CoderProfile] = []
+    for part in (raw or "").split(","):
+        bits = [b.strip() for b in part.split(":") if b.strip()]
+        if not bits:
+            continue
+        try:
+            profiles.append(
+                CoderProfile(
+                    ctx=int(bits[0]),
+                    cache_type=bits[1] if len(bits) > 1 else "f16",
+                    n_cpu_moe=int(bits[2]) if len(bits) > 2 else 0,
+                    vram_mib=int(bits[3]) if len(bits) > 3 else 0,
+                )
+            )
+        except ValueError:
+            logger.warning("Ignoring bad CODER_CTX_PROFILES entry: %r", part)
+    return sorted(profiles, key=lambda p: p.ctx)
+
+
+# Smallest profile that fits a request is used; larger ones trade speed for room
+# (quantized KV + experts on CPU). Without profiles: one CODER_CTX_SIZE launch.
+CODER_PROFILES = _parse_coder_profiles(os.getenv("CODER_CTX_PROFILES", "")) or [
+    CoderProfile(
+        ctx=int(os.getenv("CODER_CTX_SIZE", "32768")),
+        cache_type=os.getenv("CODER_CACHE_TYPE", "f16").strip() or "f16",
+        n_cpu_moe=int(os.getenv("CODER_N_CPU_MOE", "0")),
+    )
+]
+# Largest coder window — budgets (session pack, health) size against this.
+CODER_CTX = CODER_PROFILES[-1].ctx
+
+
+def coder_profile_for(min_ctx: int) -> CoderProfile:
+    for profile in CODER_PROFILES:
+        if profile.ctx >= min_ctx:
+            return profile
+    return CODER_PROFILES[-1]
 # Shared default; role-specific overrides let big coders spill layers to CPU/RAM.
 _DEFAULT_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
 PERSONA_GPU_LAYERS = int(os.getenv("PERSONA_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS)))
@@ -49,6 +102,13 @@ CODER_GPU_LAYERS = int(os.getenv("CODER_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS))
 # Back-compat alias used by health / older callers
 GPU_LAYERS = _DEFAULT_GPU_LAYERS
 LLAMA_THREADS = int(os.getenv("LLAMA_THREADS", "0"))  # 0 = llama.cpp default
+# Free-VRAM margin for llama-server --fit. Windows (WDDM) starts spilling to shared
+# memory well before the card is full: 1024 still spilled at 64k, 3072 did not.
+# 0 = pin --n-gpu-layers instead.
+LLAMA_FIT_TARGET_MIB = int(os.getenv("LLAMA_FIT_TARGET_MIB", "3072"))
+# Headroom over a profile's measured VRAM (which already includes compute buffers)
+# before pinning all layers on GPU without the fit probe.
+PINNED_MARGIN_MIB = int(os.getenv("LLAMA_PINNED_MARGIN_MIB", "1024"))
 READY_TIMEOUT_SEC = int(os.getenv("LLAMA_READY_TIMEOUT_SEC", "600"))
 # Persona chat: off = much faster (no long CoT). Coder can keep thinking.
 PERSONA_REASONING = os.getenv("PERSONA_REASONING", "off").strip().lower()
@@ -70,6 +130,18 @@ def _normalize_reasoning(value: str) -> str:
     return "auto"
 
 
+def _free_vram_mib() -> int | None:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=5,
+        )
+        return int(out.strip().splitlines()[0])
+    except (OSError, ValueError, subprocess.SubprocessError, IndexError):
+        return None
+
+
 def _gpu_layers_for(role: str) -> int:
     return PERSONA_GPU_LAYERS if role == "persona" else CODER_GPU_LAYERS
 
@@ -79,6 +151,7 @@ class LlamaServerManager:
         self.process: subprocess.Popen | None = None
         self.current_role: str | None = None
         self.current_model: Path | None = None
+        self.current_ctx: int | None = None
 
     def coder_available(self) -> bool:
         return any_coder_available()
@@ -102,25 +175,39 @@ class LlamaServerManager:
         self.process = None
         self.current_role = None
         self.current_model = None
+        self.current_ctx = None
         for path in (PID_FILE, ROLE_FILE, MODEL_FILE):
             try:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
 
-    def start(self, role: str, model_path: Path | None = None) -> None:
+    def start(
+        self,
+        role: str,
+        model_path: Path | None = None,
+        profile: CoderProfile | None = None,
+    ) -> None:
         if role not in {"persona", "coder"}:
             raise ValueError(f"Unknown role: {role}")
 
+        cache_type = "f16"
+        n_cpu_moe = 0
+        vram_mib = 0
         if role == "persona":
             model_path = (model_path or persona_model().path).resolve()
             ctx = PERSONA_CTX
+            vram_mib = PERSONA_VRAM_MIB
             reasoning_raw = PERSONA_REASONING
         else:
             model_path = (model_path or primary_coder().path).resolve()
             if not model_path.is_file():
                 raise FileNotFoundError(f"Coder model not found: {model_path}")
-            ctx = CODER_CTX
+            profile = profile or CODER_PROFILES[0]
+            ctx = profile.ctx
+            cache_type = profile.cache_type
+            n_cpu_moe = profile.n_cpu_moe
+            vram_mib = profile.vram_mib
             reasoning_raw = CODER_REASONING
 
         if not model_path.is_file():
@@ -139,19 +226,33 @@ class LlamaServerManager:
             str(model_path),
             "--ctx-size",
             str(ctx),
-            "--n-gpu-layers",
-            str(gpu_layers),
             "--port",
             str(LLAMA_PORT),
             "--host",
             "127.0.0.1",
             "--jinja",
         ]
+        # Fit layers / experts to the VRAM that is actually free (TTS, vision, browser
+        # come and go); pinning --n-gpu-layers would disable the fit. The fit probe adds
+        # ~15 s to a load, so skip it when the measured footprint clearly fits.
+        free = _free_vram_mib() if LLAMA_FIT_TARGET_MIB > 0 else None
+        use_fit = LLAMA_FIT_TARGET_MIB > 0 and not (
+            vram_mib and free is not None and free - PINNED_MARGIN_MIB >= vram_mib
+        )
+        if use_fit:
+            args.extend(["--fit", "on", "--fit-target", str(LLAMA_FIT_TARGET_MIB)])
+        else:
+            args.extend(["--n-gpu-layers", str(gpu_layers)])
         if LLAMA_THREADS > 0:
             args.extend(["--threads", str(LLAMA_THREADS)])
 
         fa = FLASH_ATTN if FLASH_ATTN in {"on", "off", "auto"} else "auto"
         args.extend(["--flash-attn", fa])
+        if cache_type != "f16":
+            # Quantized V cache needs flash attention.
+            args.extend(["--cache-type-k", cache_type, "--cache-type-v", cache_type])
+        if n_cpu_moe > 0:
+            args.extend(["--n-cpu-moe", str(n_cpu_moe)])
 
         reasoning = _normalize_reasoning(reasoning_raw)
         args.extend(["--reasoning", reasoning])
@@ -162,11 +263,13 @@ class LlamaServerManager:
         log_file = open(log_path, "w", encoding="utf-8", errors="replace")
         logger.info(
             "Starting llama-server role=%s model=%s gpu_layers=%s ctx=%s "
-            "reasoning=%s flash_attn=%s",
+            "cache=%s n_cpu_moe=%s reasoning=%s flash_attn=%s",
             role,
             model_path.name,
-            gpu_layers,
+            f"fit(margin {LLAMA_FIT_TARGET_MIB} MiB, free {free} MiB)" if use_fit else gpu_layers,
             ctx,
+            cache_type,
+            n_cpu_moe,
             reasoning,
             fa,
         )
@@ -181,6 +284,7 @@ class LlamaServerManager:
         MODEL_FILE.write_text(str(model_path), encoding="utf-8")
         self.current_role = role
         self.current_model = model_path
+        self.current_ctx = ctx
         self.wait_until_healthy(timeout_sec=READY_TIMEOUT_SEC)
         logger.info("llama-server ready role=%s pid=%s", role, self.process.pid)
 
@@ -196,7 +300,18 @@ class LlamaServerManager:
             time.sleep(1)
         raise TimeoutError("Timed out waiting for llama-server /health")
 
-    def ensure(self, role: str, model_path: Path | None = None) -> None:
+    def ensure(
+        self,
+        role: str,
+        model_path: Path | None = None,
+        *,
+        min_ctx: int = 0,
+    ) -> None:
+        """
+        Make `role` the live model. For the coder, min_ctx picks the smallest profile
+        that fits; a running coder is reused while its window is big enough (keeps the
+        prompt cache), and relaunched with a larger profile only when it is not.
+        """
         if role == "persona":
             target = (model_path or persona_model().path).resolve()
         else:
@@ -205,8 +320,23 @@ class LlamaServerManager:
         if (
             self.current_role == role
             and self.current_model == target
+            and (role != "coder" or (self.current_ctx or 0) >= min_ctx)
             and self.is_healthy()
         ):
+            return
+
+        if role == "coder":
+            profile = coder_profile_for(min_ctx)
+            if self.current_role == "coder" and self.current_model == target:
+                logger.info(
+                    "Coder window %s < needed %s — relaunching at ctx=%s (%s KV, %s MoE layers on CPU)",
+                    self.current_ctx,
+                    min_ctx,
+                    profile.ctx,
+                    profile.cache_type,
+                    profile.n_cpu_moe,
+                )
+            self.start(role, model_path=target, profile=profile)
             return
 
         if self.is_healthy() and ROLE_FILE.exists() and MODEL_FILE.exists():

@@ -17,6 +17,7 @@ from ResearchPipeline import (  # noqa: E402
     parse_planner_queries,
     run_research_pipeline,
 )
+from SearchGate import SearchDecision  # noqa: E402
 
 
 def test_classify_skip_tiny_edit():
@@ -59,8 +60,8 @@ def test_classify_deep_on_version_uncertainty():
 
 def test_classify_simple_when_should_search(monkeypatch):
     monkeypatch.setattr(
-        "ResearchPipeline.should_search",
-        lambda *_a, **_k: True,
+        "ResearchPipeline.search_decision",
+        lambda *_a, **_k: SearchDecision(True, 2, ["test"]),
     )
     monkeypatch.setattr("ResearchPipeline.RESEARCH_DEEP_ENABLED", True)
     assert (

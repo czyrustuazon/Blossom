@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -205,11 +207,34 @@ def looks_like_editor_dump(user_prompt: str) -> bool:
     return "<<<FILE" in text or "[EDITOR CONTEXT]" in text.upper()
 
 
+_HOST_ASK: ContextVar[str] = ContextVar("blossom_host_ask", default="")
+
+# Any later host block ([PROBLEMS — IDE], [LINK CHECK], [PATTERN SCAN], …) ends the ask.
+_SECTION_HEADER_RE = re.compile(r"(?m)^[ \t]*\[[A-Z][A-Z0-9_/]{2,}(?:[ A-Z0-9_/]*)(?:\s*[—–:\-][^\]\n]*)?\][ \t]*$")
+
+
+@contextmanager
+def host_ask(ask: str):
+    """Pin the host-sent user ask (blossom_ask) for this pipeline run."""
+    token = _HOST_ASK.set((ask or "").strip()[:4000])
+    try:
+        yield
+    finally:
+        _HOST_ASK.reset(token)
+
+
 def extract_user_request(user_prompt: str) -> str:
     text = user_prompt or ""
+    pinned = _HOST_ASK.get()
+    # Only for the message that carries it (helpers also call this on other text).
+    if pinned and pinned[:80] in text:
+        return pinned
     marker = "[USER REQUEST]"
     if marker in text:
         tail = text.split(marker, 1)[1].strip()
+        header = _SECTION_HEADER_RE.search(tail)
+        if header:
+            tail = tail[: header.start()].strip()
         for stop in (
             "[REPO KNOWLEDGE",
             "[EDITOR CONTEXT",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-from EditorContext import looks_like_editor_dump
+from EditorContext import extract_user_request, looks_like_editor_dump
 
 PLAN_FIRST_RE = re.compile(
     r"\b("
@@ -29,6 +29,24 @@ APPROVAL_RE = re.compile(
 )
 MULTI_FILE_RE = re.compile(
     r"\b(and|multiple|all files|entire repo|refactor entire|every file)\b",
+    re.I,
+)
+# Mirrors CLUE_ASK_RE in the extension's promptTier.ts: reference-as-clue → blueprint.
+CLUE_ASK_RE = re.compile(
+    r"\b(?:(?:to |so (?:you|we|that you|that we) )?(?:get|have|form) (?:an? |some )?"
+    r"(?:idea|sense|picture|feel) (?:of |for |about )?(?:what|how|where)|"
+    r"so (?:you|we) (?:know|understand|can figure out|can decide) (?:what|how|where)|"
+    r"to (?:figure out|work out|decide|understand|learn) (?:what|how|where) "
+    r"(?:to do|we should|you should|needs?|comes?|is next)|"
+    r"(?:as|for) (?:a |the )?(?:clue|clues|guide|guidance|hint|hints|reference|"
+    r"starting point|inspiration|blueprint|roadmap)|"
+    r"use (?:it|this|that|them|[\w./\\-]+) to (?:guide|inform)|what to do next)\b",
+    re.I,
+)
+CLUE_IMPLEMENT_OVERRIDE_RE = re.compile(
+    r"\b(?:do it|go ahead|implement (?:it|now|them|the (?:plan|changes|fix(?:es)?|steps))|"
+    r"apply (?:it|them|now)|start (?:coding|implementing)|"
+    r"then (?:implement|apply|fix|make the changes|do the changes))\b",
     re.I,
 )
 
@@ -59,11 +77,17 @@ def has_editor_context(user_prompt: str) -> bool:
 
 
 def detect_prompt_tier(user_prompt: str) -> PromptTier:
-    text = (user_prompt or "").strip()
-    if not text:
+    """Fallback when the host sent no blossom_tier. Classifies the user's sentence only:
+    edit verbs inside attached files or agent instructions must not flip it to execute."""
+    full_text = (user_prompt or "").strip()
+    if not full_text:
         return PromptTier.FULL
 
-    has_editor = has_editor_context(text)
+    has_editor = has_editor_context(full_text)
+    text = extract_user_request(full_text)
+    if CLUE_ASK_RE.search(text) and not CLUE_IMPLEMENT_OVERRIDE_RE.search(text):
+        return PromptTier.PLAN
+
     planish = bool(PLAN_FIRST_RE.search(text))
     actionable = bool(ACTIONABLE_RE.search(text))
     approved = bool(APPROVAL_RE.search(text))
@@ -71,7 +95,7 @@ def detect_prompt_tier(user_prompt: str) -> PromptTier:
     if approved or (actionable and not planish):
         if (
             has_editor
-            and len(text) < 1200
+            and len(full_text) < 1200
             and not MULTI_FILE_RE.search(text)
         ):
             return PromptTier.TINY

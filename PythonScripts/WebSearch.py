@@ -18,6 +18,8 @@ import requests
 from dotenv import load_dotenv
 from pathlib import Path
 
+from SearchGate import SearchDecision, assess_search_need
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 load_dotenv(SCRIPT_DIR / ".env")
@@ -60,19 +62,22 @@ SEARCH_TRIGGER_KEYWORDS = (
 )
 
 
-def should_search(user_prompt: str, *, coding: bool = False) -> bool:
+def search_decision(
+    user_prompt: str,
+    *,
+    coding: bool = False,
+    prior_hits: list[dict] | None = None,
+) -> SearchDecision:
     if not WEB_SEARCH_ENABLED:
-        return False
-    text = (user_prompt or "").lower()
-    if any(kw in text for kw in SEARCH_TRIGGER_KEYWORDS):
-        return True
-    # Editor-attached coding dumps are local work — don't web-search the whole buffer
-    # unless the user explicitly asked to search (keywords above).
-    if "<<<file" in text or "[editor context]" in text:
-        return False
-    if coding and WEB_SEARCH_ON_CODING:
-        return True
-    return False
+        return SearchDecision(False, 0, ["web search disabled"])
+    decision = assess_search_need(user_prompt, coding=coding, prior_hits=prior_hits)
+    if coding and not WEB_SEARCH_ON_CODING and "asked to look it up" not in decision.reasons:
+        return SearchDecision(False, decision.score, decision.reasons + ["coding search off"])
+    return decision
+
+
+def should_search(user_prompt: str, *, coding: bool = False) -> bool:
+    return search_decision(user_prompt, coding=coding).search
 
 
 def _normalize_results(raw: list[dict[str, Any]]) -> list[dict[str, str]]:

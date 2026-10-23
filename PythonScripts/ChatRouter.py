@@ -56,11 +56,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
-from LlamaServerManager import PERSONA_CTX, server_manager
+from LlamaServerManager import CODER_CTX, PERSONA_CTX, server_manager
 from LocalModels import coder_ladder, primary_coder
 from EditorContext import (
+    EDITOR_TOKEN_BUDGET,
     build_task_brief,
     extract_user_request as _extract_user_request,
+    host_ask,
     is_context_overflow_error,
     looks_like_editor_dump,
     pack_editor_context,
@@ -249,6 +251,8 @@ JAPANESE_KEYWORDS = (
 )
 
 ProgressFn = Callable[[dict[str, Any]], None]
+# Receives final-answer text deltas as llama-server generates them (SSE clients only).
+ContentFn = Callable[[str], None]
 
 swap_lock = threading.Lock()
 engine = CompanionEngine()
@@ -256,6 +260,41 @@ _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chatrouter")
 
 # Leave room for the persona completion itself inside the loaded ctx window.
 PERSONA_PROMPT_BUDGET = max(2048, PERSONA_CTX - int(os.getenv("PERSONA_REPLY_RESERVE", "1536")))
+# Share of the persona window for this chat's blossom_session pack (persona + memories take the rest).
+PERSONA_SESSION_BUDGET = max(
+    1024,
+    int(os.getenv("PERSONA_SESSION_TOKENS", "0")) or int(PERSONA_PROMPT_BUDGET * 0.4),
+)
+# Persona voice rewrite of coding answers. Off by default: it swaps the coder out
+# (dropping its KV cache) and adds ~10 s per turn for no technical gain.
+CODING_VOICE_REWRITE = os.getenv("CODING_VOICE_REWRITE", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+# Share of the largest coder window reserved for the Assistant's session pack
+# (blossom_session). Scales with CODER_CTX_SIZE / CODER_CTX_PROFILES.
+SESSION_CONTEXT_BUDGET = max(
+    1024,
+    int(os.getenv("SESSION_CONTEXT_TOKENS", "0"))
+    or int(CODER_CTX * float(os.getenv("SESSION_CONTEXT_SHARE", "0.35"))),
+)
+# System prompt, lessons, web, protocol, and the reply.
+CODER_RESERVE_TOKENS = int(os.getenv("CODER_REPLY_RESERVE", "4096")) + int(
+    os.getenv("CODER_PROMPT_OVERHEAD", "6144")
+)
+
+
+def _coder_ctx_needed(user_prompt: str, session_context: str = "") -> int:
+    """Tokens the next coder call needs (picks the llama-server context profile)."""
+    prompt_tokens = _approx_tokens(user_prompt)
+    if looks_like_editor_dump(user_prompt):
+        prompt_tokens = min(prompt_tokens, EDITOR_TOKEN_BUDGET)
+    session_tokens = (
+        min(_approx_tokens(session_context), SESSION_CONTEXT_BUDGET) if session_context else 0
+    )
+    return prompt_tokens + session_tokens + CODER_RESERVE_TOKENS
 
 
 def _approx_tokens(text: str) -> int:
@@ -491,6 +530,55 @@ def _delta_text(delta: Any, field: str) -> str:
     return str(raw) if raw else ""
 
 
+def _partial_tag_suffix_len(text: str, tag: str) -> int:
+    """Length of the longest suffix of text that is a proper prefix of tag."""
+    for k in range(min(len(tag) - 1, len(text)), 0, -1):
+        if text.endswith(tag[:k]):
+            return k
+    return 0
+
+
+class ThinkSplitter:
+    """Route inline <think>…</think> spans to reasoning; tags may straddle deltas."""
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_think = False
+
+    def _kind(self) -> str:
+        return "reasoning" if self._in_think else "content"
+
+    def feed(self, piece: str) -> list[tuple[str, str]]:
+        self._buf += piece
+        out: list[tuple[str, str]] = []
+        while self._buf:
+            tag = self.CLOSE if self._in_think else self.OPEN
+            idx = self._buf.find(tag)
+            if idx >= 0:
+                if idx:
+                    out.append((self._kind(), self._buf[:idx]))
+                self._buf = self._buf[idx + len(tag) :]
+                self._in_think = not self._in_think
+                continue
+            keep = _partial_tag_suffix_len(self._buf, tag)
+            emit = self._buf[: len(self._buf) - keep]
+            if emit:
+                out.append((self._kind(), emit))
+            self._buf = self._buf[len(self._buf) - keep :]
+            break
+        return out
+
+    def flush(self) -> list[tuple[str, str]]:
+        if not self._buf:
+            return []
+        out = [(self._kind(), self._buf)]
+        self._buf = ""
+        return out
+
+
 def _stream_local_chat(
     messages: list[dict],
     *,
@@ -498,10 +586,16 @@ def _stream_local_chat(
     temperature: float,
     on_progress: ProgressFn | None = None,
     source: str = "local_coder",
+    on_content: ContentFn | None = None,
+    draft_step: str | None = "coder_draft",
 ) -> str:
     """
-    Stream from llama-server and emit model_reasoning token deltas live.
-    Blossom Assistant accumulates these in the busy-row reasoning strip.
+    Stream from llama-server and emit reasoning / answer deltas live.
+
+    reasoning_content and inline <think> spans → model_reasoning thoughts.
+    Answer text → on_content when this call produces the user-visible reply,
+    otherwise a transient draft_step thought (e.g. coder output that the persona
+    may still rewrite). Returns the answer text without <think> spans.
     """
     stream = LOCAL_CLIENT.chat.completions.create(
         model=model,
@@ -510,6 +604,38 @@ def _stream_local_chat(
         stream=True,
     )
     content_parts: list[str] = []
+    splitter = ThinkSplitter()
+    label = _label_intel_source(source)
+
+    def emit_reasoning(piece: str) -> None:
+        _think(
+            on_progress,
+            "model_reasoning",
+            piece,
+            source=source,
+            label=label,
+            log=False,
+        )
+
+    def emit_segments(segments: list[tuple[str, str]]) -> None:
+        for kind, text in segments:
+            if kind == "reasoning":
+                emit_reasoning(text)
+                continue
+            content_parts.append(text)
+            if on_content:
+                on_content(text)
+            elif draft_step:
+                _think(
+                    on_progress,
+                    draft_step,
+                    text,
+                    source=source,
+                    label=label,
+                    log=False,
+                    transient=True,
+                )
+
     for chunk in stream:
         choices = getattr(chunk, "choices", None) or []
         if not choices:
@@ -520,17 +646,11 @@ def _stream_local_chat(
             delta = choice0.get("delta")
         reasoning_piece = _delta_text(delta, "reasoning_content")
         if reasoning_piece:
-            _think(
-                on_progress,
-                "model_reasoning",
-                reasoning_piece,
-                source=source,
-                label=_label_intel_source(source),
-                log=False,
-            )
+            emit_reasoning(reasoning_piece)
         content_piece = _delta_text(delta, "content")
         if content_piece:
-            content_parts.append(content_piece)
+            emit_segments(splitter.feed(content_piece))
+    emit_segments(splitter.flush())
     text = "".join(content_parts)
     return _message_text({"content": text})
 
@@ -602,6 +722,32 @@ def _local_completion_with_reasoning(
         source=source,
     )
     return final_response
+
+
+def _persona_reply(
+    messages: list[dict],
+    *,
+    temperature: float,
+    on_progress: ProgressFn | None,
+    on_content: ContentFn | None,
+) -> dict:
+    """Persona answer; streams to the client live when it is the user-visible reply."""
+    if on_content:
+        text = _stream_local_chat(
+            messages,
+            model=LOCAL_VOICE_MODEL,
+            temperature=temperature,
+            on_progress=on_progress,
+            source="persona",
+            on_content=on_content,
+        )
+        return _synthetic_completion(text)
+    return _local_completion_with_reasoning(
+        messages,
+        temperature=temperature,
+        on_progress=on_progress,
+        source="persona",
+    )
 
 
 def _cloud_system_prompt(purpose: str = "general") -> str:
@@ -876,6 +1022,65 @@ def _gather_web_context(
     return result.brief
 
 
+def _fit_session_context(
+    session_context: str, budget_tokens: int | None = None
+) -> tuple[str, int]:
+    """
+    Trim the extension's session pack (summary + recent turns) to the token budget
+    (SESSION_CONTEXT_BUDGET by default). Keeps the head (ledger + running summary)
+    and the newest turns; drops the middle.
+    """
+    text = (session_context or "").strip()
+    if not text:
+        return "", 0
+    max_chars = (budget_tokens or SESSION_CONTEXT_BUDGET) * 4
+    if len(text) > max_chars:
+        head = max_chars // 4
+        tail = max_chars - head - 80
+        text = (
+            f"{text[:head]}\n\n[… older session turns trimmed to fit context …]\n\n"
+            f"{text[-tail:]}"
+        )
+    return text, _approx_tokens(text)
+
+
+def _persona_chat_messages(
+    last_user_message: str,
+    session_context: str,
+    on_progress: ProgressFn | None,
+) -> list[dict]:
+    """Persona prompt + history. With a blossom_session pack, this chat's turns (coding
+    included) replace the persona DB's recent rows, trimmed to the 16k persona window."""
+    messages = engine.build_chat_messages(last_user_message)
+    block, tokens = _fit_session_context(session_context, PERSONA_SESSION_BUDGET)
+    if not block:
+        return messages
+    current = (
+        messages[-1]
+        if len(messages) > 1 and messages[-1].get("role") == "user"
+        else {"role": "user", "content": last_user_message}
+    )
+    _think(
+        on_progress,
+        "session_context",
+        f"Session context (persona): ~{tokens} tokens (budget {PERSONA_SESSION_BUDGET}).",
+        tokens=tokens,
+        budget=PERSONA_SESSION_BUDGET,
+    )
+    return [
+        messages[0],
+        {
+            "role": "system",
+            "content": (
+                "[THIS CHAT SO FAR — the user's current conversation with you, coding "
+                "turns included. Use it for continuity; their newest message follows.]\n\n"
+                + block
+            ),
+        },
+        current,
+    ]
+
+
 def _local_coder_answer(
     user_prompt: str,
     on_progress: ProgressFn | None = None,
@@ -883,13 +1088,35 @@ def _local_coder_answer(
     *,
     sequential: bool = False,
     force_sequential: bool = False,
+    session_context: str = "",
+    on_content: ContentFn | None = None,
+    host_tier: PromptTier | None = None,
 ) -> str:
+    session_block = ""
+    session_tokens = 0
     if force_sequential or sequential:
         packed_prompt, pack_stats = pack_editor_context_sequential(user_prompt)
         mode_label = "sequential"
     else:
-        packed_prompt, pack_stats = pack_editor_context(user_prompt)
+        session_block, session_tokens = _fit_session_context(session_context)
+        live_ctx = server_manager.current_ctx or CODER_CTX
+        packed_prompt, pack_stats = pack_editor_context(
+            user_prompt,
+            token_budget=max(
+                4096,
+                min(EDITOR_TOKEN_BUDGET, live_ctx - CODER_RESERVE_TOKENS - session_tokens),
+            ),
+        )
         mode_label = "packed"
+        if session_block:
+            _think(
+                on_progress,
+                "session_context",
+                f"Session context: ~{session_tokens} tokens "
+                f"(budget {SESSION_CONTEXT_BUDGET}).",
+                tokens=session_tokens,
+                budget=SESSION_CONTEXT_BUDGET,
+            )
     if pack_stats.get("packed") or pack_stats.get("mode") == "sequential":
         if pack_stats.get("mode") == "sequential":
             _think(
@@ -923,7 +1150,7 @@ def _local_coder_answer(
     if task_brief and not sequential:
         _think(on_progress, "task_brief", "Added create/edit task brief for the coder.")
 
-    tier = detect_prompt_tier(user_prompt)
+    tier = host_tier or detect_prompt_tier(user_prompt)
     if sequential:
         tier = PromptTier.TINY
         _think(
@@ -998,6 +1225,18 @@ def _local_coder_answer(
     messages = [
         {"role": "system", "content": system_content},
     ]
+    # Session pack right after the system prompt: it is append-only between compactions,
+    # so llama-server can reuse the cached prefix instead of re-reading ~100k tokens.
+    if session_block:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "[SESSION CONTEXT — earlier in this chat; use it to continue, "
+                    "but the user's new request below wins]\n" + session_block
+                ),
+            }
+        )
     if task_brief and not sequential:
         messages.append({"role": "system", "content": task_brief})
     if lesson_block:
@@ -1018,6 +1257,7 @@ def _local_coder_answer(
             temperature=0.2,
             on_progress=on_progress,
             source="local_coder",
+            on_content=on_content,
         )
     except Exception as exc:
         if not sequential and is_context_overflow_error(exc):
@@ -1031,6 +1271,7 @@ def _local_coder_answer(
                 on_progress=on_progress,
                 web_block="",
                 sequential=True,
+                on_content=on_content,
             )
         raise
 
@@ -1064,6 +1305,9 @@ def _get_coding_intel(
     *,
     defer_cloud: bool = False,
     force_sequential: bool = False,
+    session_context: str = "",
+    on_content: ContentFn | None = None,
+    host_tier: PromptTier | None = None,
 ) -> tuple[str, str, str | None]:
     web_block = "" if force_sequential else _gather_web_context(
         user_prompt, coding=True, on_progress=on_progress
@@ -1100,6 +1344,7 @@ def _get_coding_intel(
                 on_progress=on_progress,
                 web_block="",
                 force_sequential=True,
+                on_content=on_content,
             )
         except Exception as seq_exc:
             logger.warning("Sequential chunk mode failed (%s).", seq_exc)
@@ -1147,19 +1392,34 @@ def _get_coding_intel(
         for index, model in enumerate(ladders):
             more_local = index + 1 < len(ladders)
             try:
+                min_ctx = _coder_ctx_needed(user_prompt, session_context)
+                reuse = (
+                    server_manager.current_role == "coder"
+                    and server_manager.current_model == model.path.resolve()
+                    and (server_manager.current_ctx or 0) >= min_ctx
+                )
+                if not reuse:
+                    _think(
+                        on_progress,
+                        "swap_coder",
+                        f"Loading coder GGUF ({model.name})"
+                        + (f" [{index + 1}/{len(ladders)}]" if len(ladders) > 1 else "")
+                        + "…",
+                    )
+                server_manager.ensure("coder", model_path=model.path, min_ctx=min_ctx)
                 _think(
                     on_progress,
                     "swap_coder",
-                    f"Loading coder GGUF ({model.name})"
-                    + (f" [{index + 1}/{len(ladders)}]" if len(ladders) > 1 else "")
-                    + "…",
+                    f"Coder {'already loaded' if reuse else 'ready'} "
+                    f"({model.name}, ctx {server_manager.current_ctx}).",
                 )
-                server_manager.ensure("coder", model_path=model.path)
-                _think(on_progress, "swap_coder", f"Coder ready ({model.name}).")
                 answer = _local_coder_answer(
                     user_prompt,
                     on_progress=on_progress,
                     web_block=web_block,
+                    session_context=session_context,
+                    on_content=on_content,
+                    host_tier=host_tier,
                 )
                 answer_source = f"local_coder:{model.name}"
                 if not answer or len(answer.strip()) < 20:
@@ -1355,7 +1615,9 @@ def _persona_wrap(
     on_progress: ProgressFn | None = None,
     *,
     locale: str = "ja",
+    on_content: ContentFn | None = None,
 ) -> dict:
+    """Persona voice rewrite. Skip paths leave the coder loaded so agent rounds don't swap."""
     focus = _extract_user_request(user_prompt)
     facts_tokens = _approx_tokens(raw_facts)
     # Keep tool_call fences intact for the Blossom Assistant agent loop.
@@ -1367,7 +1629,6 @@ def _persona_wrap(
             "persona_skip",
             "Agent tool_call turn — skipping persona wrap.",
         )
-        server_manager.ensure("persona")
         return _synthetic_completion(raw_facts)
 
     # Large coding payloads (full HTML/files) won't fit history+persona+rewrite in one ctx.
@@ -1384,12 +1645,7 @@ def _persona_wrap(
             facts_tokens=facts_tokens,
             budget=PERSONA_PROMPT_BUDGET,
         )
-        server_manager.ensure("persona")  # leave persona loaded for next casual turn
         return _synthetic_completion(raw_facts)
-
-    _think(on_progress, "swap_persona", "Loading persona model for voice rewrite…")
-    server_manager.ensure("persona")
-    _think(on_progress, "persona", "Rewriting answer in companion voice…")
 
     if kind == "coding":
         # Slim prompt: do NOT re-inject editor file dumps or long chat history.
@@ -1446,6 +1702,21 @@ def _persona_wrap(
             budget=PERSONA_PROMPT_BUDGET,
         )
         return _synthetic_completion(raw_facts)
+
+    _think(on_progress, "swap_persona", "Loading persona model for voice rewrite…")
+    server_manager.ensure("persona")
+    _think(on_progress, "persona", "Rewriting answer in companion voice…")
+
+    if on_content:
+        text = _stream_local_chat(
+            persona_messages,
+            model=LOCAL_VOICE_MODEL,
+            temperature=temperature,
+            on_progress=on_progress,
+            source="persona",
+            on_content=on_content,
+        )
+        return _synthetic_completion(text)
 
     final_response = _local_completion(persona_messages, temperature=temperature)
     _emit_model_reasoning(
@@ -1532,11 +1803,27 @@ def run_chat_pipeline(
     last_user_message: str,
     on_progress: ProgressFn | None = None,
     *,
+    ask: str = "",
+    **kwargs,
+) -> tuple[dict, str | None]:
+    """run_chat_pipeline with the host-sent ask (blossom_ask) pinned for every
+    _extract_user_request call, so IDE/tool blocks around it never count as the ask."""
+    with host_ask(ask):
+        return _run_chat_pipeline(last_user_message, on_progress, **kwargs)
+
+
+def _run_chat_pipeline(
+    last_user_message: str,
+    on_progress: ProgressFn | None = None,
+    *,
     defer_voice: bool | None = None,
     defer_cloud: bool = False,
     force_sequential: bool = False,
     locale: str = "ja",
     voice_id: str | None = None,
+    on_content: ContentFn | None = None,
+    session_context: str = "",
+    host_tier: PromptTier | None = None,
 ) -> tuple[dict, str | None]:
     """Synchronous pipeline used by both streaming and non-streaming endpoints.
 
@@ -1560,7 +1847,8 @@ def run_chat_pipeline(
     coding_raw_facts: str | None = None
 
     def progress(event: dict) -> None:
-        thoughts.append(event)
+        if not event.get("transient"):
+            thoughts.append(event)
         if on_progress:
             on_progress(event)
 
@@ -1593,6 +1881,9 @@ def run_chat_pipeline(
                 on_progress=progress,
                 defer_cloud=defer_cloud,
                 force_sequential=force_sequential,
+                session_context=session_context,
+                on_content=None if CODING_VOICE_REWRITE else on_content,
+                host_tier=host_tier,
             )
             coding_raw_facts = raw_facts
             intel_source = source
@@ -1603,19 +1894,29 @@ def run_chat_pipeline(
                 source=source,
                 label=_label_intel_source(source),
             )
-            final_response = _persona_wrap(
-                last_user_message,
-                raw_facts,
-                kind="coding",
-                on_progress=progress,
-                locale=locale,
-            )
+            if CODING_VOICE_REWRITE:
+                final_response = _persona_wrap(
+                    last_user_message,
+                    raw_facts,
+                    kind="coding",
+                    on_progress=progress,
+                    locale=locale,
+                    on_content=on_content,
+                )
+            else:
+                focus = _extract_user_request(last_user_message)
+                engine._log_message(
+                    "user", focus if len(last_user_message) > 4000 else last_user_message
+                )
+                final_response = _synthetic_completion(raw_facts)
         elif japanese:
             route = "japanese"
             _think(progress, "route", "Detected Japanese-study request.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
             server_manager.ensure("persona")
-            persona_messages = engine.build_chat_messages(last_user_message)
+            persona_messages = _persona_chat_messages(
+                last_user_message, session_context, progress
+            )
             _apply_chat_mode_nudges(persona_messages, locale)
 
             focus = _extract_user_request(last_user_message)
@@ -1640,11 +1941,11 @@ def run_chat_pipeline(
             intel_source = "persona"
             try:
                 _think(progress, "persona", "Answering with local persona…")
-                final_response = _local_completion_with_reasoning(
+                final_response = _persona_reply(
                     persona_messages,
                     temperature=0.82,
                     on_progress=progress,
-                    source="persona",
+                    on_content=on_content,
                 )
                 local_text = _message_text(final_response["choices"][0]["message"])
                 if len(local_text) < 20 and (GEMINI_CLIENT or CLAUDE_CLIENT):
@@ -1697,7 +1998,9 @@ def run_chat_pipeline(
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
             server_manager.ensure("persona")
             intel_source = "persona"
-            persona_messages = engine.build_chat_messages(last_user_message)
+            persona_messages = _persona_chat_messages(
+                last_user_message, session_context, progress
+            )
             _apply_chat_mode_nudges(persona_messages, locale)
             web_block = _gather_web_context(
                 last_user_message, coding=False, on_progress=progress
@@ -1713,11 +2016,11 @@ def run_chat_pipeline(
                     }
                 )
             _think(progress, "persona", "Generating companion reply…")
-            final_response = _local_completion_with_reasoning(
+            final_response = _persona_reply(
                 persona_messages,
                 temperature=0.7,
                 on_progress=progress,
-                source="persona",
+                on_content=on_content,
             )
 
     _think(progress, "done", "Pipeline finished.", source=intel_source or "unknown")
@@ -1731,7 +2034,8 @@ def run_chat_pipeline(
         _has_agent_tool_calls(draft)
         or _has_agent_tool_calls(coding_raw_facts or "")
     )
-    if draft and not agent_tool_turn and engine.reply_looks_like_remix(draft):
+    # Code answers legitimately repeat earlier ones; anti-echo is a companion-voice repair.
+    if draft and route not in {"coding", "agent"} and engine.reply_looks_like_remix(draft):
         _think(
             progress,
             "anti_echo",
@@ -1857,6 +2161,106 @@ def _openai_stop_chunk(chunk_id: str) -> dict:
     }
 
 
+SUMMARY_PARALLEL = max(1, int(os.getenv("SUMMARY_PARALLEL", "4")))
+# Smallest per-request window worth splitting into (prompt + reply).
+SUMMARY_MIN_SLICE_TOKENS = 6000
+SUMMARY_SINGLE_PASS_REPLY_TOKENS = 1500
+
+_SESSION_SUMMARY_SYSTEM = (
+    "You maintain the running summary of a long coding chat so later turns can continue "
+    "without the full transcript. Summarize the given turns (merge with a previous "
+    "summary if one is given). Keep: "
+    "the user's goals, decisions and constraints, files read or changed (paths), what was "
+    "done, what failed and why, and open questions / next steps. Drop pleasantries, tool "
+    "noise and code bodies (reference paths instead). Plain text with short sections. "
+    "Do not invent anything."
+)
+
+
+def _summarize_with_loaded_model(text: str, max_chars: int) -> tuple[str, str]:
+    """Summarize on whichever llama-server role is already up (no swap unless none is)."""
+    with swap_lock:
+        role = server_manager.current_role
+        if not role or not server_manager.is_healthy():
+            server_manager.ensure("persona")
+            role = "persona"
+        ctx = (server_manager.current_ctx or CODER_CTX) if role == "coder" else PERSONA_CTX
+        model = LOCAL_CODER_MODEL if role == "coder" else LOCAL_VOICE_MODEL
+        overhead = 700
+
+        def summarize_once(
+            chunk: str, limit: int, part: str = "", reply_cap: int = ctx // 4
+        ) -> str:
+            response = LOCAL_CLIENT.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SESSION_SUMMARY_SYSTEM},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{part}Write the summary in at most ~{limit} characters."
+                            f"\n\n{chunk}"
+                        ),
+                    },
+                ],
+                temperature=0.2,
+                max_tokens=min(max(256, limit // 3), reply_cap),
+                stream=False,
+            )
+            return _message_text(response.choices[0].message)[:limit]
+
+        reply_tokens = min(max(256, max_chars // 3), ctx // 4)
+        k = max(1, min(SUMMARY_PARALLEL, ctx // SUMMARY_MIN_SLICE_TOKENS))
+        fits = _approx_tokens(text) + reply_tokens + overhead <= ctx
+        # Generation, not prefill, dominates: a long summary is faster as k concurrent
+        # shorter ones than as one long decode.
+        if fits and (k == 1 or reply_tokens <= SUMMARY_SINGLE_PASS_REPLY_TOKENS):
+            return summarize_once(text, max_chars), role
+
+        # Summarize independent slices concurrently on the server's parallel slots
+        # (they share one KV cache, so k slices must fit in ctx); keep them in order.
+        per_request = ctx // k
+        slice_tokens = max(1500, per_request - per_request // 4 - overhead)
+        if fits:
+            slice_tokens = min(slice_tokens, -(-_approx_tokens(text) // k))
+        slice_chars = slice_tokens * 4
+        pieces = [text[i : i + slice_chars] for i in range(0, len(text), slice_chars)]
+        limit = max(800, max_chars // len(pieces))
+        n = len(pieces)
+        with ThreadPoolExecutor(max_workers=k, thread_name_prefix="summarize") as pool:
+            parts = list(
+                pool.map(
+                    lambda ip: summarize_once(
+                        ip[1],
+                        limit,
+                        f"This is part {ip[0] + 1} of {n} of the transcript. ",
+                        per_request // 4,
+                    ),
+                    enumerate(pieces),
+                )
+            )
+        summary = "\n\n".join(p.strip() for p in parts if p.strip())
+    return summary[:max_chars], role
+
+
+@app.post("/v1/blossom/summarize")
+async def summarize_session(request: Request):
+    """Local session compaction for Blossom Assistant (never routes to cloud)."""
+    body = await request.json()
+    text = str(body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    max_chars = max(500, min(int(body.get("max_chars") or 6000), 200_000))
+    try:
+        summary, role = await asyncio.get_running_loop().run_in_executor(
+            _executor, _summarize_with_loaded_model, text, max_chars
+        )
+    except Exception as exc:
+        logger.exception("Session summarize failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "summary": summary, "role": role}
+
+
 @app.get("/health")
 async def health():
     ladder = coder_ladder(available_only=False)
@@ -1893,6 +2297,12 @@ async def health():
             "deep_enabled": RESEARCH_DEEP_ENABLED,
         },
         "supports_thoughts": True,
+        "supports_session_field": True,
+        "supports_summarize": True,
+        "coder_ctx": CODER_CTX,
+        "persona_ctx": PERSONA_CTX,
+        "session_budget_tokens": SESSION_CONTEXT_BUDGET,
+        "persona_session_budget_tokens": PERSONA_SESSION_BUDGET,
         "supports_memory_write": True,
         "supports_feedback": True,
         "supports_persona": True,
@@ -2327,6 +2737,12 @@ async def route_chat(request: Request):
     want_stream = bool(body.get("stream"))
     defer_cloud = bool(body.get("blossom_defer_cloud"))
     force_sequential = bool(body.get("blossom_sequential_mode"))
+    raw_session = body.get("blossom_session")
+    session_context = raw_session if isinstance(raw_session, str) else ""
+    raw_tier = str(body.get("blossom_tier") or "").strip().lower()
+    host_tier = PromptTier(raw_tier) if raw_tier in {t.value for t in PromptTier} else None
+    raw_ask = body.get("blossom_ask")
+    ask = raw_ask.strip() if isinstance(raw_ask, str) else ""
     locale = normalize_locale(
         body.get("blossom_locale")
         or body.get("locale")
@@ -2343,6 +2759,9 @@ async def route_chat(request: Request):
                     defer_cloud=defer_cloud,
                     force_sequential=force_sequential,
                     locale=locale,
+                    session_context=session_context,
+                    host_tier=host_tier,
+                    ask=ask,
                 )
                 return final
 
@@ -2361,6 +2780,9 @@ async def route_chat(request: Request):
     def on_progress(event: dict) -> None:
         queue.put(("thought", event))
 
+    def on_content(piece: str) -> None:
+        queue.put(("content", piece))
+
     def worker() -> None:
         try:
             final, pending_speak = run_chat_pipeline(
@@ -2370,6 +2792,10 @@ async def route_chat(request: Request):
                 defer_cloud=defer_cloud,
                 force_sequential=force_sequential,
                 locale=locale,
+                on_content=on_content,
+                session_context=session_context,
+                host_tier=host_tier,
+                ask=ask,
             )
             # Stream text first; keep SSE open until TTS finishes (stop comes after audio).
             queue.put(("final", final))
@@ -2432,10 +2858,21 @@ async def route_chat(request: Request):
     threading.Thread(target=worker, daemon=True, name="chatrouter-stream").start()
 
     async def event_stream():
+        streamed_parts: list[str] = []
         while True:
             kind, payload = await asyncio.to_thread(queue.get)
             if kind == "thought":
                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            elif kind == "content":
+                streamed_parts.append(payload)
+                yield (
+                    "data: "
+                    + json.dumps(
+                        _openai_content_chunk(payload, chunk_id),
+                        ensure_ascii=False,
+                    )
+                    + "\n\n"
+                )
             elif kind == "final":
                 text = ""
                 try:
@@ -2549,7 +2986,18 @@ async def route_chat(request: Request):
                         )
                         + "\n\n"
                     )
-                if text:
+                if streamed_parts:
+                    # Anti-echo / remix post-passes may have changed text already on screen.
+                    if text.strip() != "".join(streamed_parts).strip():
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {"object": "blossom.content_replace", "content": text},
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                elif text:
                     step = 48
                     for i in range(0, len(text), step):
                         piece = text[i : i + step]
