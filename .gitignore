@@ -24,6 +24,10 @@ Mind/CompanionMind.db
 Mind/*.db
 Mind/llama-server.pid
 Mind/llama-server.role
+Mind/companion/
+Mind/assistant/
+Mind/logs/
+Mind/.store-migration.lock
 
 # Logs
 *.log

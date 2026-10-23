@@ -24,12 +24,18 @@ Progress / "thoughts":
     data: {"object":"chat.completion.chunk","choices":[{"delta":{"content":"..."}}]}
     data: [DONE]
   When stream=false, returns normal completion JSON plus blossom_thoughts[].
+
+Client isolation:
+  Every Mind-touching request must name its client (X-Blossom-Client header or
+  blossom_client = companion|assistant). Each client has its own SQLite + Chroma
+  store (MindStores); the reply echoes blossom_surface so clients can verify.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -80,10 +86,25 @@ from CloudHandoffCompressor import (
     append_prior_provider_block,
     prepare_cloud_coding_prompt,
 )
+import MindStores
 from MemoryUpdater import (
     CONVERSATIONAL_MODEL,
     LLAMA_SERVER_URL,
-    CompanionEngine,
+    bootstrap_mind_stores,
+    get_engine,
+)
+from MindStores import (
+    CLIENT_HEADER,
+    SURFACE_ASSISTANT,
+    SURFACE_COMPANION,
+    SURFACES,
+    SurfaceError,
+    current_surface,
+    pinned_surface,
+    require_client_tag,
+    require_surface,
+    resolve_request_surface,
+    surface_scope,
 )
 from SemanticMemory import (
     CODING_LESSONS_TOP_K,
@@ -133,6 +154,10 @@ from VoiceClient import (
 logging.basicConfig(level=logging.INFO, format="[Blossom]: %(message)s")
 logger = logging.getLogger(__name__)
 
+# Split mode starts the Assistant router with BLOSSOM_ROUTER_PORT; .env's
+# CHAT_ROUTER_PORT (loaded with override above) belongs to the Companion router.
+if os.getenv("BLOSSOM_ROUTER_PORT"):
+    os.environ["CHAT_ROUTER_PORT"] = os.environ["BLOSSOM_ROUTER_PORT"]
 ROUTER_HOST = os.getenv("CHAT_ROUTER_HOST", "127.0.0.1")
 ROUTER_PORT = int(os.getenv("CHAT_ROUTER_PORT", "8081"))
 
@@ -254,9 +279,37 @@ ProgressFn = Callable[[dict[str, Any]], None]
 # Receives final-answer text deltas as llama-server generates them (SSE clients only).
 ContentFn = Callable[[str], None]
 
-swap_lock = threading.Lock()
-engine = CompanionEngine()
-_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chatrouter")
+class _ContextThreadPoolExecutor(ThreadPoolExecutor):
+    """run_in_executor does not copy contextvars; the request surface must follow the work."""
+
+    def submit(self, fn, /, *args, **kwargs):
+        ctx = contextvars.copy_context()
+        return super().submit(ctx.run, fn, *args, **kwargs)
+
+
+class _SurfaceEngine:
+    """Routes every engine call to the active request surface's own Mind store."""
+
+    def __getattr__(self, name: str):
+        return getattr(get_engine(require_surface()), name)
+
+
+# One router may serve both clients (legacy) or be pinned to one (split mode).
+SERVED_SURFACES: tuple[str, ...] = (pinned_surface(),) if pinned_surface() else SURFACES
+
+BRAIN_BROKER_URL = os.getenv("BLOSSOM_BRAIN_BROKER_URL", "").strip().rstrip("/")
+if BRAIN_BROKER_URL:
+    # Split routers share one GPU: the broker owns llama-server, routers lease it.
+    from BrainClient import BrainLease, RemoteServerManager
+
+    swap_lock = BrainLease(
+        BRAIN_BROKER_URL, holder=f"chatrouter-{'+'.join(SERVED_SURFACES)}-{os.getpid()}"
+    )
+    server_manager = RemoteServerManager(BRAIN_BROKER_URL, swap_lock)
+else:
+    swap_lock = threading.Lock()
+engine = _SurfaceEngine()
+_executor = _ContextThreadPoolExecutor(max_workers=2, thread_name_prefix="chatrouter")
 
 # Leave room for the persona completion itself inside the loaded ctx window.
 PERSONA_PROMPT_BUDGET = max(2048, PERSONA_CTX - int(os.getenv("PERSONA_REPLY_RESERVE", "1536")))
@@ -318,15 +371,58 @@ def _synthetic_completion(content: str) -> dict:
     }
 
 
+@contextlib.contextmanager
+def _surface_scope_for(
+    request: Request,
+    body: dict[str, Any] | None = None,
+    *,
+    force: str | None = None,
+):
+    """Resolve and activate the client surface for one request (400/409 on bad tags)."""
+    try:
+        if force:
+            pinned = pinned_surface()
+            tagged = MindStores.normalize_surface(
+                request.headers.get(CLIENT_HEADER)
+                or request.query_params.get("blossom_client")
+                or (body or {}).get("blossom_client")
+            )
+            if (pinned and pinned != force) or (tagged and tagged != force):
+                raise MindStores.SurfaceMismatchError(
+                    f"This endpoint belongs to the {force} client."
+                )
+            surface = force
+        else:
+            surface = resolve_request_surface(
+                header=request.headers.get(CLIENT_HEADER),
+                query=request.query_params.get("blossom_client"),
+                body=body,
+            )
+    except SurfaceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    with surface_scope(surface):
+        yield surface
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    try:
+        await asyncio.get_running_loop().run_in_executor(_executor, bootstrap_mind_stores)
+    except Exception:
+        logger.exception("Mind store bootstrap failed")
+    logger.info(
+        "Serving surfaces: %s (client tag %s)",
+        ", ".join(SERVED_SURFACES),
+        "required" if require_client_tag() else "optional",
+    )
     logger.info("Bootstrapping persona llama-server...")
     with swap_lock:
         server_manager.ensure("persona")
-    try:
-        ensure_feedback_table()
-    except Exception:
-        logger.exception("Could not ensure feedback_turns table")
+    for surface in SERVED_SURFACES:
+        try:
+            ensure_feedback_table(surface)
+        except Exception:
+            logger.exception("Could not ensure %s feedback_turns table", surface)
     # Compactor needs :11434 — must run after llama is up (not before ChatRouter in start-server.ps1).
     compact_on_boot = os.getenv("COMPACT_ON_STARTUP", "true").strip().lower() in {
         "1",
@@ -340,17 +436,16 @@ async def lifespan(_app: FastAPI):
 
             logger.info("Running history compaction (llama ready)…")
             await asyncio.get_running_loop().run_in_executor(
-                _executor, compact_and_summarize_history
+                _executor,
+                lambda: compact_and_summarize_history(surfaces=SERVED_SURFACES),
             )
         except Exception:
             logger.exception("History compaction skipped")
 
-    eval_on_boot = os.getenv("EVAL_ON_STARTUP", "true").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    # The eval suite exercises the coding route as the Assistant client.
+    eval_on_boot = SURFACE_ASSISTANT in SERVED_SURFACES and os.getenv(
+        "EVAL_ON_STARTUP", "true"
+    ).strip().lower() in {"1", "true", "yes", "on"}
     eval_task: asyncio.Task | None = None
 
     async def _run_eval_after_listen() -> None:
@@ -1786,6 +1881,7 @@ def _finalize_response(
             "route": route,
             "enabled": True,
         }
+    final_response["blossom_surface"] = current_surface()
     return final_response
 
 
@@ -1824,13 +1920,45 @@ def _run_chat_pipeline(
     on_content: ContentFn | None = None,
     session_context: str = "",
     host_tier: PromptTier | None = None,
+    chat_surface: str | None = None,
 ) -> tuple[dict, str | None]:
     """Synchronous pipeline used by both streaming and non-streaming endpoints.
 
     Returns (final_response, pending_speak_text). When defer_voice is True and
     TTS is needed, pending_speak_text is set so the caller can synthesize after
     streaming text to the client.
+
+    chat_surface picks the client Mind store (history, persona, memories). There is
+    no default: callers must pass it or already be inside surface_scope().
     """
+    with surface_scope(chat_surface or require_surface()):
+        return __run_chat_pipeline_inner(
+            last_user_message,
+            on_progress,
+            defer_voice=defer_voice,
+            defer_cloud=defer_cloud,
+            force_sequential=force_sequential,
+            locale=locale,
+            voice_id=voice_id,
+            on_content=on_content,
+            session_context=session_context,
+            host_tier=host_tier,
+        )
+
+
+def __run_chat_pipeline_inner(
+    last_user_message: str,
+    on_progress: ProgressFn | None = None,
+    *,
+    defer_voice: bool | None = None,
+    defer_cloud: bool = False,
+    force_sequential: bool = False,
+    locale: str = "ja",
+    voice_id: str | None = None,
+    on_content: ContentFn | None = None,
+    session_context: str = "",
+    host_tier: PromptTier | None = None,
+) -> tuple[dict, str | None]:
     if defer_voice is None:
         defer_voice = VOICE_DEFER_STREAM
     locale = normalize_locale(locale)
@@ -2313,6 +2441,11 @@ async def health():
             "service_ok": voice_service_healthy() if VOICE_ENABLED else False,
         },
         "agent_execution": _agent_execution_health(),
+        "surface": pinned_surface(),
+        "served_surfaces": list(SERVED_SURFACES),
+        "require_client": require_client_tag(),
+        "supports_surface_isolation": True,
+        "brain_broker": BRAIN_BROKER_URL or None,
     }
 
 
@@ -2359,14 +2492,15 @@ async def get_audio(audio_id: str):
 
 
 @app.get("/v1/persona")
-async def get_persona():
-    """Active companion personality + catalog of all slots."""
-    try:
-        bundle = engine.get_persona_bundle()
-        return {"ok": True, **bundle}
-    except Exception as exc:
-        logger.exception("Failed to load persona")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+async def get_persona(request: Request):
+    """Active personality + catalog of all slots for the calling client."""
+    with _surface_scope_for(request) as surface:
+        try:
+            bundle = engine.get_persona_bundle()
+            return {"ok": True, "blossom_surface": surface, **bundle}
+        except Exception as exc:
+            logger.exception("Failed to load persona")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.put("/v1/persona")
@@ -2382,27 +2516,39 @@ async def put_persona(request: Request):
         raise HTTPException(status_code=400, detail="Expected persona object")
     persona_id = body.get("id") or patch.get("id")
 
-    try:
-        persona = await asyncio.get_running_loop().run_in_executor(
-            _executor,
-            lambda: engine.update_persona(patch, persona_id=persona_id),
-        )
-        bundle = engine.get_persona_bundle()
-        return {"ok": True, "persona": persona, **{k: bundle[k] for k in ("active_id", "personas")}}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Failed to save persona")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    with _surface_scope_for(request, body) as surface:
+        try:
+            persona = await asyncio.get_running_loop().run_in_executor(
+                _executor,
+                lambda: engine.update_persona(patch, persona_id=persona_id),
+            )
+            bundle = engine.get_persona_bundle()
+            return {
+                "ok": True,
+                "blossom_surface": surface,
+                "persona": persona,
+                **{k: bundle[k] for k in ("active_id", "personas")},
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Failed to save persona")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/v1/personas")
-async def list_personas():
-    try:
-        return {"ok": True, "personas": engine.list_personas(), "active_id": engine.get_persona_bundle()["active_id"]}
-    except Exception as exc:
-        logger.exception("Failed to list personas")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+async def list_personas(request: Request):
+    with _surface_scope_for(request) as surface:
+        try:
+            return {
+                "ok": True,
+                "blossom_surface": surface,
+                "personas": engine.list_personas(),
+                "active_id": engine.get_persona_bundle()["active_id"],
+            }
+        except Exception as exc:
+            logger.exception("Failed to list personas")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/personas")
@@ -2415,9 +2561,10 @@ async def create_persona(request: Request):
         body = await request.json()
     except Exception:
         body = {}
-    name = str((body or {}).get("companion_name") or "New companion").strip()
-    copy_from = bool((body or {}).get("copy_from_active"))
-    activate = bool((body or {}).get("activate"))
+    body = body if isinstance(body, dict) else {}
+    name = str(body.get("companion_name") or "New companion").strip()
+    copy_from = bool(body.get("copy_from_active"))
+    activate = bool(body.get("activate"))
 
     def _create():
         created = engine.create_persona(
@@ -2427,35 +2574,42 @@ async def create_persona(request: Request):
             return engine.activate_persona(created["id"])
         return engine.get_persona_bundle()
 
-    try:
-        bundle = await asyncio.get_running_loop().run_in_executor(_executor, _create)
-        return {"ok": True, **bundle}
-    except Exception as exc:
-        logger.exception("Failed to create persona")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    with _surface_scope_for(request, body) as surface:
+        try:
+            bundle = await asyncio.get_running_loop().run_in_executor(_executor, _create)
+            return {"ok": True, "blossom_surface": surface, **bundle}
+        except Exception as exc:
+            logger.exception("Failed to create persona")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/v1/personas/{persona_id}/activate")
-async def activate_persona(persona_id: str):
-    try:
-        bundle = await asyncio.get_running_loop().run_in_executor(
-            _executor, lambda: engine.activate_persona(persona_id)
-        )
-        return {"ok": True, **bundle}
-    except KeyError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except Exception as exc:
-        logger.exception("Failed to activate persona")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+async def activate_persona(persona_id: str, request: Request):
+    with _surface_scope_for(request) as surface:
+        try:
+            bundle = await asyncio.get_running_loop().run_in_executor(
+                _executor, lambda: engine.activate_persona(persona_id)
+            )
+            return {"ok": True, "blossom_surface": surface, **bundle}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.exception("Failed to activate persona")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.delete("/v1/personas/{persona_id}")
-async def delete_persona(persona_id: str):
+async def delete_persona(persona_id: str, request: Request):
+    with _surface_scope_for(request):
+        return await _delete_persona_scoped(persona_id)
+
+
+async def _delete_persona_scoped(persona_id: str):
     try:
         bundle = await asyncio.get_running_loop().run_in_executor(
             _executor, lambda: engine.delete_persona(persona_id)
         )
-        return {"ok": True, **bundle}
+        return {"ok": True, "blossom_surface": current_surface(), **bundle}
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2494,12 +2648,15 @@ async def post_feedback(request: Request):
         raise HTTPException(status_code=400, detail="verdict is required")
 
     try:
-        result = await asyncio.get_running_loop().run_in_executor(
-            _executor,
-            lambda: apply_correctness_feedback(
-                feedback_id, verdict, note=note_s or None
-            ),
-        )
+        with _surface_scope_for(request, body):
+            result = await asyncio.get_running_loop().run_in_executor(
+                _executor,
+                lambda: apply_correctness_feedback(
+                    feedback_id, verdict, note=note_s or None
+                ),
+            )
+    except HTTPException:
+        raise
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2545,21 +2702,24 @@ async def register_feedback(request: Request):
         raise HTTPException(status_code=400, detail="answer is required")
 
     try:
-        feedback_id = await asyncio.get_running_loop().run_in_executor(
-            _executor,
-            lambda: register_feedback_turn(
-                route=route,
-                user_prompt=user_prompt,
-                answer=answer,
-                source=source,
-                memory_id=memory_id_s,
-                collection=(
-                    COLLECTION_CODING
-                    if route == "coding"
-                    else COLLECTION_LANGUAGE
+        with _surface_scope_for(request, body):
+            feedback_id = await asyncio.get_running_loop().run_in_executor(
+                _executor,
+                lambda: register_feedback_turn(
+                    route=route,
+                    user_prompt=user_prompt,
+                    answer=answer,
+                    source=source,
+                    memory_id=memory_id_s,
+                    collection=(
+                        COLLECTION_CODING
+                        if route == "coding"
+                        else COLLECTION_LANGUAGE
+                    ),
                 ),
-            ),
-        )
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("feedback register failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2643,7 +2803,12 @@ async def research_endpoint(request: Request):
         }
 
     try:
-        return await asyncio.get_running_loop().run_in_executor(_executor, _run)
+        with _surface_scope_for(request, body) as surface:
+            result = await asyncio.get_running_loop().run_in_executor(_executor, _run)
+            result["blossom_surface"] = surface
+            return result
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("research pipeline failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2669,10 +2834,13 @@ async def memory_coding_learn(request: Request):
         raise HTTPException(status_code=400, detail="answer is required")
 
     try:
-        memory_id = await asyncio.get_running_loop().run_in_executor(
-            _executor,
-            lambda: learn_coding_lesson(user_prompt, answer, source=source),
-        )
+        with _surface_scope_for(request, body, force=SURFACE_ASSISTANT):
+            memory_id = await asyncio.get_running_loop().run_in_executor(
+                _executor,
+                lambda: learn_coding_lesson(user_prompt, answer, source=source),
+            )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("memory/coding learn failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2687,7 +2855,7 @@ async def memory_coding_learn(request: Request):
 
 
 @app.get("/v1/memory/coding")
-async def memory_coding_search(q: str = "", n: int = 5):
+async def memory_coding_search(request: Request, q: str = "", n: int = 5):
     """Search coding_lessons (for debugging / extension verification)."""
     query = (q or "").strip()
     if not query:
@@ -2698,7 +2866,10 @@ async def memory_coding_search(q: str = "", n: int = 5):
         return query_coding_lessons(query, top_k=limit)
 
     try:
-        hits = await asyncio.get_running_loop().run_in_executor(_executor, _search)
+        with _surface_scope_for(request, force=SURFACE_ASSISTANT):
+            hits = await asyncio.get_running_loop().run_in_executor(_executor, _search)
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("memory/coding search failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -2739,6 +2910,18 @@ async def route_chat(request: Request):
     force_sequential = bool(body.get("blossom_sequential_mode"))
     raw_session = body.get("blossom_session")
     session_context = raw_session if isinstance(raw_session, str) else ""
+    try:
+        chat_surface = resolve_request_surface(
+            header=request.headers.get(CLIENT_HEADER),
+            query=request.query_params.get("blossom_client"),
+            body=body,
+        )
+    except SurfaceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if chat_surface == SURFACE_COMPANION and session_context:
+        # Session packs are IDE transcripts; they must never become Haruhi's history.
+        logger.warning("Dropped blossom_session on a Companion-tagged request.")
+        session_context = ""
     raw_tier = str(body.get("blossom_tier") or "").strip().lower()
     host_tier = PromptTier(raw_tier) if raw_tier in {t.value for t in PromptTier} else None
     raw_ask = body.get("blossom_ask")
@@ -2762,12 +2945,15 @@ async def route_chat(request: Request):
                     session_context=session_context,
                     host_tier=host_tier,
                     ask=ask,
+                    chat_surface=chat_surface,
                 )
+                final["blossom_surface"] = chat_surface
                 return final
 
-            return await asyncio.get_running_loop().run_in_executor(
-                _executor, _run_sync
-            )
+            with surface_scope(chat_surface):
+                return await asyncio.get_running_loop().run_in_executor(
+                    _executor, _run_sync
+                )
         except HTTPException:
             raise
         except Exception as exc:
@@ -2796,7 +2982,9 @@ async def route_chat(request: Request):
                 session_context=session_context,
                 host_tier=host_tier,
                 ask=ask,
+                chat_surface=chat_surface,
             )
+            final["blossom_surface"] = chat_surface
             # Stream text first; keep SSE open until TTS finishes (stop comes after audio).
             queue.put(("final", final))
             emotion = str(final.get("blossom_emotion") or "")
@@ -2855,7 +3043,11 @@ async def route_chat(request: Request):
         finally:
             queue.put(("end", None))
 
-    threading.Thread(target=worker, daemon=True, name="chatrouter-stream").start()
+    with surface_scope(chat_surface):
+        worker_ctx = contextvars.copy_context()
+    threading.Thread(
+        target=worker_ctx.run, args=(worker,), daemon=True, name="chatrouter-stream"
+    ).start()
 
     async def event_stream():
         streamed_parts: list[str] = []
@@ -2929,6 +3121,7 @@ async def route_chat(request: Request):
                     + json.dumps(
                         {
                             "object": "blossom.thoughts",
+                            "surface": payload.get("blossom_surface"),
                             "thoughts": payload.get("blossom_thoughts") or [],
                             "source": intel_source,
                             "label": intel_label,

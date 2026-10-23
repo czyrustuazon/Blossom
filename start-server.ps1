@@ -1,4 +1,5 @@
-# Blossom — starts memory compaction, then ChatRouter (owns llama-server hot-swap).
+# Blossom - runs the isolation tests, migrates Mind stores, then starts the brain broker
+# (owns llama-server) plus one ChatRouter per client: Companion (foreground) and Assistant.
 # Works no matter where the project folder is moved.
 
 $ErrorActionPreference = "Stop"
@@ -316,11 +317,114 @@ if ($agentEnabled) {
     Write-Host "Agent sandbox skipped (AGENT_EXECUTION_ENABLED is not true)."
 }
 
+function Wait-BlossomHttp([string]$Url, [int]$TimeoutSec, $Proc) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if ($Proc -and $Proc.HasExited) { return $false }
+        try {
+            $resp = Invoke-WebRequest -Uri $Url -TimeoutSec 3 -UseBasicParsing
+            if ($resp.StatusCode -eq 200) { return $true }
+        } catch { }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
+function Stop-BlossomProc($Proc, [string]$Name) {
+    if (-not $Proc) { return }
+    try {
+        if (-not $Proc.HasExited) {
+            Write-Host "Stopping $Name PID $($Proc.Id) ..."
+            Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Warning "Could not stop ${Name}: $_"
+    }
+}
+
+# --- Client-isolation tripwire: never boot silently with a bleed regression. ---
 Write-Host ""
-Write-Host "Starting ChatRouter on http://${routerHost}:${routerPort} ..."
-Write-Host "ChatRouter will hot-swap llama-server between persona and coder models."
-Write-Host "Point clients at http://${routerHost}:${routerPort}/v1/chat/completions"
-Write-Host "(Ctrl+C stops the router, Voice service, Agent sandbox, and llama-server.)"
+Write-Host "Running backend tests (Companion/Assistant isolation tripwires)..."
+& (Join-Path $ProjectRoot "run_tests.ps1")
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+    Write-Host "!! BACKEND TESTS FAILED - Assistant may bleed into Companion.     !!" -ForegroundColor Red
+    Write-Host "!! Starting anyway; run .\run_tests.ps1 to see what broke.        !!" -ForegroundColor Red
+    Write-Host "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" -ForegroundColor Red
+    Write-Host ""
+}
+
+# Per-client Mind stores (Mind/companion, Mind/assistant). Idempotent; moves the
+# legacy shared layout on first run. Must happen before any router opens the stores.
+Push-Location $ScriptsDir
+try {
+    & python -c "import MemoryUpdater; MemoryUpdater.bootstrap_mind_stores()"
+    if ($LASTEXITCODE -ne 0) {
+        Stop-BlossomVoiceService -Proc $VoiceProc
+        Stop-BlossomAgentExecutor -Proc $AgentProc
+        Write-Error "Mind store migration failed - stop any running ChatRouter and retry."
+    }
+} finally {
+    Pop-Location
+}
+
+# Split mode (default): Companion and Assistant each get their own ChatRouter
+# process and Mind store; the brain broker owns llama-server and leases it.
+$splitRouters = $true
+if ($env:BLOSSOM_SPLIT_ROUTERS) {
+    $splitRouters = Test-BlossomEnvFlag $env:BLOSSOM_SPLIT_ROUTERS
+}
+$brokerPort = if ($env:BLOSSOM_BROKER_PORT) { $env:BLOSSOM_BROKER_PORT } else { "8085" }
+$assistantPort = if ($env:ASSISTANT_ROUTER_PORT) { $env:ASSISTANT_ROUTER_PORT } else { "8083" }
+$LogDir = Join-Path $ProjectRoot "Mind\logs"
+$BrokerProc = $null
+$AssistantProc = $null
+
+Write-Host ""
+if ($splitRouters) {
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $brokerUrl = "http://127.0.0.1:$brokerPort"
+
+    Write-Host "Starting brain broker on $brokerUrl (owns llama-server; first boot loads persona) ..."
+    $BrokerProc = Start-Process -FilePath $python.Source `
+        -ArgumentList @((Join-Path $ScriptsDir "BrainBroker.py")) `
+        -WorkingDirectory $ScriptsDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $LogDir "broker.out.log") `
+        -RedirectStandardError (Join-Path $LogDir "broker.log")
+    if (-not (Wait-BlossomHttp "$brokerUrl/health" 900 $BrokerProc)) {
+        Write-Warning "Brain broker did not come up (see Mind\logs\broker.log) - falling back to one shared ChatRouter."
+        Stop-BlossomProc -Proc $BrokerProc -Name "brain broker"
+        $BrokerProc = $null
+        $splitRouters = $false
+    }
+}
+if ($splitRouters) {
+    $env:BLOSSOM_BRAIN_BROKER_URL = $brokerUrl
+
+    Write-Host "Starting Assistant ChatRouter on http://${routerHost}:${assistantPort} ..."
+    $env:BLOSSOM_SURFACE = "assistant"
+    $env:BLOSSOM_ROUTER_PORT = $assistantPort
+    $AssistantProc = Start-Process -FilePath $python.Source `
+        -ArgumentList @((Join-Path $ScriptsDir "ChatRouter.py")) `
+        -WorkingDirectory $ScriptsDir -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $LogDir "assistant-router.out.log") `
+        -RedirectStandardError (Join-Path $LogDir "assistant-router.log")
+    Remove-Item Env:BLOSSOM_ROUTER_PORT -ErrorAction SilentlyContinue
+
+    # Companion runs in the foreground; the eval suite belongs to the Assistant router.
+    $env:BLOSSOM_SURFACE = "companion"
+    $env:EVAL_ON_STARTUP = "false"
+
+    Write-Host ""
+    Write-Host "Companion ChatRouter : http://${routerHost}:${routerPort}  (Blossom Companion)"
+    Write-Host "Assistant ChatRouter : http://${routerHost}:${assistantPort}  (Blossom Assistant / VS Code)"
+    Write-Host "Assistant log        : Mind\logs\assistant-router.log"
+} else {
+    Write-Host "Starting single ChatRouter on http://${routerHost}:${routerPort} (BLOSSOM_SPLIT_ROUTERS=false) ..."
+    Write-Host "ChatRouter will hot-swap llama-server between persona and coder models."
+}
+Write-Host "(Ctrl+C stops the routers, broker, Voice service, Agent sandbox, and llama-server.)"
 Write-Host ""
 
 Enable-BlossomKeepAwake
@@ -331,6 +435,8 @@ try {
 } finally {
     Disable-BlossomKeepAwake
     Pop-Location
+    Stop-BlossomProc -Proc $AssistantProc -Name "Assistant ChatRouter"
+    Stop-BlossomProc -Proc $BrokerProc -Name "brain broker"
     Stop-BlossomVoiceService -Proc $VoiceProc
     Stop-BlossomAgentExecutor -Proc $AgentProc
     if (Test-Path -LiteralPath $PidFile) {

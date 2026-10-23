@@ -13,14 +13,21 @@ Local-first personal companion: llama.cpp GGUFs + FastAPI ChatRouter (`:8081`) +
 & ".\start-server.ps1"
 ```
 
-Point clients at `http://127.0.0.1:8081/v1/chat/completions` (or your Tailscale host from `.env` — never commit the real IP; use `XXX.XXX.XXX.XXX` in docs).
+Point Blossom Companion at `:8081` and Blossom Assistant at `:8083` (or your Tailscale host from `.env` — never commit the real IP; use `XXX.XXX.XXX.XXX` in docs).
 
 ## Clients
 
-| Client | Role |
-|--------|------|
-| **Blossom Companion** (`Documents\Blossom Companion`) | Chat UI: personas, JA/EN locale, spoken replies, 👍/👎 on coding answers |
-| **Blossom Assistant** (`Documents\Blossom Assistant`) | VS Code extension: agent loop, Apply/delete, escalation, editor context |
+| Client | Role | Router |
+|--------|------|--------|
+| **Blossom Companion** (`Documents\Blossom Companion`) | Chat UI: personas, JA/EN locale, spoken replies, 👍/👎 on coding answers | `:8081` |
+| **Blossom Assistant** (`Documents\Blossom Assistant`) | VS Code extension: agent loop, Apply/delete, escalation, editor context | `:8083` |
+
+### Client isolation (no Assistant → Companion bleed)
+
+- **Separate Mind stores:** `Mind/companion/` (CompanionMind.db + chromadb: relationship_life, language_lessons, web_knowledge) and `Mind/assistant/` (AssistantMind.db + chromadb: coding_lessons, nlpp_hard_bans, web_knowledge). Each store has its own persona; Assistant's was seeded from Companion's identity but evolves on its own (reflection is off unless `BLOSSOM_ASSISTANT_REFLECTION=true`).
+- **Separate processes:** `start-server.ps1` starts `BrainBroker.py` (`127.0.0.1:8085`, the only owner of llama-server, which hands out exclusive model leases) plus one ChatRouter per client (`BLOSSOM_SURFACE=companion|assistant`). Set `BLOSSOM_SPLIT_ROUTERS=false` for the old single router.
+- **Client tag:** every client request sends `X-Blossom-Client` / `blossom_client`. A dedicated router answers 409 to the other client's tag. A shared router answers 400 to untagged requests (`BLOSSOM_REQUIRE_CLIENT`, default on). Replies echo `blossom_surface`.
+- **Tripwire:** `.\run_tests.ps1` (`-BleedOnly` for just the isolation tests). It runs at every `start-server.ps1` boot and prints a red warning if anything fails. Tests use a temp Mind folder and never touch `Mind/`.
 
 ## Research pipeline (shared)
 

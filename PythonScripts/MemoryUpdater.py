@@ -3,12 +3,23 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
 
+import MindStores
+from MindStores import (
+    SURFACE_ASSISTANT,
+    SURFACE_COMPANION,
+    SURFACES,
+    SurfaceMismatchError,
+    current_surface,
+    normalize_surface,
+    require_surface,
+)
 from TemporalContext import (
     build_temporal_context_block,
     now_local_iso,
@@ -23,8 +34,6 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 load_dotenv(SCRIPT_DIR / ".env")
 load_dotenv(PROJECT_ROOT / ".env")
 
-MIND_DIR = PROJECT_ROOT / "Mind"
-DB_PATH = MIND_DIR / "CompanionMind.db"
 MODELS_DIR = PROJECT_ROOT / "Brains" / "models"
 RUNTIME_DIR = PROJECT_ROOT / "Brains" / "runtime"
 LLAMA_SERVER_EXE = RUNTIME_DIR / "llama-server.exe"
@@ -38,10 +47,20 @@ REFLECTION_STATE_KEY = "last_reflection_assistant_count"
 PERSONA_BOOK_KEY = "persona_book"
 LEGACY_PROFILE_KEY = "profile"
 DEFAULT_PERSONA_ID = "main"
+# One-shot: move pre-isolation coding dumps out of Companion short-term history.
+CHAT_SURFACE_ISOLATION_KEY = "chat_surface_isolation_v1"
+# One-shot: move Assistant rows out of the legacy shared DB into AssistantMind.db.
+SURFACE_STORE_SPLIT_KEY = "surface_store_split_v1"
 
 # Marker keeps invite-cadence soft-migration idempotent across persona notes.
 ANTI_INVITE_MARKER = "[[anti-invite-v2]]"
 _OLD_ANTI_INVITE_MARKERS = ("[[anti-invite-v1]]",)
+
+# Assistant's persona copies these identity fields from Companion once, at creation.
+# Mood, user traits and relationship stage always evolve per client.
+_IDENTITY_FIELDS = ("companion_name", "personality_notes", "linguistic_quirks", "voice_id")
+
+
 DEFAULT_PERSONALITY_NOTES = (
     f"{ANTI_INVITE_MARKER}\n"
     "Chat like a real person texting — not a scripted adventure bot.\n"
@@ -121,6 +140,24 @@ def _strip_stock_closer(text: str) -> str:
     return out.strip()
 
 
+_FENCED_BLOCK_RE = re.compile(r"```.*?(?:```|$)", re.DOTALL)
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>.*?(?:</tool_call>|$)|\{\s*\"tool_call\".*?\}", re.DOTALL | re.IGNORECASE
+)
+
+
+def scrub_companion_bleed(text: str) -> str:
+    """Replace code fences / tool calls in Companion history with a placeholder."""
+    raw = text or ""
+    if "```" not in raw and "tool_call" not in raw.lower():
+        return raw
+    out = _FENCED_BLOCK_RE.sub("[code omitted]", raw)
+    out = _TOOL_CALL_RE.sub("[code omitted]", out)
+    if out != raw:
+        logger.warning("Companion history contained code/tool blocks — scrubbed (possible bleed).")
+    return out
+
+
 def _strip_loop_habits(text: str) -> str:
     """Remove sticky opener + stock closer so history does not few-shot the loop."""
     return _strip_stock_closer(_strip_leading_action(text))
@@ -167,7 +204,7 @@ def _phrase_fingerprints(text: str, n: int = 6, limit: int = 6) -> list[str]:
 def _recent_prior_assistants(
     limit: int = 5,
     *,
-    db_path: str | Path = DB_PATH,
+    db_path: str | Path,
     persona_id: str = DEFAULT_PERSONA_ID,
 ) -> list[str]:
     """Load last N assistant texts from the DB (used by remix checks)."""
@@ -268,20 +305,53 @@ def _public_persona(profile: dict, persona_id: str, *, active: bool) -> dict:
     }
 
 
-def ensure_mind_db() -> Path:
-    """Create Mind/ and required tables if missing. Never wipe an existing DB."""
-    MIND_DIR.mkdir(parents=True, exist_ok=True)
+def _read_book(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    conn = sqlite3.connect(path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM evolution_matrix WHERE key=?", (PERSONA_BOOK_KEY,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else None
 
-    conn = sqlite3.connect(DB_PATH)
+
+def _assistant_seed_profile() -> dict:
+    """Assistant starts with Companion's identity but none of her evolved state."""
+    seed = dict(DEFAULT_PROFILE)
+    book = _read_book(MindStores.db_path(SURFACE_COMPANION))
+    if book:
+        active = (book.get("profiles") or {}).get(book.get("active_id") or "") or {}
+        for key in _IDENTITY_FIELDS:
+            if active.get(key):
+                seed[key] = active[key]
+    seed["relationship_stage"] = "just met"
+    seed["internal_mood_diary"] = "focused and ready to build"
+    seed["perceived_user_traits"] = []
+    return _normalize_profile(seed)
+
+
+def ensure_mind_db(surface: str | None = None) -> Path:
+    """Create one surface's DB and tables if missing. Never wipes an existing DB."""
+    surface = surface or require_surface()
+    path = MindStores.db_path(surface)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(path)
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS chat_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 persona_id TEXT NOT NULL DEFAULT 'main',
+                surface TEXT NOT NULL DEFAULT '{surface}',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -300,14 +370,29 @@ def ensure_mind_db() -> Path:
                 "ALTER TABLE chat_logs "
                 "ADD COLUMN persona_id TEXT NOT NULL DEFAULT 'main'"
             )
+        if "surface" not in chat_cols:
+            # Pre-isolation rows belong to whichever store they were found in.
+            cursor.execute(
+                "ALTER TABLE chat_logs "
+                f"ADD COLUMN surface TEXT NOT NULL DEFAULT '{surface}'"
+            )
         cursor.execute(
             "UPDATE chat_logs SET persona_id=? "
             "WHERE persona_id IS NULL OR trim(persona_id)=''",
             (DEFAULT_PERSONA_ID,),
         )
         cursor.execute(
+            "UPDATE chat_logs SET surface=? "
+            "WHERE surface IS NULL OR trim(surface)=''",
+            (surface,),
+        )
+        cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_logs_persona_id "
             "ON chat_logs (persona_id, id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_logs_persona_surface "
+            "ON chat_logs (persona_id, surface, id)"
         )
         cursor.execute(
             """
@@ -317,6 +402,58 @@ def ensure_mind_db() -> Path:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback_turns (
+                id TEXT PRIMARY KEY,
+                route TEXT NOT NULL,
+                user_prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                source TEXT,
+                memory_id TEXT,
+                collection TEXT,
+                verdict TEXT,
+                note TEXT,
+                result_json TEXT,
+                created_at REAL NOT NULL,
+                resolved_at REAL
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_feedback_turns_created "
+            "ON feedback_turns(created_at)"
+        )
+        # Quarantine IDE/coding residue that was logged into Companion history before
+        # surface isolation existed (persona_id alone never separated the clients).
+        cursor.execute(
+            "SELECT value FROM evolution_matrix WHERE key=?",
+            (CHAT_SURFACE_ISOLATION_KEY,),
+        )
+        if surface == SURFACE_COMPANION and cursor.fetchone() is None:
+            cursor.execute(
+                """
+                UPDATE chat_logs
+                SET surface=?
+                WHERE surface=?
+                  AND (
+                    instr(content, '```') > 0
+                    OR instr(lower(content), 'path=') > 0
+                    OR instr(lower(content), 'def add(') > 0
+                    OR instr(lower(content), '```python') > 0
+                    OR instr(lower(content), 'docker') > 0
+                    OR instr(lower(content), 'tool_call') > 0
+                  )
+                """,
+                (SURFACE_ASSISTANT, SURFACE_COMPANION),
+            )
+            cursor.execute(
+                """
+                INSERT INTO evolution_matrix (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (CHAT_SURFACE_ISOLATION_KEY, "1"),
+            )
         # semantic_memories now live in ChromaDB (Mind/chromadb). Keep legacy table
         # if it already exists so migrate_sqlite_semantic_memories can copy rows.
         cursor.execute(
@@ -330,11 +467,12 @@ def ensure_mind_db() -> Path:
                 (LEGACY_PROFILE_KEY,),
             )
             legacy = cursor.fetchone()
-            seed = (
-                _normalize_profile(json.loads(legacy[0]))
-                if legacy
-                else dict(DEFAULT_PROFILE)
-            )
+            if legacy:
+                seed = _normalize_profile(json.loads(legacy[0]))
+            elif surface == SURFACE_ASSISTANT:
+                seed = _assistant_seed_profile()
+            else:
+                seed = dict(DEFAULT_PROFILE)
             book = {
                 "active_id": DEFAULT_PERSONA_ID,
                 "profiles": {DEFAULT_PERSONA_ID: seed},
@@ -364,7 +502,7 @@ def ensure_mind_db() -> Path:
     finally:
         conn.close()
 
-    return DB_PATH
+    return path
 
 
 def _assistant_text_from_response(response_json: dict) -> str:
@@ -387,23 +525,78 @@ def chat_completion(messages, temperature=0.7, timeout=120.0) -> str:
     return _assistant_text_from_response(response.json())
 
 
-ensure_mind_db()
-try:
-    from SemanticMemory import migrate_sqlite_semantic_memories
+def split_legacy_rows() -> dict[str, int]:
+    """Move Assistant rows out of the (formerly shared) Companion DB. Idempotent."""
+    companion = ensure_mind_db(SURFACE_COMPANION)
+    assistant = ensure_mind_db(SURFACE_ASSISTANT)
+    moved = {"chat_logs": 0, "feedback_turns": 0}
+    conn = sqlite3.connect(companion)
+    try:
+        done = conn.execute(
+            "SELECT value FROM evolution_matrix WHERE key=?", (SURFACE_STORE_SPLIT_KEY,)
+        ).fetchone()
+        if done:
+            return moved
+        conn.execute("ATTACH DATABASE ? AS dst", (str(assistant),))
+        rows = conn.execute(
+            "SELECT role, content, persona_id, created_at FROM chat_logs WHERE surface=?",
+            (SURFACE_ASSISTANT,),
+        ).fetchall()
+        if rows:
+            conn.executemany(
+                """
+                INSERT INTO dst.chat_logs (role, content, persona_id, surface, created_at)
+                VALUES (?, ?, ?, 'assistant', ?)
+                """,
+                rows,
+            )
+            conn.execute("DELETE FROM chat_logs WHERE surface=?", (SURFACE_ASSISTANT,))
+        moved["chat_logs"] = len(rows)
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO dst.feedback_turns "
+            "SELECT * FROM feedback_turns WHERE route='coding'"
+        )
+        moved["feedback_turns"] = max(cur.rowcount or 0, 0)
+        conn.execute("DELETE FROM feedback_turns WHERE route='coding'")
+        conn.execute(
+            "INSERT INTO evolution_matrix (key, value) VALUES (?, '1')",
+            (SURFACE_STORE_SPLIT_KEY,),
+        )
+        conn.commit()
+        conn.execute("DETACH DATABASE dst")
+    finally:
+        conn.close()
+    if any(moved.values()):
+        logger.info("Split legacy rows into AssistantMind.db: %s", moved)
+    return moved
 
-    migrate_sqlite_semantic_memories()
-except Exception as exc:
-    logger.warning("Semantic memory migration skipped: %s", exc)
+
+def bootstrap_mind_stores() -> None:
+    """Move the legacy shared layout into per-surface stores, then create both."""
+    with MindStores.migration_lock():
+        MindStores.migrate_legacy_files()
+        split_legacy_rows()
+        try:
+            from SemanticMemory import split_legacy_collections
+
+            split_legacy_collections()
+        except Exception as exc:
+            logger.warning("Chroma surface split skipped: %s", exc)
 
 
 class CompanionEngine:
+    """Persona + short-term memory for exactly one client surface."""
+
     def __init__(
         self,
         base_url=CHAT_COMPLETIONS_URL,
         reflection_every_n_turns: int = REFLECTION_EVERY_N_TURNS,
+        *,
+        surface: str | None = None,
     ):
         self.base_url = base_url
-        self.db_path = str(ensure_mind_db())
+        self.surface = normalize_surface(surface) if surface else require_surface()
+        self.db_path = str(ensure_mind_db(self.surface))
         self.reflection_every_n_turns = max(1, int(reflection_every_n_turns))
         self.static_core = (
             "You are a local AI companion: warm, sharp, and a little teasing when it fits. "
@@ -443,6 +636,15 @@ class CompanionEngine:
             "- Keep wit light; never let jokes replace the actual fix."
         )
 
+    def _check_surface(self, surface: str | None = None) -> str:
+        """Refuse to read/write this store on behalf of the other client."""
+        requested = normalize_surface(surface) if surface else current_surface()
+        if requested and requested != self.surface:
+            raise SurfaceMismatchError(
+                f"{self.surface} engine used for a {requested} request"
+            )
+        return self.surface
+
     def _read_persona_book(self) -> dict:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -454,7 +656,7 @@ class CompanionEngine:
         if row is None:
             # Lazy migrate if ensure_mind_db wasn't called yet
             conn.close()
-            ensure_mind_db()
+            ensure_mind_db(self.surface)
             return self._read_persona_book()
         book = json.loads(row[0])
         conn.close()
@@ -648,8 +850,9 @@ class CompanionEngine:
             conn.execute("DELETE FROM chat_logs WHERE persona_id=?", (pid,))
         return self.get_persona_bundle()
 
-    def _last_user_message_at(self) -> str | None:
-        """created_at of the newest user turn for the active persona (if any)."""
+    def _last_user_message_at(self, surface: str | None = None) -> str | None:
+        """created_at of the newest user turn for the active persona+surface."""
+        surface = self._check_surface(surface)
         persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -657,11 +860,11 @@ class CompanionEngine:
             """
             SELECT created_at
             FROM chat_logs
-            WHERE persona_id=? AND role='user'
+            WHERE persona_id=? AND surface=? AND role='user'
             ORDER BY id DESC
             LIMIT 1
             """,
-            (persona_id,),
+            (persona_id, surface),
         )
         row = cursor.fetchone()
         conn.close()
@@ -676,9 +879,16 @@ class CompanionEngine:
         *,
         sanitize_assistant_loops: bool = False,
         include_timestamps: bool = True,
+        surface: str | None = None,
     ):
-        """Recent chat for the persona. Long coding dumps are truncated so casual chat
-        doesn't keep re-anchoring on file/link work from earlier turns.
+        """Recent chat for the persona on this engine's client surface.
+
+        Each client has its own DB; rows are also surface-tagged as a second fence.
+        Companion history additionally strips code/tool blocks (bleed detector) so
+        a mis-tagged IDE turn can never few-shot Haruhi into coding-bot mode.
+
+        Long coding dumps are truncated so casual chat doesn't keep re-anchoring
+        on file/link work from earlier turns on the *same* surface.
 
         When sanitize_assistant_loops is True (generation prompts), strip sticky
         *action* openers / stock closings from older assistant turns so the model
@@ -687,6 +897,7 @@ class CompanionEngine:
         When include_timestamps is True, prefix each line with a local time stamp
         so the model can sense gaps and day boundaries.
         """
+        surface = self._check_surface(surface)
         persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -694,11 +905,11 @@ class CompanionEngine:
             """
             SELECT role, content, created_at
             FROM chat_logs
-            WHERE persona_id=?
+            WHERE persona_id=? AND surface=?
             ORDER BY id DESC
             LIMIT ?
             """,
-            (persona_id, limit),
+            (persona_id, surface, limit),
         )
         rows = cursor.fetchall()
         conn.close()
@@ -706,6 +917,8 @@ class CompanionEngine:
         out = []
         for role, content, created_at in ordered:
             text = content or ""
+            if surface == SURFACE_COMPANION:
+                text = scrub_companion_bleed(text)
             if sanitize_assistant_loops and role == "assistant":
                 text = _strip_loop_habits(text)
             if len(text) > max_chars_per_message:
@@ -888,13 +1101,18 @@ class CompanionEngine:
             ).strip()
         return out.strip() or raw
 
-    def _assistant_turn_count(self) -> int:
+    def _assistant_turn_count(self, surface: str | None = None) -> int:
+        """Count this store's assistant replies (drives its own self-reflection)."""
         persona_id = self._active_persona_id()
+        surface = normalize_surface(surface) if surface else self.surface
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) FROM chat_logs WHERE role='assistant' AND persona_id=?",
-            (persona_id,),
+            """
+            SELECT COUNT(*) FROM chat_logs
+            WHERE role='assistant' AND persona_id=? AND surface=?
+            """,
+            (persona_id, surface),
         )
         count = cursor.fetchone()[0]
         conn.close()
@@ -939,20 +1157,30 @@ class CompanionEngine:
         conn.commit()
         conn.close()
 
-    def _log_message(self, role, content):
+    @property
+    def reflects(self) -> bool:
+        """Companion always evolves; Assistant only if opted in (reflection swaps models)."""
+        if self.surface == SURFACE_COMPANION:
+            return True
+        return os.getenv("BLOSSOM_ASSISTANT_REFLECTION", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+
+    def _log_message(self, role, content, surface: str | None = None):
+        surface = self._check_surface(surface)
         persona_id = self._active_persona_id()
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
             """
-            INSERT INTO chat_logs (role, content, persona_id, created_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO chat_logs (role, content, persona_id, surface, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (role, content, persona_id, now_local_iso()),
+            (role, content, persona_id, surface, now_local_iso()),
         )
         conn.commit()
         conn.close()
-        if role == "assistant":
+        if role == "assistant" and self.reflects:
             self.maybe_run_self_reflection()
 
     def build_persona_system_prompt(
@@ -1070,9 +1298,9 @@ class CompanionEngine:
         return updated
 
     def execute_self_reflection(self):
-        """Evolve persona metrics from recent chat."""
+        """Evolve this store's persona metrics from its own recent chat."""
         profile = self._get_profile()
-        history = self._get_short_term_context(limit=20)
+        history = self._get_short_term_context(limit=20, surface=self.surface)
         history_text = "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in history
         )
@@ -1119,10 +1347,30 @@ class CompanionEngine:
             return None
 
 
+_ENGINES: dict[str, CompanionEngine] = {}
+_ENGINES_LOCK = threading.Lock()
+
+
+def get_engine(surface: str | None = None) -> CompanionEngine:
+    """Shared engine for one surface (one per process per client store)."""
+    key = normalize_surface(surface) if surface else require_surface()
+    with _ENGINES_LOCK:
+        engine = _ENGINES.get(key)
+        if engine is None:
+            engine = CompanionEngine(surface=key)
+            _ENGINES[key] = engine
+        return engine
+
+
+def reset_engines() -> None:
+    with _ENGINES_LOCK:
+        _ENGINES.clear()
+
+
 def run_chat_cli():
     """Interactive companion chat. Requires llama-server to already be running."""
     logging.basicConfig(level=logging.INFO, format="[Blossom]: %(message)s")
-    engine = CompanionEngine()
+    engine = CompanionEngine(surface=SURFACE_COMPANION)
     print("Companion ready. Type your message (or 'exit' / 'quit' to stop).")
     print(
         f"Self-reflection runs automatically every {engine.reflection_every_n_turns} replies."

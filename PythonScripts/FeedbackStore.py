@@ -14,7 +14,9 @@ import time
 import uuid
 from typing import Any
 
-from MemoryUpdater import DB_PATH
+import MindStores
+from MemoryUpdater import ensure_mind_db
+from MindStores import require_surface
 from SemanticMemory import (
     COLLECTION_CODING,
     COLLECTION_LANGUAGE,
@@ -35,40 +37,14 @@ VALID_VERDICTS = frozenset({"correct", "incorrect"})
 
 
 def _connect() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    """Feedback for the active client lives in that client's own Mind DB."""
+    conn = sqlite3.connect(MindStores.db_path(require_surface()))
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def ensure_feedback_table() -> None:
-    conn = _connect()
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS feedback_turns (
-                id TEXT PRIMARY KEY,
-                route TEXT NOT NULL,
-                user_prompt TEXT NOT NULL,
-                answer TEXT NOT NULL,
-                source TEXT,
-                memory_id TEXT,
-                collection TEXT,
-                verdict TEXT,
-                note TEXT,
-                result_json TEXT,
-                created_at REAL NOT NULL,
-                resolved_at REAL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feedback_turns_created "
-            "ON feedback_turns(created_at)"
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def ensure_feedback_table(surface: str | None = None) -> None:
+    ensure_mind_db(surface or require_surface())
 
 
 def _prune_old(conn: sqlite3.Connection) -> None:

@@ -9,7 +9,8 @@ from typing import Any, Iterable
 
 SCRIPT_DIR = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = SCRIPT_DIR.parent
-MIND_DB = PROJECT_ROOT / "Mind" / "CompanionMind.db"
+# Coding feedback lives in the Assistant store since the per-client Mind split.
+MIND_DB = PROJECT_ROOT / "Mind" / "assistant" / "AssistantMind.db"
 DEFAULT_OUTPUT = PROJECT_ROOT / "Mind" / "lora_exports"
 
 DEFAULT_SOURCE_PATTERNS = (

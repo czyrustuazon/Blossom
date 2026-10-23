@@ -32,8 +32,14 @@ def ask_coder(prompt: str, *, timeout_sec: float = 600.0) -> str:
         "messages": [{"role": "user", "content": prompt}],
         "stream": False,
         "temperature": 0.2,
+        "blossom_client": "assistant",
     }
-    resp = requests.post(chat_router_url(), json=payload, timeout=timeout_sec)
+    resp = requests.post(
+        chat_router_url(),
+        json=payload,
+        headers={"X-Blossom-Client": "assistant"},
+        timeout=timeout_sec,
+    )
     resp.raise_for_status()
     data = resp.json()
     choices = data.get("choices") or []

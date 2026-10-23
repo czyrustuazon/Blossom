@@ -1,26 +1,34 @@
 import logging
 import sqlite3
 
+import MindStores
 from MemoryUpdater import (
     CHAT_COMPLETIONS_URL,
-    DB_PATH,
     chat_completion,
     ensure_mind_db,
 )
+from MindStores import SURFACE_ASSISTANT, SURFACE_COMPANION, SURFACES, surface_scope
 from SemanticMemory import COLLECTION_LIFE, add_memory
 
 logging.basicConfig(level=logging.INFO, format="[Blossom Compactor]: %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def _stale_history_for_persona(persona_id: str, keep_last_n: int):
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+def _db(surface: str) -> str:
+    return str(MindStores.db_path(surface))
+
+
+def _stale_history_for_persona(persona_id: str, keep_last_n: int, surface: str):
+    conn = sqlite3.connect(_db(surface), timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT COUNT(*) as total FROM chat_logs WHERE persona_id=?",
-        (persona_id,),
+        """
+        SELECT COUNT(*) as total FROM chat_logs
+        WHERE persona_id=? AND surface=?
+        """,
+        (persona_id, surface),
     )
     total_rows = cursor.fetchone()["total"]
 
@@ -33,19 +41,42 @@ def _stale_history_for_persona(persona_id: str, keep_last_n: int):
         """
         SELECT id, role, content, created_at
         FROM chat_logs
-        WHERE persona_id=?
+        WHERE persona_id=? AND surface=?
         ORDER BY id ASC
         LIMIT ?
         """,
-        (persona_id, rows_to_process),
+        (persona_id, surface, rows_to_process),
     )
     stale_rows = cursor.fetchall()
     conn.close()
     return stale_rows
 
 
+def _purge_stale_rows(persona_id: str, surface: str, keep_last_n: int) -> bool:
+    """Drop old rows for a surface without writing relationship_life memories."""
+    stale_rows = _stale_history_for_persona(persona_id, keep_last_n, surface)
+    if not stale_rows:
+        return False
+    max_stale_id = stale_rows[-1]["id"]
+    with sqlite3.connect(_db(surface), timeout=30.0) as write_conn:
+        write_conn.execute("PRAGMA journal_mode=WAL;")
+        write_conn.execute(
+            "DELETE FROM chat_logs WHERE persona_id=? AND surface=? AND id <= ?",
+            (persona_id, surface, max_stale_id),
+        )
+    logger.info(
+        "Purged %s stale %s-surface rows for persona %s (no life-memory archive).",
+        len(stale_rows),
+        surface,
+        persona_id,
+    )
+    return True
+
+
 def _compact_persona_history(persona_id: str, keep_last_n: int) -> bool:
-    stale_rows = _stale_history_for_persona(persona_id, keep_last_n)
+    """Archive Companion history into Companion's relationship_life; never Assistant."""
+    surface = SURFACE_COMPANION
+    stale_rows = _stale_history_for_persona(persona_id, keep_last_n, surface)
     if not stale_rows:
         return False
 
@@ -81,7 +112,7 @@ def _compact_persona_history(persona_id: str, keep_last_n: int) -> bool:
 
     try:
         logger.info(
-            "Processing %s stale log entries for persona %s via %s...",
+            "Processing %s stale Companion log entries for persona %s via %s...",
             len(stale_rows),
             persona_id,
             CHAT_COMPLETIONS_URL,
@@ -100,16 +131,20 @@ def _compact_persona_history(persona_id: str, keep_last_n: int) -> bool:
         return False
 
     try:
-        memory_id = add_memory(
-            compiled_memory_text,
-            importance_score=5,
-            metadata={
-                "source": "history_compactor",
-                "persona_id": persona_id,
-                "max_stale_id": max_stale_id,
-            },
-            collection=COLLECTION_LIFE,
-        )
+        with surface_scope(SURFACE_COMPANION):
+            memory_id = add_memory(
+                compiled_memory_text,
+                importance_score=5,
+                metadata={
+                    "source": "history_compactor",
+                    "persona_id": persona_id,
+                    "surface": SURFACE_COMPANION,
+                    "max_stale_id": max_stale_id,
+                },
+                collection=COLLECTION_LIFE,
+            )
+        if not memory_id:
+            raise RuntimeError("relationship_life write was refused")
         logger.info("Archived compacted memory into ChromaDB as %s", memory_id)
     except Exception as e:
         logger.error(
@@ -118,16 +153,19 @@ def _compact_persona_history(persona_id: str, keep_last_n: int) -> bool:
         )
         return False
 
-    with sqlite3.connect(DB_PATH, timeout=30.0) as write_conn:
+    with sqlite3.connect(_db(surface), timeout=30.0) as write_conn:
         write_conn.execute("PRAGMA journal_mode=WAL;")
         write_cursor = write_conn.cursor()
         try:
             write_cursor.execute(
-                "DELETE FROM chat_logs WHERE persona_id=? AND id <= ?",
-                (persona_id, max_stale_id),
+                """
+                DELETE FROM chat_logs
+                WHERE persona_id=? AND surface=? AND id <= ?
+                """,
+                (persona_id, SURFACE_COMPANION, max_stale_id),
             )
             logger.info(
-                "Successfully archived persona %s entries up to log ID %s.",
+                "Successfully archived persona %s Companion entries up to log ID %s.",
                 persona_id,
                 max_stale_id,
             )
@@ -141,43 +179,46 @@ def _compact_persona_history(persona_id: str, keep_last_n: int) -> bool:
     return True
 
 
-def compact_and_summarize_history(keep_last_n=50):
+def compact_and_summarize_history(keep_last_n=50, surfaces=None):
     """
-    Compact old short-term history independently for each persona.
+    Trim each client store's short-term history, per persona.
 
-    Summaries still enter the shared relationship/life collection, while raw
-    conversation context and retention limits remain persona-scoped.
+    Companion rows are summarized into Companion's relationship_life. Assistant rows
+    are purged without any summary, so IDE coding dumps can never re-enter Companion
+    memory via compaction.
     """
-    ensure_mind_db()
-    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
-        persona_ids = [
-            str(row[0])
-            for row in conn.execute(
-                "SELECT DISTINCT persona_id FROM chat_logs ORDER BY persona_id"
-            ).fetchall()
-        ]
-
+    targets = tuple(surfaces or SURFACES)
     compacted_any = False
-    for persona_id in persona_ids:
-        try:
-            compacted_any = (
-                _compact_persona_history(persona_id, keep_last_n) or compacted_any
-            )
-        except Exception:
-            logger.exception("History compaction failed for persona %s", persona_id)
+    for surface in targets:
+        ensure_mind_db(surface)
+        with sqlite3.connect(_db(surface), timeout=30.0) as conn:
+            persona_ids = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT DISTINCT persona_id FROM chat_logs ORDER BY persona_id"
+                ).fetchall()
+            ]
+        for persona_id in persona_ids:
+            try:
+                if surface == SURFACE_COMPANION:
+                    done = _compact_persona_history(persona_id, keep_last_n)
+                else:
+                    done = _purge_stale_rows(persona_id, SURFACE_ASSISTANT, keep_last_n)
+                compacted_any = done or compacted_any
+            except Exception:
+                logger.exception(
+                    "History compaction failed for %s persona %s", surface, persona_id
+                )
+        if compacted_any:
+            with sqlite3.connect(_db(surface), timeout=60.0) as rebuild_conn:
+                rebuild_conn.execute("VACUUM;")
 
     if not compacted_any:
         logger.info(
-            "Database balance optimal. Every persona is at or below %s rows.",
+            "Database balance optimal. Every persona surface is at or below %s rows.",
             keep_last_n,
         )
-        return False
-
-    with sqlite3.connect(DB_PATH, timeout=60.0) as rebuild_conn:
-        logger.info("Reclaiming disk array spaces via VACUUM protocol...")
-        rebuild_conn.execute("VACUUM;")
-        logger.info("Disk space defragmentation successful.")
-    return True
+    return compacted_any
 
 
 if __name__ == "__main__":

@@ -1,12 +1,15 @@
 """
 Long-term semantic memories in ChromaDB (local persistent vectors).
 
-Collections:
-  - relationship_life  : personal / relationship memories
-  - coding_lessons     : general + NLPP lessons + workspace-matched product manuals
-  - nlpp_hard_bans     : critical NLPP bans (always retrieved on coding)
-  - language_lessons   : Japanese-teaching facts (user-verified)
-  - web_knowledge      : useful findings learned from web search
+Collections and the client store that owns them:
+  - relationship_life  : personal / relationship memories          (companion)
+  - language_lessons   : Japanese-teaching facts (user-verified)   (companion)
+  - coding_lessons     : general + NLPP lessons + product manuals  (assistant)
+  - nlpp_hard_bans     : critical NLPP bans (always retrieved on coding) (assistant)
+  - web_knowledge      : findings learned from web search          (per client)
+
+A collection is only reachable from its home surface: cross-surface reads return
+nothing and writes are dropped, so Assistant lessons never reach Haruhi's prompt.
 
 coding_lessons metadata taxonomy:
   - scope: general | product | nlpp | learned
@@ -25,17 +28,20 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import threading
+
 import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
+
+import MindStores
+from MindStores import SURFACE_ASSISTANT, SURFACE_COMPANION, current_surface
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 load_dotenv(SCRIPT_DIR / ".env")
 load_dotenv(PROJECT_ROOT / ".env")
 
-MIND_DIR = PROJECT_ROOT / "Mind"
-CHROMA_DIR = Path(os.getenv("CHROMA_DIR", str(MIND_DIR / "chromadb")))
 COLLECTION_LIFE = os.getenv("CHROMA_COLLECTION_LIFE", "relationship_life")
 COLLECTION_CODING = os.getenv("CHROMA_COLLECTION_CODING", "coding_lessons")
 COLLECTION_HARD_BANS = os.getenv("CHROMA_COLLECTION_HARD_BANS", "nlpp_hard_bans")
@@ -54,28 +60,86 @@ MEMORY_PROMPT_MAX_CHARS = max(500, int(os.getenv("MEMORY_PROMPT_MAX_CHARS", "400
 
 logger = logging.getLogger(__name__)
 
-_client = None
-_collections: dict[str, Any] = {}
+LEGACY_SEMANTIC_COLLECTION = "semantic_memories"
+# None = every surface keeps its own copy (web research).
+COLLECTION_HOME: dict[str, str | None] = {
+    COLLECTION_LIFE: SURFACE_COMPANION,
+    COLLECTION_LANGUAGE: SURFACE_COMPANION,
+    LEGACY_SEMANTIC_COLLECTION: SURFACE_COMPANION,
+    COLLECTION_CODING: SURFACE_ASSISTANT,
+    COLLECTION_HARD_BANS: SURFACE_ASSISTANT,
+    COLLECTION_WEB: None,
+}
+
+_clients: dict[str, Any] = {}
+_collections: dict[tuple[str, str], Any] = {}
+_clients_lock = threading.Lock()
 
 
-def _get_client():
-    global _client
-    if _client is None:
-        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        _client = chromadb.PersistentClient(
-            path=str(CHROMA_DIR),
-            settings=Settings(anonymized_telemetry=False),
+def collection_home(name: str) -> str | None:
+    return COLLECTION_HOME.get(name, SURFACE_COMPANION)
+
+
+def store_surface_for(name: str, surface: str | None = None) -> str | None:
+    """Which surface's Chroma dir serves this collection right now (None = denied).
+
+    Without an active surface (seed scripts, maintenance), home-owned collections
+    resolve to their home; per-client collections need an explicit surface.
+    """
+    active = surface or current_surface()
+    home = collection_home(name)
+    if home is None:
+        return active
+    if active is None or active == home:
+        return home
+    return None
+
+
+def _get_client(surface: str):
+    path = MindStores.chroma_dir(surface)
+    key = str(path)
+    with _clients_lock:
+        client = _clients.get(key)
+        if client is None:
+            path.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=key,
+                settings=Settings(anonymized_telemetry=False),
+            )
+            _clients[key] = client
+        return client
+
+
+def _get_collection(name: str, *, surface: str | None = None):
+    """Collection handle, or None when the active surface may not touch it."""
+    store = store_surface_for(name, surface)
+    if store is None:
+        logger.debug(
+            "Collection %s is not reachable from surface %s", name, surface or current_surface()
         )
-    return _client
-
-
-def _get_collection(name: str):
-    if name not in _collections:
-        _collections[name] = _get_client().get_or_create_collection(
+        return None
+    key = (str(MindStores.chroma_dir(store)), name)
+    coll = _collections.get(key)
+    if coll is None:
+        coll = _get_client(store).get_or_create_collection(
             name=name,
             metadata={"hnsw:space": "cosine"},
         )
-    return _collections[name]
+        _collections[key] = coll
+    return coll
+
+
+def reset_clients() -> None:
+    """Drop cached Chroma handles (tests / after store moves)."""
+    with _clients_lock:
+        _collections.clear()
+        _clients.clear()
+        try:
+            from chromadb.api.client import SharedSystemClient
+
+            SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
 
 
 def add_memory(
@@ -102,6 +166,11 @@ def add_memory(
             )
 
     coll = _get_collection(collection)
+    if coll is None:
+        logger.warning(
+            "Dropped write to %s: not owned by surface %s", collection, current_surface()
+        )
+        return ""
     coll.add(ids=[memory_id], documents=[text], metadatas=[meta])
     logger.info(
         "Stored memory %s in %s (importance=%s)",
@@ -128,6 +197,8 @@ def query_memories(
 
     n = top_k or MEMORY_TOP_K
     coll = _get_collection(collection)
+    if coll is None:
+        return []
     count = coll.count()
     if count == 0:
         return []
@@ -305,6 +376,8 @@ def get_memory(
     if not mid:
         return None
     coll = _get_collection(collection)
+    if coll is None:
+        return None
     try:
         got = coll.get(ids=[mid], include=["documents", "metadatas"])
     except Exception:
@@ -330,6 +403,8 @@ def delete_memory(
     if not mid:
         return False
     coll = _get_collection(collection)
+    if coll is None:
+        return False
     try:
         existing = coll.get(ids=[mid], include=[])
         if not (existing.get("ids") or []):
@@ -373,6 +448,8 @@ def update_memory_metadata(
             value if isinstance(value, (str, int, float, bool)) else str(value)
         )
     coll = _get_collection(collection)
+    if coll is None:
+        return False
     try:
         coll.update(ids=[mid], metadatas=[meta])
         return True
@@ -541,19 +618,19 @@ def learn_web_findings(
                 collection=COLLECTION_WEB,
             )
         )
+    ids = [mid for mid in ids if mid]
     if ids:
         logger.info("Stored %s web knowledge memories for query=%r", len(ids), query[:80])
     return ids
 
 
 def migrate_sqlite_semantic_memories() -> int:
-    """One-time copy of old SQLite semantic_memories rows into relationship_life."""
-    from MemoryUpdater import DB_PATH
-
-    if not DB_PATH.exists():
+    """One-time copy of old SQLite semantic_memories rows into Companion's relationship_life."""
+    db = MindStores.db_path(SURFACE_COMPANION)
+    if not db.exists():
         return 0
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(db)
     try:
         cursor = conn.cursor()
         cursor.execute(
@@ -573,34 +650,7 @@ def migrate_sqlite_semantic_memories() -> int:
     if not rows:
         return 0
 
-    # Also migrate legacy single Chroma collection if present
-    client = _get_client()
-    try:
-        legacy = client.get_collection("semantic_memories")
-        legacy_data = legacy.get(include=["documents", "metadatas"])
-        life = _get_collection(COLLECTION_LIFE)
-        existing = set(life.get(include=[]).get("ids") or [])
-        moved = 0
-        for legacy_id, doc, meta in zip(
-            legacy_data.get("ids") or [],
-            legacy_data.get("documents") or [],
-            legacy_data.get("metadatas") or [],
-        ):
-            new_id = f"legacy-chroma-{legacy_id}"
-            if new_id in existing or not (doc or "").strip():
-                continue
-            life.add(
-                ids=[new_id],
-                documents=[doc],
-                metadatas=[{**(meta or {}), "migrated_from": "chroma_semantic_memories"}],
-            )
-            moved += 1
-        if moved:
-            logger.info("Migrated %s rows from legacy chroma collection.", moved)
-    except Exception:
-        pass
-
-    collection = _get_collection(COLLECTION_LIFE)
+    collection = _get_collection(COLLECTION_LIFE, surface=SURFACE_COMPANION)
     existing = set(collection.get(include=[]).get("ids") or [])
     migrated = 0
 
@@ -631,3 +681,58 @@ def migrate_sqlite_semantic_memories() -> int:
             COLLECTION_LIFE,
         )
     return migrated
+
+
+def _copy_collection(src_coll, dst_coll, batch: int = 200) -> int:
+    existing = set(dst_coll.get(include=[]).get("ids") or [])
+    data = src_coll.get(include=["documents", "metadatas", "embeddings"])
+    ids = data.get("ids") or []
+    docs = data.get("documents") or []
+    metas = data.get("metadatas") or []
+    embs = data.get("embeddings")
+    copied = 0
+    for start in range(0, len(ids), batch):
+        chunk = [
+            i for i in range(start, min(start + batch, len(ids))) if ids[i] not in existing
+        ]
+        if not chunk:
+            continue
+        kwargs: dict[str, Any] = {
+            "ids": [ids[i] for i in chunk],
+            "documents": [docs[i] for i in chunk],
+            "metadatas": [metas[i] or {"migrated_from": "shared_store"} for i in chunk],
+        }
+        if embs is not None and len(embs) == len(ids):
+            kwargs["embeddings"] = [embs[i] for i in chunk]
+        dst_coll.add(**kwargs)
+        copied += len(chunk)
+    return copied
+
+
+def split_legacy_collections() -> dict[str, int]:
+    """Move companion-home collections out of the (formerly shared) Assistant store.
+
+    The legacy Chroma dir was moved wholesale to Mind/assistant/chromadb; anything
+    that belongs to Companion is copied over and then dropped from Assistant.
+    Idempotent: a second run finds nothing left to move.
+    """
+    moved: dict[str, int] = {}
+    src_dir = MindStores.chroma_dir(SURFACE_ASSISTANT)
+    if not src_dir.is_dir():
+        migrate_sqlite_semantic_memories()
+        return moved
+    src_client = _get_client(SURFACE_ASSISTANT)
+    present = {getattr(c, "name", c) for c in src_client.list_collections()}
+    for name, home in COLLECTION_HOME.items():
+        if home != SURFACE_COMPANION or name not in present:
+            continue
+        src = src_client.get_collection(name)
+        target = COLLECTION_LIFE if name == LEGACY_SEMANTIC_COLLECTION else name
+        dst = _get_collection(target, surface=SURFACE_COMPANION)
+        moved[target] = moved.get(target, 0) + _copy_collection(src, dst)
+        src_client.delete_collection(name)
+        _collections.pop((str(src_dir), name), None)
+    migrate_sqlite_semantic_memories()
+    if any(moved.values()):
+        logger.info("Split Chroma collections into the Companion store: %s", moved)
+    return moved
