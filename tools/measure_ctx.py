@@ -15,6 +15,9 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "PythonScripts"))
+from LlamaServerManager import _free_ram_mib, should_disable_mmap  # noqa: E402
+
 EXE = ROOT / "Brains" / "runtime" / "llama-server.exe"
 MODEL = ROOT / "Brains" / "models" / "coding" / "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
 PORT = 11500
@@ -64,10 +67,18 @@ def main() -> None:
         args += ["--n-gpu-layers", "999"]
     if n_cpu_moe:
         args += ["--n-cpu-moe", str(n_cpu_moe)]
+        if should_disable_mmap(MODEL, n_cpu_moe, _free_ram_mib()):
+            args.append("--no-mmap")
     log = open(ROOT / "Mind" / f"measure-{ctx}-{cache}-{n_cpu_moe}.log", "w", encoding="utf-8")
     t0 = time.time()
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
-    result: dict = {"ctx": ctx, "cache": cache, "n_cpu_moe": n_cpu_moe, "baseline_mib": base}
+    result: dict = {
+        "ctx": ctx,
+        "cache": cache,
+        "n_cpu_moe": n_cpu_moe,
+        "mmap": "--no-mmap" not in args,
+        "baseline_mib": base,
+    }
     try:
         while not healthy():
             if proc.poll() is not None:

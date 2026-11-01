@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import struct
 import subprocess
 import time
 from dataclasses import dataclass
@@ -41,8 +42,11 @@ PERSONA_MODEL = persona_model().path
 CODER_MODEL = primary_coder().path
 
 LLAMA_PORT = int(os.getenv("LLAMA_SERVER_PORT", "11434"))
-PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "16384"))
-PERSONA_VRAM_MIB = int(os.getenv("PERSONA_VRAM_MIB", "13000"))
+# Qwen3-14B is trained at 32768. The default matches that window (fp16 KV is ~5 GB).
+PERSONA_CTX = int(os.getenv("PERSONA_CTX_SIZE", "32768"))
+# Estimate for 32k fp16 KV + Q4 weights + compute buffers, so --fit still runs when
+# voice TTS has already taken a chunk of the 24 GB card.
+PERSONA_VRAM_MIB = int(os.getenv("PERSONA_VRAM_MIB", "18000"))
 
 
 @dataclass(frozen=True)
@@ -109,6 +113,9 @@ LLAMA_FIT_TARGET_MIB = int(os.getenv("LLAMA_FIT_TARGET_MIB", "3072"))
 # Headroom over a profile's measured VRAM (which already includes compute buffers)
 # before pinning all layers on GPU without the fit probe.
 PINNED_MARGIN_MIB = int(os.getenv("LLAMA_PINNED_MARGIN_MIB", "1024"))
+# --no-mmap reads the whole GGUF into RAM. Only do that when free RAM covers the
+# file plus this margin, so a 32 GB machine does not page the 18 GB coder.
+MMAP_DISABLE_MARGIN_MIB = int(os.getenv("LLAMA_MMAP_DISABLE_MARGIN_MIB", "4096"))
 READY_TIMEOUT_SEC = int(os.getenv("LLAMA_READY_TIMEOUT_SEC", "600"))
 # Persona chat: off = much faster (no long CoT). Coder can keep thinking.
 PERSONA_REASONING = os.getenv("PERSONA_REASONING", "off").strip().lower()
@@ -144,6 +151,107 @@ def _free_vram_mib() -> int | None:
 
 def _gpu_layers_for(role: str) -> int:
     return PERSONA_GPU_LAYERS if role == "persona" else CODER_GPU_LAYERS
+
+
+def _read_gguf_string(handle) -> str:
+    (length,) = struct.unpack("<Q", handle.read(8))
+    return handle.read(length).decode("utf-8", "replace")
+
+
+def _skip_gguf_value(handle, vtype: int) -> None:
+    sizes = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+    if vtype in sizes:
+        handle.read(sizes[vtype])
+        return
+    if vtype == 8:
+        _read_gguf_string(handle)
+        return
+    if vtype == 9:
+        (elem_type,) = struct.unpack("<I", handle.read(4))
+        (count,) = struct.unpack("<Q", handle.read(8))
+        for _ in range(count):
+            _skip_gguf_value(handle, elem_type)
+        return
+    raise ValueError(f"unknown gguf type {vtype}")
+
+
+def gguf_context_length(path: Path) -> int | None:
+    """Trained context length from a GGUF header, or None if it cannot be read."""
+    try:
+        with path.open("rb") as handle:
+            if handle.read(4) != b"GGUF":
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            handle.read(8)  # tensor count
+            (n_kv,) = struct.unpack("<Q", handle.read(8))
+            arch: str | None = None
+            ctx_types = {4: "<I", 5: "<i", 10: "<Q", 11: "<q"}
+            for _ in range(n_kv):
+                key = _read_gguf_string(handle)
+                (vtype,) = struct.unpack("<I", handle.read(4))
+                if key == "general.architecture" and vtype == 8:
+                    arch = _read_gguf_string(handle)
+                    continue
+                if arch and key == f"{arch}.context_length" and vtype in ctx_types:
+                    width = 4 if vtype in {4, 5} else 8
+                    return int(struct.unpack(ctx_types[vtype], handle.read(width))[0])
+                _skip_gguf_value(handle, vtype)
+    except (OSError, ValueError, struct.error):
+        return None
+    return None
+
+
+def cap_ctx_to_trained(ctx: int, model_path: Path) -> int:
+    """Keep the launch window inside the context the GGUF was trained for."""
+    trained = gguf_context_length(model_path)
+    if trained and ctx > trained:
+        logger.info(
+            "Capping ctx %s to trained context %s for %s",
+            ctx,
+            trained,
+            model_path.name,
+        )
+        return trained
+    return ctx
+
+
+def _free_ram_mib() -> int | None:
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+        return int(status.ullAvailPhys // (1024 * 1024))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def should_disable_mmap(model_path: Path, n_cpu_moe: int, free_ram_mib: int | None) -> bool:
+    """Copy the GGUF into RAM when CPU experts would otherwise fault through mmap."""
+    if n_cpu_moe <= 0 or free_ram_mib is None:
+        return False
+    try:
+        file_mib = model_path.stat().st_size // (1024 * 1024)
+    except OSError:
+        return False
+    return free_ram_mib >= file_mib + MMAP_DISABLE_MARGIN_MIB
 
 
 class LlamaServerManager:
@@ -215,6 +323,14 @@ class LlamaServerManager:
         if not LLAMA_SERVER_EXE.is_file():
             raise FileNotFoundError(f"llama-server.exe not found: {LLAMA_SERVER_EXE}")
 
+        ctx = cap_ctx_to_trained(ctx, model_path)
+        # One slot owns the whole window. llama-server's auto default is 4 slots
+        # sharing one KV pool, so a long prompt can be rejected while idle slots
+        # still hold cache. Blossom serves one request at a time.
+        disable_mmap = should_disable_mmap(
+            model_path, n_cpu_moe, _free_ram_mib() if n_cpu_moe > 0 else None
+        )
+
         self.stop()
         mind_dir = PROJECT_ROOT / "Mind"
         mind_dir.mkdir(parents=True, exist_ok=True)
@@ -231,6 +347,8 @@ class LlamaServerManager:
             "--host",
             "127.0.0.1",
             "--jinja",
+            "--parallel",
+            "1",
         ]
         # Fit layers / experts to the VRAM that is actually free (TTS, vision, browser
         # come and go); pinning --n-gpu-layers would disable the fit. The fit probe adds
@@ -253,6 +371,8 @@ class LlamaServerManager:
             args.extend(["--cache-type-k", cache_type, "--cache-type-v", cache_type])
         if n_cpu_moe > 0:
             args.extend(["--n-cpu-moe", str(n_cpu_moe)])
+        if disable_mmap:
+            args.append("--no-mmap")
 
         reasoning = _normalize_reasoning(reasoning_raw)
         args.extend(["--reasoning", reasoning])
@@ -263,13 +383,14 @@ class LlamaServerManager:
         log_file = open(log_path, "w", encoding="utf-8", errors="replace")
         logger.info(
             "Starting llama-server role=%s model=%s gpu_layers=%s ctx=%s "
-            "cache=%s n_cpu_moe=%s reasoning=%s flash_attn=%s",
+            "cache=%s n_cpu_moe=%s mmap=%s parallel=1 reasoning=%s flash_attn=%s",
             role,
             model_path.name,
             f"fit(margin {LLAMA_FIT_TARGET_MIB} MiB, free {free} MiB)" if use_fit else gpu_layers,
             ctx,
             cache_type,
             n_cpu_moe,
+            "off" if disable_mmap else "on",
             reasoning,
             fa,
         )

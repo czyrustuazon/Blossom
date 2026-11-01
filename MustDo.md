@@ -2,7 +2,7 @@
 
 Action items for **Cursor Agent escalation**, **cost-aware complement workflow**, and **long-term coding improvement**.
 
-**Last updated: 2026-08-02** (P0–P4 shipped; **P5** NLPP seeds; **P6** LoRA pipeline; **P7** README migration)
+**Last updated: 2026-11-01** (long-context hardware note; P0–P4 shipped; **P5** NLPP seeds; **P6** LoRA pipeline; **P7** README migration)
 
 This document is the **implementation spec** for the next engineer or LLM agent. Read `PROGRESS.md` for historical status; read **§ LLM agent onboarding prompt** at the bottom for a copy-paste briefing.
 
@@ -127,6 +127,25 @@ Future (70B-capable hardware — when funded):
 5. Update `README.md` hardware section (per MustDo #6).
 
 **Priority rule:** **Full-GPU residency beats parameter count.** A fast 30B MoE entirely on GPU beats a crawling 70B hybrid. Upgrade hardware before upgrading parameters on a spill config.
+
+### Long context beyond this PC (future hardware)
+
+*Recorded 2026-11-01. This RTX 4090 (24 GB) plus 32 GB RAM already runs Qwen3-Coder-30B-A3B at its trained **262,144** window: q4 KV cache, 12 MoE layers on CPU, one llama-server slot. Measured 2026-10-22 at 21.3 GB and about 19 tok/s once the prompt is ~232k. Persona (Qwen3-14B) is at its trained **32,768**. Leave both there until the machine changes.*
+
+| Idea | What it unlocks | Hardware that makes it worth building |
+|------|-----------------|----------------------------------------|
+| **vLLM + PagedAttention** | Many requests share one GPU without wasting KV on fragmentation. llama.cpp is the right server for a single local user. | A dedicated inference box, or several concurrent agents on one server |
+| **Ring Attention** | One sequence split across GPUs, so context can grow past a single card's KV cache | 2 or more GPUs (dual 4090, or better) |
+| **YaRN / NTK past 256k, toward 1M, on Qwen3-Coder** | The GGUF is already trained at 262,144. A further RoPE stretch needs the KV cache to fit. At this architecture, q4 KV at 1M is on the order of four times the 256k cache (tens of GB of cache alone) plus the weights | 48 GB+ on one GPU, or multi-GPU with ring / tensor split |
+| **YaRN on the Qwen3-14B persona toward 128k** | Qwen's published stretch for this dense 14B. q8 KV at 128k is about 10 GB plus ~9 GB of weights, which crowds a 24 GB card once Style-BERT TTS is on `cuda:0` | A 48 GB card, or a second GPU so persona and coder are not hot-swapped |
+| **Progressive long-context fine-tune** | Teaches a model whose *trained* window is shorter than the one you want. The current coder does not need it. A future dense 70B often ships at 32k–128k | The same box that holds that 70B fully on GPU, plus a long-context dataset (books, multi-file repos) |
+| **Speculative decoding (draft model beside the coder)** | Faster generation. The 256k profile already sits near 21 GB, so a draft model has no room | Extra VRAM after the main weights and the KV cache |
+| **Disk KV restore across hot-swaps** (`--slot-save-path`) | Skips the ~2 minute prefill when a 200k coder session is evicted for persona and loaded again. A 256k q4 cache is several GB on disk. Ship this only after the single-slot launch is the one you run every day | No new GPU. Software follow-up on this PC |
+| **Dual-GPU tensor split for a 70B coder** | Full-GPU 70B, already the plan in the section above | 2×24 GB, or one 48 GB+ card |
+
+**Keep doing on this PC:** one llama-server slot (`--parallel 1`), flash attention, the two measured coder profiles, and mmap left on unless free RAM can hold the whole GGUF (CPU expert offload is slower through mmap, and copying an 18 GB file into 32 GB of RAM will page).
+
+**DeepSeek-Coder-V2-Lite** is trained at **163,840**, and its GGUF already contains the RoPE scaling up to that. Launches cap at the file's trained length, so the 262,144 profile cannot stretch the alt coder to 250k.
 
 ### Expected outcomes by phase
 
@@ -1170,7 +1189,7 @@ Add or expand these sections in **`README.md`**. Copy/adapt from this file — d
 | **Images & vision** (new) | [Must do #1b](#must-do-1b--image-upload--vision-routing) | Text-only local coder; image attach → escalate **with compressed prior context** |
 | **Handoff compression** (new) | [Must do §1.7](#17-conversation-compression-required-before-every-cloud-escalate) | Summarize once; reuse for Cursor → Gemini → Claude; reduce tokens |
 | **Learning** (new) | [Must do #4 Phase A](#phase-a--rag-now-no-gpu-training) | RAG ≠ weight training; Correct/Incorrect; `/v1/memory/coding` |
-| **Hardware & models** (expand) | [70B upgrade plan](#70b-upgrade-plan-future--when-funded) | Current 4090 + 30B MoE; future 70B requirements; **do not** repeat 72B spill on 24 GB |
+| **Hardware & models** (expand) | [70B upgrade plan](#70b-upgrade-plan-future--when-funded), [long context beyond this PC](#long-context-beyond-this-pc-future-hardware) | Current 4090 + 30B MoE at its trained 256k; future 70B, vLLM, ring attention, YaRN past 256k |
 | **Quick start** (keep) | existing | Point to Brains, `.env`, `start-server.ps1` |
 | **Where we're at** (keep) | existing | Link `PROGRESS.md`; add link to `MustDo.md` for active work only |
 
