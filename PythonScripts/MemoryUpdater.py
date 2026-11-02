@@ -84,6 +84,8 @@ DEFAULT_PROFILE = {
     "personality_notes": DEFAULT_PERSONALITY_NOTES,
     # Folder name under Voice/characters/<voice_id>/{Jpn,Eng}/; empty → voice service default
     "voice_id": "",
+    # "" = PERSONA_MODEL_PATH. "bolt" = PERSONA_ALT_MODEL_PATH (Nemotron Bolt E4B).
+    "brain": "",
 }
 
 # Always injected into the system prompt (even if the user edits personality_notes).
@@ -286,6 +288,8 @@ def _normalize_profile(profile: dict | None) -> dict:
         str(cleaned.get("personality_notes") or "")
     )
     cleaned["voice_id"] = str(cleaned.get("voice_id") or "").strip()
+    brain = str(cleaned.get("brain") or "").strip()
+    cleaned["brain"] = brain if brain == "bolt" else ""
     # Drop book-only keys if they leaked into a profile blob
     cleaned.pop("id", None)
     return cleaned
@@ -302,6 +306,7 @@ def _public_persona(profile: dict, persona_id: str, *, active: bool) -> dict:
         "perceived_user_traits": profile.get("perceived_user_traits") or [],
         "personality_notes": _notes_for_public(profile.get("personality_notes") or ""),
         "voice_id": profile.get("voice_id") or "",
+        "brain": profile.get("brain") or "",
     }
 
 
@@ -769,6 +774,7 @@ class CompanionEngine:
             "active_id": active_id,
             "persona": self.get_persona(active_id),
             "personas": self.list_personas(),
+            "brains": _persona_brains(),
         }
 
     def update_persona(
@@ -787,6 +793,7 @@ class CompanionEngine:
             "perceived_user_traits",
             "personality_notes",
             "voice_id",
+            "brain",
         }
         for key, value in (patch or {}).items():
             if key in allowed:
@@ -800,6 +807,7 @@ class CompanionEngine:
         companion_name: str | None = None,
         copy_from_active: bool = False,
         persona_id: str | None = None,
+        brain: str | None = None,
     ) -> dict:
         book = self._read_persona_book()
         name = (companion_name or "New companion").strip() or "New companion"
@@ -815,6 +823,9 @@ class CompanionEngine:
             seed["linguistic_quirks"] = ["still finding her voice"]
             seed["personality_notes"] = DEFAULT_PERSONALITY_NOTES
             seed["voice_id"] = ""
+            seed["brain"] = ""
+        if brain is not None:
+            seed["brain"] = brain
         pid = (persona_id or "").strip() or _slugify_persona_id(name)
         if pid in book["profiles"]:
             pid = _slugify_persona_id(name)
@@ -1337,6 +1348,7 @@ class CompanionEngine:
             # User-authored direction + voice pick — reflection must not wipe these.
             updated_profile["personality_notes"] = profile.get("personality_notes") or ""
             updated_profile["voice_id"] = profile.get("voice_id") or ""
+            updated_profile["brain"] = profile.get("brain") or ""
 
             # Merge through normalizer so missing keys / types stay sane
             updated_profile = self._set_profile(updated_profile)
@@ -1349,6 +1361,37 @@ class CompanionEngine:
 
 _ENGINES: dict[str, CompanionEngine] = {}
 _ENGINES_LOCK = threading.Lock()
+
+
+def _persona_brains() -> list[dict]:
+    from LocalModels import persona_brain_catalog
+
+    return persona_brain_catalog()
+
+
+def ensure_bolt_persona_slot() -> bool:
+    """Add the companion Bolt slot once its GGUF is on disk. Leaves the active persona alone."""
+    from LocalModels import BOLT_BRAIN_ID, persona_alt_model
+
+    alt = persona_alt_model()
+    if alt is None or not alt.available:
+        return False
+    eng = get_engine(SURFACE_COMPANION)
+    book = eng._read_persona_book()
+    for pid, prof in book["profiles"].items():
+        if str(prof.get("brain") or "") == BOLT_BRAIN_ID:
+            return False
+        if pid == BOLT_BRAIN_ID:
+            prof = dict(prof)
+            prof["brain"] = BOLT_BRAIN_ID
+            eng._set_profile(prof, persona_id=pid)
+            return True
+    eng.create_persona(
+        companion_name="Bolt",
+        persona_id=BOLT_BRAIN_ID,
+        brain=BOLT_BRAIN_ID,
+    )
+    return True
 
 
 def get_engine(surface: str | None = None) -> CompanionEngine:

@@ -63,7 +63,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
 from LlamaServerManager import CODER_CTX, PERSONA_CTX, server_manager
-from LocalModels import coder_ladder, primary_coder
+from LocalModels import coder_ladder, persona_brain_path, primary_coder
 from EditorContext import (
     EDITOR_TOKEN_BUDGET,
     build_task_brief,
@@ -91,6 +91,7 @@ from MemoryUpdater import (
     CONVERSATIONAL_MODEL,
     LLAMA_SERVER_URL,
     bootstrap_mind_stores,
+    ensure_bolt_persona_slot,
     get_engine,
 )
 from MindStores import (
@@ -309,6 +310,52 @@ if BRAIN_BROKER_URL:
 else:
     swap_lock = threading.Lock()
 engine = _SurfaceEngine()
+
+
+def _persona_model_for_surface(surface: str | None = None):
+    """GGUF for the active persona on this surface. Bolt slots load the alt model."""
+    try:
+        if surface:
+            persona = get_engine(surface).get_persona()
+        else:
+            persona = engine.get_persona()
+        brain = str(persona.get("brain") or "")
+    except Exception:
+        logger.exception("Persona brain lookup failed; using the default persona GGUF")
+        brain = ""
+    return persona_brain_path(brain)
+
+
+def _ensure_persona(surface: str | None = None) -> None:
+    server_manager.ensure("persona", model_path=_persona_model_for_surface(surface))
+
+
+def _loaded_gguf_name() -> str:
+    path = getattr(server_manager, "current_model", None)
+    if path is None:
+        return ""
+    return Path(path).name
+
+
+def _model_sampling(source: str, temperature: float) -> dict[str, Any]:
+    """Nemotron cards sample at 1.0 / 0.95. Qwen keeps the caller's temperature."""
+    name = _loaded_gguf_name()
+    kwargs: dict[str, Any] = {"temperature": temperature}
+    if "Nemotron-3.5-Lightning" in name and source in {"local_coder", "agent_execution"}:
+        kwargs["temperature"] = 1.0
+        kwargs["top_p"] = 0.95
+    elif "Bolt-E4B" in name and source == "persona":
+        kwargs["temperature"] = 1.0
+        kwargs["top_p"] = 0.95
+        kwargs["extra_body"] = {
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+                "conversational_mode": True,
+            }
+        }
+    return kwargs
+
+
 _executor = _ContextThreadPoolExecutor(max_workers=2, thread_name_prefix="chatrouter")
 
 # Leave room for the persona completion itself inside the loaded ctx window.
@@ -417,7 +464,16 @@ async def lifespan(_app: FastAPI):
     )
     logger.info("Bootstrapping persona llama-server...")
     with swap_lock:
-        server_manager.ensure("persona")
+        try:
+            ensure_bolt_persona_slot()
+        except Exception:
+            logger.exception("Bolt persona slot was not created")
+        boot_surface = (
+            SURFACE_COMPANION
+            if SURFACE_COMPANION in SERVED_SURFACES
+            else SERVED_SURFACES[0]
+        )
+        _ensure_persona(boot_surface)
     for surface in SERVED_SURFACES:
         try:
             ensure_feedback_table(surface)
@@ -692,11 +748,12 @@ def _stream_local_chat(
     otherwise a transient draft_step thought (e.g. coder output that the persona
     may still rewrite). Returns the answer text without <think> spans.
     """
+    sampling = _model_sampling(source, temperature)
     stream = LOCAL_CLIENT.chat.completions.create(
         model=model,
         messages=messages,
-        temperature=temperature,
         stream=True,
+        **sampling,
     )
     content_parts: list[str] = []
     splitter = ThinkSplitter()
@@ -793,12 +850,21 @@ def _apply_chat_mode_nudges(messages: list[dict], locale: str) -> list[dict]:
     return messages
 
 
-def _local_completion(messages: list[dict], temperature: float = 0.82) -> dict:
+def _local_completion(
+    messages: list[dict],
+    temperature: float = 0.82,
+    sampling_source: str | None = None,
+) -> dict:
+    sampling = (
+        _model_sampling(sampling_source, temperature)
+        if sampling_source
+        else {"temperature": temperature}
+    )
     response = LOCAL_CLIENT.chat.completions.create(
         model=LOCAL_VOICE_MODEL,
         messages=messages,
-        temperature=temperature,
         stream=False,
+        **sampling,
     )
     return response.model_dump()
 
@@ -810,7 +876,9 @@ def _local_completion_with_reasoning(
     on_progress: ProgressFn | None = None,
     source: str = "persona",
 ) -> dict:
-    final_response = _local_completion(messages, temperature=temperature)
+    final_response = _local_completion(
+        messages, temperature=temperature, sampling_source=source
+    )
     _emit_model_reasoning(
         on_progress,
         final_response["choices"][0]["message"],
@@ -1799,7 +1867,7 @@ def _persona_wrap(
         return _synthetic_completion(raw_facts)
 
     _think(on_progress, "swap_persona", "Loading persona model for voice rewrite…")
-    server_manager.ensure("persona")
+    _ensure_persona()
     _think(on_progress, "persona", "Rewriting answer in companion voice…")
 
     if on_content:
@@ -1813,7 +1881,9 @@ def _persona_wrap(
         )
         return _synthetic_completion(text)
 
-    final_response = _local_completion(persona_messages, temperature=temperature)
+    final_response = _local_completion(
+        persona_messages, temperature=temperature, sampling_source="persona"
+    )
     _emit_model_reasoning(
         on_progress,
         final_response["choices"][0]["message"],
@@ -2041,7 +2111,7 @@ def __run_chat_pipeline_inner(
             route = "japanese"
             _think(progress, "route", "Detected Japanese-study request.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
-            server_manager.ensure("persona")
+            _ensure_persona()
             persona_messages = _persona_chat_messages(
                 last_user_message, session_context, progress
             )
@@ -2124,7 +2194,7 @@ def __run_chat_pipeline_inner(
             route = "casual"
             _think(progress, "route", "Casual chat → persona model.")
             _think(progress, "swap_persona", "Ensuring persona model is loaded…")
-            server_manager.ensure("persona")
+            _ensure_persona()
             intel_source = "persona"
             persona_messages = _persona_chat_messages(
                 last_user_message, session_context, progress
@@ -2247,7 +2317,7 @@ def __run_chat_pipeline_inner(
     if VOICE_ENABLED and not coding and not defer_voice:
         # Sync path may still use LLM emotion mode; ensure persona is loaded.
         try:
-            server_manager.ensure("persona")
+            _ensure_persona()
         except Exception:
             logger.exception("Could not ensure persona for voice emotion classify")
     final_response, pending_speak = maybe_attach_voice(
@@ -2310,7 +2380,7 @@ def _summarize_with_loaded_model(text: str, max_chars: int) -> tuple[str, str]:
     with swap_lock:
         role = server_manager.current_role
         if not role or not server_manager.is_healthy():
-            server_manager.ensure("persona")
+            _ensure_persona()
             role = "persona"
         ctx = (server_manager.current_ctx or CODER_CTX) if role == "coder" else PERSONA_CTX
         model = LOCAL_CODER_MODEL if role == "coder" else LOCAL_VOICE_MODEL
@@ -2527,7 +2597,7 @@ async def put_persona(request: Request):
                 "ok": True,
                 "blossom_surface": surface,
                 "persona": persona,
-                **{k: bundle[k] for k in ("active_id", "personas")},
+                **{k: bundle[k] for k in ("active_id", "personas", "brains")},
             }
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

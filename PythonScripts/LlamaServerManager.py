@@ -92,13 +92,39 @@ CODER_PROFILES = _parse_coder_profiles(os.getenv("CODER_CTX_PROFILES", "")) or [
 ]
 # Largest coder window — budgets (session pack, health) size against this.
 CODER_CTX = CODER_PROFILES[-1].ctx
+# Per-file overrides. "substring=ctx:cache:n_cpu_moe:vram|ctx:...;other=..."
+# Lightning's KV cache stays small, so it must not inherit the Qwen CPU-expert profile.
+CODER_MODEL_PROFILES = os.getenv("CODER_MODEL_PROFILES", "")
 
 
-def coder_profile_for(min_ctx: int) -> CoderProfile:
-    for profile in CODER_PROFILES:
+def profiles_for_model(
+    model_path: Path | None,
+    rules: str | None = None,
+    fallback: list[CoderProfile] | None = None,
+) -> list[CoderProfile]:
+    """Launch profiles for one GGUF. Unmatched files keep CODER_CTX_PROFILES."""
+    raw = CODER_MODEL_PROFILES if rules is None else rules
+    fallback_profiles = CODER_PROFILES if fallback is None else fallback
+    name = model_path.name if model_path is not None else ""
+    for rule in raw.split(";"):
+        rule = rule.strip()
+        if not rule or "=" not in rule:
+            continue
+        needle, spec = rule.split("=", 1)
+        needle = needle.strip()
+        if needle and needle in name:
+            parsed = _parse_coder_profiles(spec.replace("|", ","))
+            if parsed:
+                return parsed
+    return list(fallback_profiles)
+
+
+def coder_profile_for(min_ctx: int, model_path: Path | None = None) -> CoderProfile:
+    profiles = profiles_for_model(model_path)
+    for profile in profiles:
         if profile.ctx >= min_ctx:
             return profile
-    return CODER_PROFILES[-1]
+    return profiles[-1]
 # Shared default; role-specific overrides let big coders spill layers to CPU/RAM.
 _DEFAULT_GPU_LAYERS = int(os.getenv("LLAMA_N_GPU_LAYERS", "999"))
 PERSONA_GPU_LAYERS = int(os.getenv("PERSONA_N_GPU_LAYERS", str(_DEFAULT_GPU_LAYERS)))
@@ -447,7 +473,7 @@ class LlamaServerManager:
             return
 
         if role == "coder":
-            profile = coder_profile_for(min_ctx)
+            profile = coder_profile_for(min_ctx, target)
             if self.current_role == "coder" and self.current_model == target:
                 logger.info(
                     "Coder window %s < needed %s — relaunching at ctx=%s (%s KV, %s MoE layers on CPU)",

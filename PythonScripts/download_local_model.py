@@ -33,7 +33,10 @@ def _print_env_hint(role: str, rel_path: str, preset: dict | None = None) -> Non
     print("Download complete. Point .env at this file, then restart ChatRouter:")
     print()
     if role == "conversational":
-        print(f"  PERSONA_MODEL_PATH={rel_path}")
+        if preset and preset.get("env_key") == "PERSONA_ALT_MODEL_PATH":
+            print(f"  PERSONA_ALT_MODEL_PATH={rel_path}")
+        else:
+            print(f"  PERSONA_MODEL_PATH={rel_path}")
     elif preset and preset.get("env_key") == "CODER_ALT_MODEL_PATH":
         print(f"  CODER_ALT_MODEL_PATH={rel_path}")
         print("  # or fold into a ladder:")

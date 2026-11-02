@@ -114,3 +114,57 @@ def primary_coder() -> LocalModel:
 
 def any_coder_available() -> bool:
     return bool(coder_ladder(available_only=True))
+
+
+# Persona slot field. Empty brain id keeps PERSONA_MODEL_PATH (Qwen).
+BOLT_BRAIN_ID = "bolt"
+
+
+def persona_alt_model() -> LocalModel | None:
+    """Second conversational GGUF (Nemotron Bolt). Unset means there is no alt brain."""
+    raw = os.getenv("PERSONA_ALT_MODEL_PATH", "").strip()
+    if not raw:
+        return None
+    return LocalModel(path=resolve_model_path(raw), kind="persona")
+
+
+def _brain_label(path: Path) -> str:
+    name = path.name
+    if "Bolt-E4B" in name:
+        return "Nemotron Bolt E4B"
+    if "Qwen3-14B" in name or "Qwen_Qwen3-14B" in name:
+        return "Qwen3 14B"
+    return path.stem
+
+
+def persona_brain_catalog() -> list[dict]:
+    """Brains the personality panel can assign. id '' is the default persona GGUF."""
+    main = persona_model()
+    brains = [
+        {
+            "id": "",
+            "label": _brain_label(main.path),
+            "path": str(main.path),
+            "available": main.available,
+        }
+    ]
+    alt = persona_alt_model()
+    if alt is not None:
+        brains.append(
+            {
+                "id": BOLT_BRAIN_ID,
+                "label": _brain_label(alt.path),
+                "path": str(alt.path),
+                "available": alt.available,
+            }
+        )
+    return brains
+
+
+def persona_brain_path(brain_id: str | None) -> Path:
+    """GGUF for a persona slot. A missing Bolt file falls back to the default persona."""
+    if (brain_id or "").strip() == BOLT_BRAIN_ID:
+        alt = persona_alt_model()
+        if alt is not None and alt.available:
+            return alt.path.resolve()
+    return persona_model().path.resolve()
