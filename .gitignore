@@ -28,6 +28,8 @@ Mind/companion/
 Mind/assistant/
 Mind/logs/
 Mind/.store-migration.lock
+Mind/rag/web_crawl/*.jsonl
+Mind/rag/web_crawl/*.json
 
 # Logs
 *.log

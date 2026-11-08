@@ -7,6 +7,8 @@ Collections and the client store that owns them:
   - coding_lessons     : general + NLPP lessons + product manuals  (assistant)
   - nlpp_hard_bans     : critical NLPP bans (always retrieved on coding) (assistant)
   - web_knowledge      : findings learned from web search          (per client)
+  - crawl_docs         : first-pass documentation chunks             (assistant)
+  - crawl_code         : first-pass code samples                     (assistant)
 
 A collection is only reachable from its home surface: cross-surface reads return
 nothing and writes are dropped, so Assistant lessons never reach Haruhi's prompt.
@@ -47,6 +49,8 @@ COLLECTION_CODING = os.getenv("CHROMA_COLLECTION_CODING", "coding_lessons")
 COLLECTION_HARD_BANS = os.getenv("CHROMA_COLLECTION_HARD_BANS", "nlpp_hard_bans")
 COLLECTION_LANGUAGE = os.getenv("CHROMA_COLLECTION_LANGUAGE", "language_lessons")
 COLLECTION_WEB = os.getenv("CHROMA_COLLECTION_WEB", "web_knowledge")
+COLLECTION_CRAWL_DOCS = os.getenv("CHROMA_COLLECTION_CRAWL_DOCS", "crawl_docs")
+COLLECTION_CRAWL_CODE = os.getenv("CHROMA_COLLECTION_CRAWL_CODE", "crawl_code")
 # Back-compat alias used by older code/docs
 MEMORY_COLLECTION = COLLECTION_LIFE
 MEMORY_TOP_K = max(1, int(os.getenv("MEMORY_TOP_K", "5")))
@@ -69,6 +73,8 @@ COLLECTION_HOME: dict[str, str | None] = {
     COLLECTION_CODING: SURFACE_ASSISTANT,
     COLLECTION_HARD_BANS: SURFACE_ASSISTANT,
     COLLECTION_WEB: None,
+    COLLECTION_CRAWL_DOCS: SURFACE_ASSISTANT,
+    COLLECTION_CRAWL_CODE: SURFACE_ASSISTANT,
 }
 
 _clients: dict[str, Any] = {}

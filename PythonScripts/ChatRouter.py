@@ -5,7 +5,7 @@ Flow:
   casual   -> persona llama-server
               (+ optional web search → web_knowledge Chroma when triggered)
   coding   -> hot-swap through local coder ladder (CODER_MODELS / CODER_ALT)
-              (+ nlpp_hard_bans always + coding_lessons + web_knowledge RAG)
+              (+ nlpp_hard_bans always + coding_lessons + crawl_docs/crawl_code + web_knowledge RAG)
               -> gated research pipeline (skip/simple/deep) when enabled
               -> Claude/Gemini only if local coders fail (CLOUD_FALLBACK_ORDER)
               -> learn useful answers into coding_lessons / web_knowledge
@@ -110,6 +110,8 @@ from MindStores import (
 from SemanticMemory import (
     CODING_LESSONS_TOP_K,
     COLLECTION_CODING,
+    COLLECTION_CRAWL_CODE,
+    COLLECTION_CRAWL_DOCS,
     COLLECTION_HARD_BANS,
     COLLECTION_LANGUAGE,
     COLLECTION_WEB,
@@ -1244,6 +1246,49 @@ def _persona_chat_messages(
     ]
 
 
+def _crawl_reference_block(focus: str) -> tuple[str, int]:
+    """Docs and code from the first-pass crawl, for the coder prompt only."""
+
+    def _stamp_url(hits: list[dict]) -> list[dict]:
+        stamped = []
+        for hit in hits:
+            url = str((hit.get("metadata") or {}).get("url") or "")
+            text = str(hit.get("text") or "")
+            if url and url not in text:
+                hit = dict(hit)
+                hit["text"] = f"{url}\n{text}"
+            stamped.append(hit)
+        return stamped
+
+    docs = _stamp_url(
+        query_memories(focus, collection=COLLECTION_CRAWL_DOCS, top_k=4)
+    )
+    code = _stamp_url(
+        query_memories(focus, collection=COLLECTION_CRAWL_CODE, top_k=3)
+    )
+    parts: list[str] = []
+    if docs:
+        parts.append(
+            format_memories_for_prompt(
+                docs,
+                heading=(
+                    "[CRAWLED DOCS — reference only; cite the URL; "
+                    "not this project's source]"
+                ),
+                max_chars=1800,
+            )
+        )
+    if code:
+        parts.append(
+            format_memories_for_prompt(
+                code,
+                heading="[CRAWLED CODE SAMPLES — patterns to adapt, not to paste blindly]",
+                max_chars=1200,
+            )
+        )
+    return "\n\n".join(parts), len(docs) + len(code)
+
+
 def _local_coder_answer(
     user_prompt: str,
     on_progress: ProgressFn | None = None,
@@ -1370,6 +1415,19 @@ def _local_coder_answer(
                 "coding_lessons",
                 f"Loaded {len(lessons)} relevant coding lesson(s).",
                 count=len(lessons),
+            )
+        _think(on_progress, "crawl_corpus", "Retrieving crawled docs and code…")
+        crawl_block, crawl_count = _crawl_reference_block(focus)
+        if crawl_block:
+            lesson_block = (
+                f"{lesson_block}\n\n{crawl_block}" if lesson_block else crawl_block
+            )
+        if crawl_count:
+            _think(
+                on_progress,
+                "crawl_corpus",
+                f"Loaded {crawl_count} crawled reference(s).",
+                count=crawl_count,
             )
     elif sequential:
         _think(on_progress, "coding_lessons", "Skipped coding lessons (sequential overflow mode).")
