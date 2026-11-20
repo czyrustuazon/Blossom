@@ -1,6 +1,8 @@
 # Handoff — Blossom Assistant refactor training ("Dr. Light" loop)
 
-**Paused:** 2026-11-20, partway through cycle 4. **Nothing in this work is committed yet.**
+**Paused:** 2026-11-20, partway through cycle 4. Work so far is committed: Blossom
+`e3ebef8` (router, memory, rules, eval capsule, this file) and Blossom Assistant
+`839fda9` (extension tool loop).
 
 ## The goal
 
@@ -116,7 +118,7 @@ The five tasks: `rename-symbol` (rename across package, tests, README),
 → package with `__main__`), `globals-to-di` (global settings → injected
 classes, an API change), `cjs-to-esm` (Node CommonJS → ESM).
 
-## Corrections already made (uncommitted)
+## Corrections already made (committed in `e3ebef8` / `839fda9`)
 
 Each fix below came from a failure seen in the transcripts.
 
