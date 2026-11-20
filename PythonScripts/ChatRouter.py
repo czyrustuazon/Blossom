@@ -7,10 +7,10 @@ Flow:
   coding   -> hot-swap through local coder ladder (CODER_MODELS / CODER_ALT)
               (+ nlpp_hard_bans always + coding_lessons + crawl_docs/crawl_code + web_knowledge RAG)
               -> gated research pipeline (skip/simple/deep) when enabled
-              -> Claude/Gemini only if local coders fail (CLOUD_FALLBACK_ORDER)
+              -> local only: no cloud fallback (extension may be told to defer)
               -> learn useful answers into coding_lessons / web_knowledge
               -> hot-swap back to persona for voice rewrite
-  japanese -> persona first (+ language_lessons RAG); cloud last resort
+  japanese -> persona (+ language_lessons RAG); local only
               -> correctness feedback (thumbs) may store language_lessons
   research -> POST /v1/research { query, coding? } → shared ResearchPipeline
   feedback -> POST /v1/feedback { feedback_id, verdict: correct|incorrect, note? }
@@ -81,10 +81,6 @@ from PromptTier import (
     coder_system_prompt_for_tier,
     detect_prompt_tier,
     should_skip_coding_lessons,
-)
-from CloudHandoffCompressor import (
-    append_prior_provider_block,
-    prepare_cloud_coding_prompt,
 )
 import MindStores
 from MemoryUpdater import (
@@ -167,35 +163,6 @@ ROUTER_PORT = int(os.getenv("CHAT_ROUTER_PORT", "8081"))
 LOCAL_VOICE_MODEL = os.getenv("LOCAL_VOICE_MODEL", CONVERSATIONAL_MODEL.name)
 LOCAL_CODER_MODEL = os.getenv("LOCAL_CODER_MODEL", primary_coder().name)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", os.getenv("CLOUD_INTEL_MODEL", "gemini-2.5-flash-lite"))
-CLAUDE_API_KEY = (
-    os.getenv("CLAUDE_API_KEY", "").strip()
-    or os.getenv("ANTHROPIC_API_KEY", "").strip()
-)
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5")
-CLOUD_FALLBACK_ORDER = [
-    part.strip().lower()
-    for part in os.getenv("CLOUD_FALLBACK_ORDER", "claude,gemini").split(",")
-    if part.strip()
-]
-# Master switch: when false, coding never calls Claude/Gemini (local only).
-CLOUD_FALLBACK_ENABLED = os.getenv("CLOUD_FALLBACK_ENABLED", "true").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-# When false, keep a "good enough" local answer even if multi-file heuristics look incomplete.
-# Default false — incomplete→cloud was burning Claude credits on simple delete/edit tasks.
-CLOUD_ESCALATE_ON_INCOMPLETE = os.getenv(
-    "CLOUD_ESCALATE_ON_INCOMPLETE", "false"
-).strip().lower() in {"1", "true", "yes", "on"}
-# When false, ignore ESCALATE_CLOUD / ESCALATE_GEMINI markers from the local coder.
-CLOUD_ESCALATE_ON_REQUEST = os.getenv(
-    "CLOUD_ESCALATE_ON_REQUEST", "true"
-).strip().lower() in {"1", "true", "yes", "on"}
-
 LOCAL_CLIENT = OpenAI(base_url=f"{LLAMA_SERVER_URL}/v1", api_key="local")
 
 _CODING_RULES_PATH = Path(__file__).resolve().parent / "coding_rules.txt"
@@ -221,28 +188,6 @@ CODING_RULES = _load_coding_rules()  # boot-time cache; prompts also reload from
 def _coding_rules_text() -> str:
     """Prefer fresh coding_rules.txt so edits apply after ChatRouter restart (or same process)."""
     return _load_coding_rules() or CODING_RULES
-
-GEMINI_CLIENT = None
-if GEMINI_API_KEY:
-    GEMINI_CLIENT = OpenAI(
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        api_key=GEMINI_API_KEY,
-    )
-
-CLAUDE_CLIENT = None
-if CLAUDE_API_KEY:
-    try:
-        from anthropic import Anthropic
-
-        CLAUDE_CLIENT = Anthropic(api_key=CLAUDE_API_KEY)
-    except ImportError:
-        logger.warning(
-            "anthropic package not installed; Claude fallback disabled. "
-            "Run: pip install anthropic"
-        )
-
-CLOUD_CLIENT = GEMINI_CLIENT or CLAUDE_CLIENT
-CLOUD_INTEL_MODEL = GEMINI_MODEL
 
 AGENT_EXECUTION_ENABLED = os.getenv("AGENT_EXECUTION_ENABLED", "true").strip().lower() in {
     "1",
@@ -934,19 +879,6 @@ def _persona_reply(
     )
 
 
-def _cloud_system_prompt(purpose: str = "general") -> str:
-    if purpose == "coding":
-        return (
-            "You are a senior software engineer. Provide a correct, concise solution "
-            "with code blocks when needed. No filler.\n\n"
-            + _coding_rules_text()
-        )
-    return (
-        "Provide only objective facts, corrections, or raw code blocks. "
-        "Be completely concise with zero conversational filler."
-    )
-
-
 def _coder_system_prompt() -> str:
     return (
         "You are Blossom's local coding engine. Complete multi-step software tasks "
@@ -1145,106 +1077,6 @@ def _coding_answer_looks_incomplete(user_prompt: str, answer: str) -> bool:
         if info_hits < 2:
             return True
     return False
-
-
-def _gemini_facts(user_prompt: str, purpose: str = "general") -> str:
-    if GEMINI_CLIENT is None:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    response = GEMINI_CLIENT.chat.completions.create(
-        model=GEMINI_MODEL,
-        messages=[
-            {"role": "system", "content": _cloud_system_prompt(purpose)},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
-    return _message_text(response.choices[0].message)
-
-
-def _claude_facts(user_prompt: str, purpose: str = "general") -> str:
-    if CLAUDE_CLIENT is None:
-        raise RuntimeError("CLAUDE_API_KEY / ANTHROPIC_API_KEY is not set")
-    response = CLAUDE_CLIENT.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=4096,
-        system=_cloud_system_prompt(purpose),
-        messages=[{"role": "user", "content": user_prompt}],
-        temperature=0.2,
-    )
-    parts = []
-    for block in response.content:
-        text = getattr(block, "text", None)
-        if text:
-            parts.append(text)
-    return "\n".join(parts).strip()
-
-
-def _summarize_for_handoff(raw_summary: str) -> str | None:
-    """Optional LLM summarize before cloud handoff (HANDOFF_SUMMARIZE_PROVIDER)."""
-    provider = os.getenv("HANDOFF_SUMMARIZE_PROVIDER", "local").strip().lower()
-    if provider == "rules-only":
-        return None
-    if provider == "gemini" and GEMINI_CLIENT is not None:
-        try:
-            prompt = (
-                "Compress this Blossom coding session into a handoff summary.\n"
-                "Keep: goal, key decisions, files touched, failures, open questions.\n"
-                "Max 1200 words. Plain text only.\n\n"
-                + raw_summary[:24000]
-            )
-            return _gemini_facts(prompt, purpose="general")
-        except Exception as exc:
-            logger.warning("Gemini handoff summarize failed: %s", exc)
-    if provider in {"local", "gemini"}:
-        from CloudHandoffCompressor import _local_summarize
-
-        return _local_summarize(raw_summary)
-    return None
-
-
-def _cloud_facts(
-    user_prompt: str,
-    purpose: str = "general",
-    on_progress: ProgressFn | None = None,
-) -> tuple[str, str]:
-    errors: list[str] = []
-    base_prompt = user_prompt
-    prompt = base_prompt
-    for provider in CLOUD_FALLBACK_ORDER:
-        try:
-            if provider == "claude":
-                if CLAUDE_CLIENT is None:
-                    errors.append("claude: not configured")
-                    continue
-                _think(on_progress, "cloud", f"Asking Claude ({CLAUDE_MODEL})…", provider="claude")
-                return _claude_facts(prompt, purpose=purpose), "claude"
-            if provider in {"gemini", "google"}:
-                if GEMINI_CLIENT is None:
-                    errors.append("gemini: not configured")
-                    continue
-                _think(on_progress, "cloud", f"Asking Gemini ({GEMINI_MODEL})…", provider="gemini")
-                return _gemini_facts(prompt, purpose=purpose), "gemini"
-            errors.append(f"{provider}: unknown provider")
-        except Exception as exc:
-            logger.warning("Cloud provider %s failed: %s", provider, exc)
-            _think(
-                on_progress,
-                "cloud_error",
-                f"{provider} failed: {exc}",
-                provider=provider,
-            )
-            errors.append(f"{provider}: {exc}")
-            prompt = append_prior_provider_block(
-                base_prompt,
-                provider,
-                f"Failed: {exc}",
-            )
-
-    detail = (
-        "Local intelligence failed and no cloud fallback succeeded. "
-        + ("; ".join(errors) if errors else "Set CLAUDE_API_KEY and/or GEMINI_API_KEY.")
-    )
-    raise HTTPException(status_code=503, detail=detail)
 
 
 def _research_complete_fn(*, coding: bool) -> Callable[[list[dict[str, str]], float], str]:
@@ -1765,17 +1597,6 @@ def _get_coding_intel(
     web_block = "" if force_sequential else _gather_web_context(
         user_prompt, coding=True, on_progress=on_progress
     )
-    packed_prompt, _pack_stats = (
-        pack_editor_context_sequential(user_prompt)
-        if force_sequential
-        else pack_editor_context(user_prompt)
-    )
-    enriched = packed_prompt
-    if web_block:
-        enriched = (
-            f"{packed_prompt}\n\n---\nUse this research context when helpful:\n{web_block}"
-        )
-
     ladders = coder_ladder(available_only=True)
     answer = ""
     answer_source = "local_coder"
@@ -1829,7 +1650,7 @@ def _get_coding_intel(
         _think(
             on_progress,
             "fallback",
-            f"{fallback_reason}; using cloud…",
+            f"{fallback_reason}; no local coder available.",
         )
     else:
         if force_sequential:
@@ -1887,7 +1708,7 @@ def _get_coding_intel(
                     _think(
                         on_progress,
                         "fallback",
-                        f"{fallback_reason}; trying cloud…",
+                        f"{fallback_reason}; no more local coders.",
                     )
                     break
 
@@ -1920,44 +1741,18 @@ def _get_coding_intel(
                     )
                     continue
 
-                if wants_escalate and CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST:
-                    fallback_reason = "Local coder requested cloud escalation"
-                    _think(
-                        on_progress,
-                        "escalate",
-                        f"{fallback_reason}; trying cloud…",
-                    )
-                    break
-                if (
-                    looks_incomplete
-                    and CLOUD_FALLBACK_ENABLED
-                    and CLOUD_ESCALATE_ON_INCOMPLETE
-                ):
-                    fallback_reason = (
-                        "Local coder answer looks incomplete for multi-file create/edit"
-                    )
-                    _think(
-                        on_progress,
-                        "escalate",
-                        f"{fallback_reason}; trying cloud…",
-                    )
-                    break
-
-                if wants_escalate and not (
-                    CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_REQUEST
-                ):
+                # Last local coder: no cloud fallback, so keep what it produced.
+                if wants_escalate:
                     _think(
                         on_progress,
                         "escalate_skipped",
-                        "Local coder asked to escalate; cloud disabled — keeping local answer.",
+                        "Local coder asked to escalate; no cloud fallback — keeping local answer.",
                     )
-                elif looks_incomplete and not (
-                    CLOUD_FALLBACK_ENABLED and CLOUD_ESCALATE_ON_INCOMPLETE
-                ):
+                elif looks_incomplete:
                     _think(
                         on_progress,
                         "escalate_skipped",
-                        "Local answer may be incomplete; cloud escalate-on-incomplete is off — keeping local.",
+                        "Local answer may be incomplete; no cloud fallback — keeping local answer.",
                     )
 
                 focus = _extract_user_request(user_prompt)
@@ -1999,10 +1794,12 @@ def _get_coding_intel(
                 _think(
                     on_progress,
                     "fallback",
-                    f"{fallback_reason}; trying cloud…",
+                    f"{fallback_reason}; no more local coders.",
                 )
 
-    if defer_cloud and CLOUD_FALLBACK_ENABLED:
+    # Local ladder exhausted. The extension (defer_cloud) decides what to do next;
+    # ChatRouter itself never calls a cloud model.
+    if defer_cloud:
         local_attempt = answer.strip() if answer and len(answer.strip()) >= 20 else ""
         reason = fallback_reason or "Local coder unavailable or insufficient"
         if sequential_tried:
@@ -2013,64 +1810,16 @@ def _get_coding_intel(
             on_progress=on_progress,
         )
 
-    if not CLOUD_FALLBACK_ENABLED:
-        _think(
-            on_progress,
-            "fallback",
-            "Cloud fallback disabled (CLOUD_FALLBACK_ENABLED=false); returning best local answer.",
-        )
-        if answer and len(answer.strip()) >= 20:
-            return answer, answer_source, memory_id
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Local coder unavailable/weak and CLOUD_FALLBACK_ENABLED=false. "
-                "Enable cloud or fix the coder GGUF."
-            ),
-        )
-
-    local_attempt = answer.strip() if answer and len(answer.strip()) >= 20 else ""
-    cloud_prompt, compress_stats = prepare_cloud_coding_prompt(
-        user_prompt,
-        enriched=enriched,
-        local_attempt=local_attempt,
-        web_block=web_block,
-        summarize_fn=_summarize_for_handoff,
+    if answer and len(answer.strip()) >= 20:
+        _think(on_progress, "fallback", "Returning best local answer.")
+        return answer, answer_source, memory_id
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            f"{fallback_reason or 'Local coder unavailable or weak'}. "
+            "Check the coder GGUF (CODER_MODELS / CODER_ALT)."
+        ),
     )
-    if compress_stats.get("compressed"):
-        _think(
-            on_progress,
-            "cloud_compress",
-            (
-                f"Compressed cloud handoff: {compress_stats.get('raw_chars', 0)} raw → "
-                f"{compress_stats.get('compressed_chars', 0)} summary chars "
-                f"({compress_stats.get('cloud_prompt_chars', len(cloud_prompt))} in prompt)."
-            ),
-            **compress_stats,
-        )
-    elif compress_stats.get("skipped"):
-        _think(
-            on_progress,
-            "cloud_compress",
-            "Cloud handoff already compressed — reusing session summary.",
-            **compress_stats,
-        )
-
-    answer, provider = _cloud_facts(
-        cloud_prompt, purpose="coding", on_progress=on_progress
-    )
-    if _has_agent_tool_calls(answer):
-        _think(
-            on_progress,
-            "agent_tools",
-            f"{provider} requested tool round(s); skipping coding_lessons learn.",
-        )
-        return answer, provider, None
-    _think(on_progress, "learn", f"Saving {provider} answer into coding_lessons…")
-    memory_id = learn_coding_lesson(
-        _extract_user_request(user_prompt), answer, source=provider
-    )
-    return answer, provider, memory_id
 
 
 def _persona_wrap(
@@ -2203,14 +1952,9 @@ def _label_intel_source(source: str | None) -> str:
         "local": "Local coder",
         "coder": "Local coder",
         "persona": "Local persona",
-        "claude": "Claude",
-        "gemini": "Gemini",
-        "google": "Gemini",
     }
     if key in labels:
         return labels[key]
-    if key.startswith("claude"):
-        return "Claude"
     return source
 
 
@@ -2439,59 +2183,13 @@ def __run_chat_pipeline_inner(
                 persona_messages.append({"role": "system", "content": lesson_block})
 
             intel_source = "persona"
-            try:
-                _think(progress, "persona", "Answering with local persona…")
-                final_response = _persona_reply(
-                    persona_messages,
-                    temperature=0.82,
-                    on_progress=progress,
-                    on_content=on_content,
-                )
-                local_text = _message_text(final_response["choices"][0]["message"])
-                if len(local_text) < 20 and (GEMINI_CLIENT or CLAUDE_CLIENT):
-                    _think(progress, "fallback", "Local answer was thin; enriching via cloud…")
-                    raw_facts, provider = _cloud_facts(
-                        last_user_message, purpose="general", on_progress=progress
-                    )
-                    intel_source = provider
-                    persona_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Augment/correct using these concise facts, staying in character:\n\n"
-                                f"{raw_facts}"
-                            ),
-                        }
-                    )
-                    _think(progress, "persona", f"Rewriting with {provider} facts…")
-                    final_response = _local_completion_with_reasoning(
-                        persona_messages,
-                        temperature=0.82,
-                        on_progress=progress,
-                        source="persona",
-                    )
-            except Exception as exc:
-                _think(progress, "fallback", f"Japanese local path failed ({exc}); cloud last resort.")
-                raw_facts, provider = _cloud_facts(
-                    last_user_message, purpose="general", on_progress=progress
-                )
-                intel_source = provider
-                persona_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Use these facts and answer in character:\n\n"
-                            f"{raw_facts}"
-                        ),
-                    }
-                )
-                _think(progress, "persona", f"Rewriting with {provider} facts…")
-                final_response = _local_completion_with_reasoning(
-                    persona_messages,
-                    temperature=0.82,
-                    on_progress=progress,
-                    source="persona",
-                )
+            _think(progress, "persona", "Answering with local persona…")
+            final_response = _persona_reply(
+                persona_messages,
+                temperature=0.82,
+                on_progress=progress,
+                on_content=on_content,
+            )
         else:
             route = "casual"
             _think(progress, "route", "Casual chat → persona model.")
@@ -2775,19 +2473,10 @@ async def health():
         "coder_available": server_manager.coder_available(),
         "coder_ladder": [m.name for m in ladder],
         "coder_ladder_available": available,
-        "cloud_enabled": bool(GEMINI_CLIENT or CLAUDE_CLIENT) and CLOUD_FALLBACK_ENABLED,
-        "cloud_providers": {
-            "claude": CLAUDE_CLIENT is not None,
-            "gemini": GEMINI_CLIENT is not None,
-            "order": CLOUD_FALLBACK_ORDER,
-            "fallback_enabled": CLOUD_FALLBACK_ENABLED,
-            "escalate_on_incomplete": CLOUD_ESCALATE_ON_INCOMPLETE,
-            "escalate_on_request": CLOUD_ESCALATE_ON_REQUEST,
-        },
+        # Cloud fallback was removed; kept as a constant for clients that read it.
+        "cloud_enabled": False,
         "model_voice": LOCAL_VOICE_MODEL,
         "model_coder": LOCAL_CODER_MODEL,
-        "model_claude": CLAUDE_MODEL,
-        "model_gemini": GEMINI_MODEL,
         "web_search": {
             "enabled": WEB_SEARCH_ENABLED,
             "provider": WEB_SEARCH_PROVIDER,
@@ -3639,16 +3328,9 @@ async def route_chat(request: Request):
     )
 
 if __name__ == "__main__":
-    logger.info(
-        "Cloud policy: enabled=%s order=%s escalate_incomplete=%s escalate_request=%s",
-        CLOUD_FALLBACK_ENABLED,
-        CLOUD_FALLBACK_ORDER,
-        CLOUD_ESCALATE_ON_INCOMPLETE,
-        CLOUD_ESCALATE_ON_REQUEST,
-    )
     if not server_manager.coder_available():
         logger.warning(
-            "Coder model not found yet (%s). Coding routes will use cloud until it exists.",
+            "Coder model not found yet (%s). Coding routes will fail until it exists.",
             primary_coder().path,
         )
     else:
@@ -3658,12 +3340,4 @@ if __name__ == "__main__":
             len(available),
             ", ".join(m.name for m in available),
         )
-    if CLAUDE_CLIENT is None and GEMINI_CLIENT is None:
-        logger.warning(
-            "No cloud keys set (CLAUDE_API_KEY / GEMINI_API_KEY) — last-resort fallback disabled."
-        )
-    elif CLAUDE_CLIENT is None:
-        logger.warning("CLAUDE_API_KEY not set — Claude fallback disabled.")
-    elif GEMINI_CLIENT is None:
-        logger.warning("GEMINI_API_KEY not set — Gemini fallback disabled.")
     uvicorn.run(app, host=ROUTER_HOST, port=ROUTER_PORT)

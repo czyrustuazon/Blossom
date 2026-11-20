@@ -495,7 +495,7 @@ def format_memories_for_prompt(
 
 
 def looks_useful_answer(text: str) -> bool:
-    """Heuristic: keep Gemini/local answers that look substantive."""
+    """Heuristic: keep local answers that look substantive."""
     cleaned = (text or "").strip()
     if len(cleaned) < 40:
         return False

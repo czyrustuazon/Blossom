@@ -258,13 +258,6 @@ if ($evalOnStartup -and (Test-Path -LiteralPath $EvalRequirements)) {
 }
 
 Write-Host ""
-if (-not $env:GEMINI_API_KEY -and -not $env:CLAUDE_API_KEY -and -not $env:ANTHROPIC_API_KEY) {
-    Write-Warning "No cloud keys set (CLAUDE_API_KEY / GEMINI_API_KEY). Last-resort fallback unavailable."
-} elseif (-not $env:CLAUDE_API_KEY -and -not $env:ANTHROPIC_API_KEY) {
-    Write-Warning "CLAUDE_API_KEY is not set. Claude last-resort fallback unavailable."
-} elseif (-not $env:GEMINI_API_KEY) {
-    Write-Warning "GEMINI_API_KEY is not set. Gemini last-resort fallback unavailable."
-}
 
 $routerHost = if ($env:CHAT_ROUTER_HOST) { $env:CHAT_ROUTER_HOST } else { "127.0.0.1" }
 $routerPort = if ($env:CHAT_ROUTER_PORT) { $env:CHAT_ROUTER_PORT } else { "8081" }
