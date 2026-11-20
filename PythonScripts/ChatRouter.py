@@ -741,9 +741,15 @@ def _stream_local_chat(
     source: str = "local_coder",
     on_content: ContentFn | None = None,
     draft_step: str | None = "coder_draft",
+    meta: dict | None = None,
+    no_thinking: bool = False,
 ) -> str:
     """
     Stream from llama-server and emit reasoning / answer deltas live.
+
+    meta, when given, receives {"finish_reason": ...} ("length" = output was cut off).
+    no_thinking asks thinking-capable chat templates (Qwen3, Nemotron) to skip the
+    reasoning phase; templates without that switch ignore it.
 
     reasoning_content and inline <think> spans → model_reasoning thoughts.
     Answer text → on_content when this call produces the user-visible reply,
@@ -751,6 +757,12 @@ def _stream_local_chat(
     may still rewrite). Returns the answer text without <think> spans.
     """
     sampling = _model_sampling(source, temperature)
+    if no_thinking:
+        extra = dict(sampling.get("extra_body") or {})
+        kwargs = dict(extra.get("chat_template_kwargs") or {})
+        kwargs["enable_thinking"] = False
+        extra["chat_template_kwargs"] = kwargs
+        sampling["extra_body"] = extra
     stream = LOCAL_CLIENT.chat.completions.create(
         model=model,
         messages=messages,
@@ -798,6 +810,11 @@ def _stream_local_chat(
         delta = getattr(choice0, "delta", None)
         if delta is None and isinstance(choice0, dict):
             delta = choice0.get("delta")
+        finish = getattr(choice0, "finish_reason", None)
+        if finish is None and isinstance(choice0, dict):
+            finish = choice0.get("finish_reason")
+        if finish and meta is not None:
+            meta["finish_reason"] = finish
         reasoning_piece = _delta_text(delta, "reasoning_content")
         if reasoning_piece:
             emit_reasoning(reasoning_piece)
@@ -806,6 +823,8 @@ def _stream_local_chat(
             emit_segments(splitter.feed(content_piece))
     emit_segments(splitter.flush())
     text = "".join(content_parts)
+    if meta is not None:
+        meta["raw"] = text  # exactly what on_content received, unstripped
     return _message_text({"content": text})
 
 
@@ -942,6 +961,121 @@ _AGENT_TOOL_CALL_RE = re.compile(r"```tool_call\b", re.IGNORECASE)
 def _has_agent_tool_calls(text: str) -> bool:
     """True when the coder is requesting Blossom Assistant tool execution."""
     return bool(_AGENT_TOOL_CALL_RE.search(text or ""))
+
+
+# Fence lines: ```, ````, ~~~ … (CommonMark). A closer uses the same character, at
+# least as many of it, and nothing after — so "```html path=x" is always an opener.
+_FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+# Extra "continue where you stopped" rounds when the coder is cut off mid-fence.
+CODER_CONTINUE_ROUNDS = max(0, int(os.getenv("CODER_CONTINUE_ROUNDS", "2")))
+FILE_EDIT_OUTPUT_CONTRACT = (
+    "[OUTPUT CONTRACT — file edit]\n"
+    "Your visible answer must contain the changed file(s), not a plan. At most one "
+    "short sentence before the code. Put each complete file in ONE fenced block whose "
+    "opening line is ```<lang> path=<relative path> (use ```` if the file itself "
+    "contains ```). Never open an empty fence or put one fence line directly under "
+    "another. A short bullet list of what changed may follow the code."
+)
+_EDIT_VERB_RE = re.compile(
+    r"\b(refactor|rewrite|modernize|modernise|migrate|convert|port|fix|update|upgrade|"
+    r"clean ?up|change|replace|edit|rename|implement|add|remove)\b",
+    re.I,
+)
+_QUESTION_LEAD_RE = re.compile(
+    r"^\s*(why|what|how|explain|describe|summari[sz]e|review|is|are|does|do|can|should)\b",
+    re.I,
+)
+
+
+def _scan_fences(text: str) -> tuple[list[tuple[str, str]], str | None]:
+    """
+    Split text into closed fences [(info, body)] plus the info of a fence that is
+    still open at the end (None when every fence closed).
+
+    Tolerates a closer glued to the last code line ("foo();```") and an empty
+    opener directly followed by the real one ("```php\\n```html path=x").
+    """
+    fences: list[tuple[str, str]] = []
+    open_marker: str | None = None
+    open_info = ""
+    body: list[str] = []
+    for line in (text or "").splitlines():
+        match = _FENCE_LINE_RE.match(line)
+        if open_marker is None:
+            if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+                open_marker, open_info, body = match.group(1), match.group(2).strip(), []
+            continue
+        char, size = open_marker[0], len(open_marker)
+        if match and match.group(1)[0] == char and len(match.group(1)) >= size:
+            rest = match.group(2).strip()
+            if not rest:
+                fences.append((open_info, "\n".join(body)))
+                open_marker = None
+                continue
+            if not body and not open_info.split()[1:] and rest:
+                # Empty opener immediately followed by a labeled one: keep the label.
+                open_marker, open_info = match.group(1), rest
+                continue
+        stripped = line.rstrip()
+        if stripped.endswith(char * size) and stripped.strip(char):
+            body.append(stripped[: -size])
+            fences.append((open_info, "\n".join(body)))
+            open_marker = None
+            continue
+        body.append(line)
+    return fences, (open_info if open_marker is not None else None)
+
+
+def _has_complete_code_fence(text: str) -> bool:
+    """True when the answer holds at least one closed, non-trivial code fence."""
+    fences, _ = _scan_fences(text)
+    return any(len(body.strip()) >= 8 for _, body in fences)
+
+
+def _has_unclosed_fence(text: str) -> bool:
+    """True when the answer stops inside a code fence (cut off mid-file)."""
+    return _scan_fences(text)[1] is not None
+
+
+def _join_continuation(answer: str, more: str) -> str:
+    """
+    Glue a "continue where you stopped" reply onto a cut-off answer: drop a fence
+    opener the model repeats at the top, and any lines it re-emits from the tail.
+    """
+    lines = more.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines:
+        match = _FENCE_LINE_RE.match(lines[0])
+        if match and match.group(2).strip():
+            lines.pop(0)
+    tail = answer.rstrip("\n").splitlines()
+    overlap = 0
+    for size in range(min(len(tail), len(lines), 60), 0, -1):
+        if [t.rstrip() for t in tail[-size:]] == [x.rstrip() for x in lines[:size]]:
+            overlap = size
+            break
+    rest = "\n".join(lines[overlap:])
+    if more.endswith("\n") and rest:
+        rest += "\n"
+    ended_mid_line = not answer.endswith("\n")
+    last = tail[-1] if tail else ""
+    if not overlap and ended_mid_line:
+        # Either the model re-emits the half-written last line in full, or it
+        # genuinely continues mid-line; both glue on without a newline.
+        if last and rest.startswith(last):
+            rest = rest[len(last):]
+        return answer + rest
+    # Result always starts with `answer`, so the caller can stream just the new tail.
+    return answer + ("" if answer.endswith("\n") else "\n") + rest
+
+
+def _is_file_edit_ask(focus: str, attached: list[str]) -> bool:
+    """Editor-attached ask that expects changed code back (not a question about it)."""
+    text = (focus or "").strip()
+    return bool(
+        attached and _EDIT_VERB_RE.search(text) and not _QUESTION_LEAD_RE.match(text)
+    )
 
 
 def _local_answer_requests_escalate(answer: str) -> bool:
@@ -1464,6 +1598,10 @@ def _local_coder_answer(
         messages.append({"role": "system", "content": lesson_block})
     if web_block and not sequential:
         messages.append({"role": "system", "content": web_block})
+    edit_ask = not sequential and _is_file_edit_ask(focus, attached)
+    if edit_ask:
+        # Plan-first models (Nemotron, Qwen3 thinking) otherwise narrate and stop.
+        messages.append({"role": "system", "content": FILE_EDIT_OUTPUT_CONTRACT})
     messages.append({"role": "user", "content": packed_prompt})
 
     _think(
@@ -1472,14 +1610,108 @@ def _local_coder_answer(
         "Running local coder (sequential)…" if sequential else "Running local coder model…",
     )
     try:
-        return _stream_local_chat(
+        meta: dict = {}
+        answer = _stream_local_chat(
             messages,
             model=LOCAL_CODER_MODEL,
             temperature=0.2,
             on_progress=on_progress,
             source="local_coder",
             on_content=on_content,
+            meta=meta,
         )
+        # `streamed` mirrors exactly what the client has received so far.
+        streamed = meta.get("raw", answer)
+        # Reasoning models sometimes narrate a plan ("Let me refactor…") and stop
+        # without code. Give them one push to actually write the file.
+        if (
+            edit_ask
+            and not _has_complete_code_fence(answer)
+            and not _has_unclosed_fence(answer)
+            and not _has_agent_tool_calls(answer)
+            and not _local_answer_requests_escalate(answer)
+        ):
+            _think(
+                on_progress,
+                "coder_continue",
+                "Coder replied without code; asking it to write the file now…",
+            )
+            targets = ", ".join(attached)
+            follow_up = messages + [
+                {"role": "assistant", "content": answer},
+                {
+                    "role": "user",
+                    "content": (
+                        "Do it now. Output the complete updated file(s) for "
+                        f"{targets}, each in ONE fenced block whose opening line is "
+                        "```<lang> path=<relative path>. No nested or empty fences, "
+                        "no further planning text before the code."
+                    ),
+                },
+            ]
+            if answer.strip():
+                if on_content:
+                    on_content("\n\n")
+                streamed += "\n\n"
+            meta = {}
+            # It already planned once — skip a second thinking phase (cheaper round).
+            more = _stream_local_chat(
+                follow_up,
+                model=LOCAL_CODER_MODEL,
+                temperature=0.2,
+                on_progress=on_progress,
+                source="local_coder",
+                on_content=on_content,
+                meta=meta,
+                no_thinking=True,
+            )
+            streamed += meta.get("raw", more)
+
+        # Cut off inside a code block (output/context limit or early stop):
+        # ask for the rest instead of leaving a half file nobody can apply.
+        for round_no in range(1, CODER_CONTINUE_ROUNDS + 1):
+            if not _has_unclosed_fence(streamed):
+                break
+            why = "hit the output limit" if meta.get("finish_reason") == "length" else "stopped"
+            _think(
+                on_progress,
+                "coder_continue",
+                f"Coder {why} inside a code block; asking for the rest "
+                f"({round_no}/{CODER_CONTINUE_ROUNDS})…",
+            )
+            follow_up = messages + [
+                {"role": "assistant", "content": streamed},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your reply was cut off inside a code block. Continue exactly "
+                        "where it stopped: output only the remaining lines, starting "
+                        "with the next line after the last one you wrote. Do not repeat "
+                        "earlier lines, do not open a new fence, and close the code "
+                        "block when the file is complete."
+                    ),
+                },
+            ]
+            meta = {}
+            # Collected quietly (draft thoughts), then glued on and streamed as one tail,
+            # so a repeated fence opener / overlapping lines never reach the client.
+            more = _stream_local_chat(
+                follow_up,
+                model=LOCAL_CODER_MODEL,
+                temperature=0.2,
+                on_progress=on_progress,
+                source="local_coder",
+                on_content=None,
+                meta=meta,
+                no_thinking=True,
+            )
+            if not more.strip():
+                break
+            joined = _join_continuation(streamed, meta.get("raw", more))
+            if on_content and len(joined) > len(streamed):
+                on_content(joined[len(streamed):])
+            streamed = joined
+        return streamed.strip()
     except Exception as exc:
         if not sequential and is_context_overflow_error(exc):
             _think(
@@ -1728,13 +1960,25 @@ def _get_coding_intel(
                         "Local answer may be incomplete; cloud escalate-on-incomplete is off — keeping local.",
                     )
 
+                focus = _extract_user_request(user_prompt)
+                attached = [f.path for f in parse_editor_files(user_prompt)]
+                if _is_file_edit_ask(focus, attached) and not _has_complete_code_fence(
+                    answer
+                ):
+                    # Do not store plan-only / broken-fence answers as "working solutions".
+                    _think(
+                        on_progress,
+                        "learn_skipped",
+                        "Answer has no complete code block; not saving it as a lesson.",
+                    )
+                    return answer, answer_source, None
                 _think(
                     on_progress,
                     "learn",
                     f"Saving {model.name} answer into coding_lessons…",
                 )
                 memory_id = learn_coding_lesson(
-                    _extract_user_request(user_prompt),
+                    focus,
                     answer,
                     source=answer_source,
                 )
