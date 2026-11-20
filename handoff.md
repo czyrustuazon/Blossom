@@ -4,6 +4,9 @@
 `e3ebef8` (router, memory, rules, eval capsule, this file) and Blossom Assistant
 `839fda9` (extension tool loop).
 
+Full technical record of the session (architecture of the loops, cycle-by-cycle
+findings, every correction and why): [`tools/eval/TRAINING.md`](tools/eval/TRAINING.md).
+
 ## The goal
 
 The user wants Blossom Assistant (the VS Code extension → Assistant ChatRouter on

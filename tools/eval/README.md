@@ -32,6 +32,7 @@ corpora/my-corpus/
 |------|---------|
 | `apply` (default) | Code tasks — model returns `path=` fences; harness writes files and checks disk |
 | `analyze_only` | Assembly / Ghidra / prose analysis — scores **response text** only (`response_contains`, `response_regex`) |
+| `agent` | Whole-project refactors through a replica of Blossom Assistant's tool loop (`project_dir`, `hidden_dir`, `max_rounds`). Flags: `--reference`, `--log-dir`. See [TRAINING.md](TRAINING.md) |
 
 ### Check types
 
