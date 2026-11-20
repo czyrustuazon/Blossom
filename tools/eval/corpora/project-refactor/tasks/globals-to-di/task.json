@@ -1,0 +1,14 @@
+{
+  "id": "globals-to-di",
+  "title": "Replace global settings with dependency injection",
+  "domain": "python",
+  "tags": ["python", "dependency-injection", "globals", "multi-file", "api-change"],
+  "mode": "agent",
+  "prompt": "notifier relies on a global mutable SETTINGS dict and module-level `global _transport` variables. Refactor to explicit dependency injection:\n- notifier/config.py: a @dataclass Settings with fields sender='noreply@example.com', sms_prefix='+1', dry_run=False, max_retries=2.\n- notifier/mailer.py: class Mailer(settings, transport) with method send_email(to, subject, body).\n- notifier/sms.py: class SmsSender(settings, transport) with method send_sms(number, text).\n- notifier/dispatcher.py: class Dispatcher(mailer, sms) with method notify(user, message).\nKeep the current behavior (retries, dry-run, sms prefix, 160-char limit, return values). Delete notifier/settings.py and remove every `global` statement. Update the tests to the new API and run them.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own (updated) tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

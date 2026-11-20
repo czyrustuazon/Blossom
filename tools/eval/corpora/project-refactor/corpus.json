@@ -1,0 +1,6 @@
+{
+  "id": "project-refactor",
+  "title": "Whole-project refactors (agent loop)",
+  "description": "Multi-file refactors driven through the Blossom Assistant tool loop. Each task ships a small project plus hidden acceptance tests the model never sees; passing means the refactor goal is met AND behavior is preserved.",
+  "domains": ["python", "javascript", "refactor"]
+}

@@ -31,6 +31,19 @@ class TaskSpec:
     fixtures: dict[str, str]
     checks: list[CheckSpec]
     task_dir: Path
+    # mode=agent: the whole project is copied into the work dir; hidden_dir holds
+    # acceptance tests the model never sees (copied in only for scoring).
+    project_dir: str = ""
+    hidden_dir: str = ""
+    max_rounds: int = 16
+
+    @property
+    def project_path(self) -> Path | None:
+        return (self.task_dir / self.project_dir).resolve() if self.project_dir else None
+
+    @property
+    def hidden_path(self) -> Path | None:
+        return (self.task_dir / self.hidden_dir).resolve() if self.hidden_dir else None
 
     @property
     def fixture_paths(self) -> dict[str, Path]:
@@ -87,6 +100,9 @@ def _parse_task(task_dir: Path) -> TaskSpec:
         fixtures=fixtures,
         checks=checks,
         task_dir=task_dir,
+        project_dir=str(meta.get("project_dir") or ""),
+        hidden_dir=str(meta.get("hidden_dir") or ""),
+        max_rounds=int(meta.get("max_rounds") or 16),
     )
 
 

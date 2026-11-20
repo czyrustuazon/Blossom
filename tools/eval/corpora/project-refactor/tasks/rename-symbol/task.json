@@ -1,0 +1,14 @@
+{
+  "id": "rename-symbol",
+  "title": "Rename a function across a package, tests and docs",
+  "domain": "python",
+  "tags": ["python", "rename", "multi-file"],
+  "mode": "agent",
+  "prompt": "Rename the function calc_total to compute_order_total across the whole project: definition, every caller (including aliased imports and module-qualified calls), the package exports, the tests and the README. Do not keep the old name as an alias. Run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

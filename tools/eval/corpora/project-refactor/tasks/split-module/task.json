@@ -1,0 +1,14 @@
+{
+  "id": "split-module",
+  "title": "Split a god module into a package",
+  "domain": "python",
+  "tags": ["python", "split-module", "package", "multi-file", "delete"],
+  "mode": "agent",
+  "prompt": "inventory.py has grown into one big file. Turn it into a package inventory/ with models.py (Item), storage.py (Store), reports.py (format_report, restock_list) and cli.py (main). inventory/__init__.py must re-export Item, Store, format_report, restock_list and main so existing imports keep working, and `python -m inventory ...` must keep working (add inventory/__main__.py). Remove the old inventory.py. Run the tests afterwards.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "id": "extract-helpers",
+  "title": "Deduplicate helpers into a shared module",
+  "domain": "python",
+  "tags": ["python", "dedupe", "extract-module", "multi-file"],
+  "mode": "agent",
+  "prompt": "Several modules in blogtool copy-paste the same slug and date-parsing helpers. Extract them into a new module blogtool/textutil.py (public names slugify and parse_date) and make every module that used a copy import from textutil instead. Delete all the duplicated definitions. Behavior must not change; run the tests to confirm.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

@@ -185,9 +185,24 @@ def _load_coding_rules() -> str:
 CODING_RULES = _load_coding_rules()  # boot-time cache; prompts also reload from disk
 
 
-def _coding_rules_text() -> str:
-    """Prefer fresh coding_rules.txt so edits apply after ChatRouter restart (or same process)."""
-    return _load_coding_rules() or CODING_RULES
+_NLPP_RULES_PATH = Path(__file__).resolve().parent / "nlpp_rules.txt"
+
+
+def _coding_rules_text(*, nlpp: bool = True) -> str:
+    """
+    Fresh coding_rules.txt (edits apply without a restart), plus the NLPP constitution
+    from nlpp_rules.txt when the task is NLPP / 3DS work. Unrelated projects get the
+    general rules only, so a small local coder isn't steered by romhack bans.
+    """
+    rules = _load_coding_rules() or CODING_RULES
+    if nlpp:
+        try:
+            extra = _NLPP_RULES_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            extra = ""
+        if extra:
+            rules = f"{rules}\n\n{extra}"
+    return rules
 
 AGENT_EXECUTION_ENABLED = os.getenv("AGENT_EXECUTION_ENABLED", "true").strip().lower() in {
     "1",
@@ -284,12 +299,26 @@ def _loaded_gguf_name() -> str:
     return Path(path).name
 
 
+# Set per coder request: True while answering a Blossom Assistant tool-loop round.
+_AGENT_ROUND_CV: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "blossom_agent_round", default=False
+)
+# Tool-call rounds need exact JSON and fence syntax; at 1.0 the coder drifts into
+# malformed calls and "```</think>" loops. Plain coding answers keep the card's 1.0.
+CODER_AGENT_TEMPERATURE = float(os.getenv("CODER_AGENT_TEMPERATURE", "0.6"))
+
+
 def _model_sampling(source: str, temperature: float) -> dict[str, Any]:
-    """Nemotron cards sample at 1.0 / 0.95. Qwen keeps the caller's temperature."""
+    """Nemotron cards sample at 1.0 / 0.95 (agent tool rounds: CODER_AGENT_TEMPERATURE).
+    Qwen keeps the caller's temperature."""
     name = _loaded_gguf_name()
     kwargs: dict[str, Any] = {"temperature": temperature}
     if "Nemotron-3.5-Lightning" in name and source in {"local_coder", "agent_execution"}:
-        kwargs["temperature"] = 1.0
+        kwargs["temperature"] = (
+            CODER_AGENT_TEMPERATURE
+            if source == "local_coder" and _AGENT_ROUND_CV.get()
+            else 1.0
+        )
         kwargs["top_p"] = 0.95
     elif "Bolt-E4B" in name and source == "persona":
         kwargs["temperature"] = 1.0
@@ -879,11 +908,11 @@ def _persona_reply(
     )
 
 
-def _coder_system_prompt() -> str:
+def _coder_system_prompt(*, nlpp: bool = True) -> str:
     return (
         "You are Blossom's local coding engine. Complete multi-step software tasks "
         "reliably by researching, planning, acting in small steps, and verifying.\n\n"
-        + _coding_rules_text()
+        + _coding_rules_text(nlpp=nlpp)
     )
 
 
@@ -964,6 +993,15 @@ def _has_complete_code_fence(text: str) -> bool:
     return any(len(body.strip()) >= 8 for _, body in fences)
 
 
+_PATH_INFO_RE = re.compile(r"\b(?:path|file)\s*[=:]", re.I)
+
+
+def _has_path_fence(text: str) -> bool:
+    """True when the answer holds a closed fence labeled with path=/file= (appliable)."""
+    fences, _ = _scan_fences(text)
+    return any(_PATH_INFO_RE.search(info) and len(body.strip()) >= 8 for info, body in fences)
+
+
 def _has_unclosed_fence(text: str) -> bool:
     """True when the answer stops inside a code fence (cut off mid-file)."""
     return _scan_fences(text)[1] is not None
@@ -1008,6 +1046,53 @@ def _is_file_edit_ask(focus: str, attached: list[str]) -> bool:
     return bool(
         attached and _EDIT_VERB_RE.search(text) and not _QUESTION_LEAD_RE.match(text)
     )
+
+
+_AGENT_ROUND_MARKERS = ("[AGENT LOOP", "[CONTINUE — AGENT ROUND", "[CONTINUE - AGENT ROUND",
+                        "[AGENT TOOL TRANSCRIPT")
+_NLPP_SIGNAL_RE = re.compile(
+    r"\b(nlpp|new ?love ?plus|3ds|img\.bin|layeredfs|azahar|bclim|trb|code\.bin|exefs|romfs|"
+    r"exheader|ghidra|gold ?bake|cia|00040000000f4e00|decomp|ctrdecomp)\b",
+    re.I,
+)
+
+
+# Intent prose that promises work the reply never did ("Let me convert all files.").
+_AGENT_STALL_RE = re.compile(
+    r"\b(let me|let's|i'?ll|i will|i'?m going to|now i|next,? i|i need to|"
+    r"starting with|proceed(?:ing)? (?:to|with)|plan\b|\[plan\])",
+    re.I,
+)
+# A finished turn ("All 3 tests pass… Summary") is not a stall even if it says "I'll".
+_AGENT_WRAPUP_RE = re.compile(
+    r"\b(tests? (?:now )?(?:pass|passed|passing)|\d+ passed|### summary|summary:|"
+    r"(?:is|are) (?:now )?(?:complete|done)|refactor(?:ing)? (?:is )?complete)\b",
+    re.I,
+)
+
+
+_THINK_DEBRIS_RE = re.compile(r"(?m)^[ \t]*`{0,3}[ \t]*</?think>[ \t]*`{0,3}[ \t]*$\n?|</?think>")
+
+
+def _strip_think_debris(text: str) -> str:
+    """Drop stray <think>/</think> markers (alone or glued to ``` ) from visible output."""
+    return _THINK_DEBRIS_RE.sub("", text or "")
+
+
+def _is_agent_round(user_prompt: str) -> bool:
+    """
+    True when the host (Blossom Assistant) is driving its tool loop: the reply must be
+    ```tool_call fences or a wrap-up, never "one full file per fence" output, and a
+    single round is not a finished solution worth learning.
+    """
+    upper = (user_prompt or "").upper()
+    return any(marker in upper for marker in _AGENT_ROUND_MARKERS)
+
+
+def _looks_nlpp(focus: str, attached: list[str], user_prompt: str = "") -> bool:
+    """NLPP / 3DS RE work: only then do hard bans and the NLPP constitution belong in the prompt."""
+    blob = " ".join([focus or "", *attached, (user_prompt or "")[:6000]])
+    return bool(_NLPP_SIGNAL_RE.search(blob))
 
 
 def _local_answer_requests_escalate(answer: str) -> bool:
@@ -1212,6 +1297,9 @@ def _persona_chat_messages(
     ]
 
 
+CRAWL_MAX_DISTANCE = float(os.getenv("CRAWL_MAX_DISTANCE", "0.45"))
+
+
 def _crawl_reference_block(focus: str) -> tuple[str, int]:
     """Docs and code from the first-pass crawl, for the coder prompt only."""
 
@@ -1226,11 +1314,19 @@ def _crawl_reference_block(focus: str) -> tuple[str, int]:
             stamped.append(hit)
         return stamped
 
+    def _close(hits: list[dict]) -> list[dict]:
+        # Far hits are off-topic (PowerShell cmdlet pages for a Python rename); they
+        # cost context and steer a small coder the wrong way.
+        return [
+            h for h in hits
+            if h.get("distance") is None or float(h["distance"]) <= CRAWL_MAX_DISTANCE
+        ]
+
     docs = _stamp_url(
-        query_memories(focus, collection=COLLECTION_CRAWL_DOCS, top_k=4)
+        _close(query_memories(focus, collection=COLLECTION_CRAWL_DOCS, top_k=4))
     )
     code = _stamp_url(
-        query_memories(focus, collection=COLLECTION_CRAWL_CODE, top_k=3)
+        _close(query_memories(focus, collection=COLLECTION_CRAWL_CODE, top_k=3))
     )
     parts: list[str] = []
     if docs:
@@ -1320,7 +1416,11 @@ def _local_coder_answer(
 
     focus = _extract_user_request(user_prompt)
     attached = [f.path for f in parse_editor_files(user_prompt)]
-    task_brief = build_task_brief(focus, attached)
+    agent_round = _is_agent_round(user_prompt)
+    _AGENT_ROUND_CV.set(agent_round)
+    nlpp_work = _looks_nlpp(focus, attached, user_prompt)
+    # The brief's "one fence per file" output format contradicts the host tool loop.
+    task_brief = "" if agent_round else build_task_brief(focus, attached)
     if task_brief and not sequential:
         _think(on_progress, "task_brief", "Added create/edit task brief for the coder.")
 
@@ -1342,7 +1442,7 @@ def _local_coder_answer(
         )
 
     lesson_block = ""
-    if not sequential:
+    if not sequential and nlpp_work:
         _think(on_progress, "nlpp_hard_bans", "Retrieving NLPP hard bans…")
         bans = query_memories(
             focus, collection=COLLECTION_HARD_BANS, top_k=HARD_BANS_TOP_K
@@ -1407,7 +1507,7 @@ def _local_coder_answer(
     system_content = (
         SEQUENTIAL_CODER_PROMPT
         if sequential
-        else coder_system_prompt_for_tier(tier, _coder_system_prompt())
+        else coder_system_prompt_for_tier(tier, _coder_system_prompt(nlpp=nlpp_work))
     )
     messages = [
         {"role": "system", "content": system_content},
@@ -1430,7 +1530,9 @@ def _local_coder_answer(
         messages.append({"role": "system", "content": lesson_block})
     if web_block and not sequential:
         messages.append({"role": "system", "content": web_block})
-    edit_ask = not sequential and _is_file_edit_ask(focus, attached)
+    # Agent rounds answer with tool_call fences; the file-edit contract and the
+    # "do it now" push would force premature full-file dumps instead of reads.
+    edit_ask = not sequential and not agent_round and _is_file_edit_ask(focus, attached)
     if edit_ask:
         # Plan-first models (Nemotron, Qwen3 thinking) otherwise narrate and stop.
         messages.append({"role": "system", "content": FILE_EDIT_OUTPUT_CONTRACT})
@@ -1454,6 +1556,10 @@ def _local_coder_answer(
         )
         # `streamed` mirrors exactly what the client has received so far.
         streamed = meta.get("raw", answer)
+        if agent_round:
+            # Leaked reasoning closers ("```</think>" repeated) are not part of the reply.
+            streamed = _strip_think_debris(streamed)
+            answer = _strip_think_debris(answer)
         # Reasoning models sometimes narrate a plan ("Let me refactor…") and stop
         # without code. Give them one push to actually write the file.
         if (
@@ -1499,10 +1605,62 @@ def _local_coder_answer(
             )
             streamed += meta.get("raw", more)
 
+        # Agent-loop stall: the coder planned (often with every file worked out in its
+        # reasoning) but the visible reply is only intent prose — no tool_call fence,
+        # so the host loop ends the turn with nothing done. Push once for the calls.
+        # An unlabeled code dump counts too: without path= the host cannot apply it.
+        if (
+            agent_round
+            and not _has_agent_tool_calls(streamed)
+            and not _has_path_fence(streamed)
+            and (_AGENT_STALL_RE.search(streamed or "") or _has_complete_code_fence(streamed))
+            and not _AGENT_WRAPUP_RE.search(streamed or "")
+            and not _local_answer_requests_escalate(streamed)
+        ):
+            _think(
+                on_progress,
+                "coder_continue",
+                "Coder described its next step without doing it; asking for the tool calls…",
+            )
+            follow_up = messages + [
+                {"role": "assistant", "content": streamed},
+                {
+                    "role": "user",
+                    "content": (
+                        "Your reply had no tool call and no path-labeled file, so nothing "
+                        "happened and the turn would end (a code block without path= is "
+                        "never applied). Do it now: emit the ```tool_call "
+                        "fences that perform it (write_file with COMPLETE file contents, "
+                        "search_replace, delete_file, run_command for the tests). One JSON "
+                        "object per fence. No plan text, no prose before the fences."
+                    ),
+                },
+            ]
+            meta = {}
+            more = _stream_local_chat(
+                follow_up,
+                model=LOCAL_CODER_MODEL,
+                temperature=0.2,
+                on_progress=on_progress,
+                source="local_coder",
+                on_content=on_content,
+                meta=meta,
+                no_thinking=True,
+            )
+            if more.strip():
+                if on_content:
+                    on_content("\n\n")
+                streamed += "\n\n" + meta.get("raw", more)
+
         # Cut off inside a code block (output/context limit or early stop):
         # ask for the rest instead of leaving a half file nobody can apply.
         for round_no in range(1, CODER_CONTINUE_ROUNDS + 1):
             if not _has_unclosed_fence(streamed):
+                break
+            if agent_round and meta.get("finish_reason") != "length":
+                # Tool-call JSON can read as an "unclosed" fence to the scanner. In the
+                # host loop only a real output-limit cut needs a continuation; a false
+                # positive cost ~9 minutes of regenerated output in training cycle 3.
                 break
             why = "hit the output limit" if meta.get("finish_reason") == "length" else "stopped"
             _think(
@@ -1757,6 +1915,15 @@ def _get_coding_intel(
 
                 focus = _extract_user_request(user_prompt)
                 attached = [f.path for f in parse_editor_files(user_prompt)]
+                if _is_agent_round(user_prompt):
+                    # One round of the host tool loop is a step, not a solution. Agent
+                    # work is learned from the user's 👍 on the finished turn instead.
+                    _think(
+                        on_progress,
+                        "learn_skipped",
+                        "Agent tool-loop round; not saving it as a lesson.",
+                    )
+                    return answer, answer_source, None
                 if _is_file_edit_ask(focus, attached) and not _has_complete_code_fence(
                     answer
                 ):

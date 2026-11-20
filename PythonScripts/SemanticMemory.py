@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -337,6 +338,10 @@ def query_coding_lessons(
 
     kept: list[dict[str, Any]] = []
     for row in raw:
+        if looks_like_broken_agent_output(str(row.get("text") or "")):
+            # Auto-learned agent rounds that were never solutions; retrieving them
+            # teaches the coder to repeat the same broken format.
+            continue
         meta = dict(row.get("metadata") or {})
         scope = _infer_scope(meta)
         product = str(meta.get("product") or "").strip().lower()
@@ -512,6 +517,24 @@ def looks_useful_answer(text: str) -> bool:
     return not any(marker in lowered for marker in reject_markers)
 
 
+_AGENT_TOOL_NAMES = (
+    "read_file|list_dir|search_text|search_replace|write_file|delete_file|run_command|"
+    "get_diagnostics|find_references|go_to_definition|ask_user|web_search|fetch_url"
+)
+# A fence whose body starts with a tool name ("```bash\nread_file src/x.py") is a tool
+# call written in the wrong format, not code. </think> is a leaked reasoning marker.
+_BROKEN_AGENT_RE = re.compile(
+    r"</?think>|```[\w-]*[ \t]*\r?\n[ \t]*(?:" + _AGENT_TOOL_NAMES + r")\b",
+    re.IGNORECASE,
+)
+_TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\b", re.IGNORECASE)
+
+
+def looks_like_broken_agent_output(text: str) -> bool:
+    """True for agent-loop debris: leaked think tags or tool calls in a code fence."""
+    return bool(_BROKEN_AGENT_RE.search(text or ""))
+
+
 def learn_coding_lesson(
     user_prompt: str,
     answer: str,
@@ -521,6 +544,10 @@ def learn_coding_lesson(
     """Persist a useful coding takeaway so the local coder can retrieve it later."""
     if not looks_useful_answer(answer):
         logger.info("Skipped coding lesson save from %s (not useful enough).", source)
+        return None
+    if looks_like_broken_agent_output(answer) or _TOOL_CALL_FENCE_RE.search(answer):
+        # A mid-loop tool request (or a malformed one) is not a working solution.
+        logger.info("Skipped coding lesson save from %s (agent-loop round, not a solution).", source)
         return None
     lesson = (
         f"User ask: {user_prompt.strip()[:500]}\n"

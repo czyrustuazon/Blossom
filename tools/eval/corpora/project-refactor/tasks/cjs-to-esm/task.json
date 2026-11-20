@@ -1,0 +1,14 @@
+{
+  "id": "cjs-to-esm",
+  "title": "Convert a Node project from CommonJS to ES modules",
+  "domain": "javascript",
+  "tags": ["javascript", "node", "esm", "module-system", "multi-file"],
+  "mode": "agent",
+  "prompt": "Convert this whole Node project from CommonJS to native ES modules: set \"type\": \"module\" in package.json, and replace every require()/module.exports/exports.x in src/ and test/ with import/export (remember relative imports need the .js extension). Keep the public API of src/index.js the same (TaskList, formatTask, resetIds), and keep `npm test` passing.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "node --test test/*.test.js", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "node _acceptance/accept.mjs", "expect_exit": 0, "description": "Hidden acceptance checks pass"}
+  ]
+}

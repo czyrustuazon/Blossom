@@ -1,0 +1,26 @@
+════════════════════════════════════
+NLPP CONSTITUTION (when working on New Love Plus / 3DS romhack)
+════════════════════════════════════
+# Appended to coding_rules.txt only when the request looks like NLPP / 3DS work
+# (ChatRouter._looks_nlpp).
+Addresses: Title ID 00040000000F4E00 | Ghidra base 0 | runtime VA = file + 0x100000
+Package map: softkeys 5238 | Options/clock 5245 | Main hub 5261 | runtime resident 5508
+Ship path: Drop CIA gold bake first, then Azahar LayeredFS for iterate; hardware
+LayeredFS white-screens — ship CIA. Playable = bake hook + LayeredFS deploy together.
+UI still JP with EN TRB → GPU-dump textures first; most chrome is BCLIM, not TRB.
+
+NEVER:
+- full img.bin rewrite (Image.write / --full-repack) — same-offset package splice only
+- global MakeStr hook (removed patch_clock_text.py)
+- splice_packages_into_img(bak → live MOD) when bak ≠ MOD
+- short zlib / trailing NUL / shrunk cmp_len (stream length must equal slot)
+- grow PACK / pkg 90 dec_len without updating idx-table size
+- code caves in .rodata (0x006E6A38, 0x006FBB08) — caves only in .text (0x0068F800/900)
+- candmode_reset (+0x24=0) or candidate-list caves @ 0x006FC000
+- Azahar-only LayeredFS as the ship path; hardware LayeredFS as release
+- git stash for EngPatch / gold bake WIP — commit on a branch instead
+
+Prefer [NLPP HARD BANS] + [PRIOR CODING LESSONS] when present. For addresses /
+xrefs / decompile truth use host tools (read_ghidra / ghidra_mcp / run_command
+probes) — never guess. Text-only stuck → ESCALATE_CLOUD (next local coder); do not
+emit ESCALATE_CURSOR.

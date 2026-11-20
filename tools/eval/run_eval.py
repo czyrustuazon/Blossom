@@ -41,6 +41,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Seed fixtures and run checks only; do not call ChatRouter",
     )
     run_p.add_argument("--db", help="SQLite results path (default: Mind/eval_results.db)")
+    run_p.add_argument(
+        "--reference",
+        action="store_true",
+        help="Agent tasks: score the bundled reference solution instead of calling the model (validates hidden tests)",
+    )
+    run_p.add_argument(
+        "--log-dir",
+        help="Agent tasks: write every round's prompt/reply + transcript.json under this folder",
+    )
 
     report_p = sub.add_parser("report", help="Show pass rate from eval DB")
     report_p.add_argument("--corpus", help="Filter by corpus id")
@@ -89,11 +98,14 @@ def main(argv: list[str] | None = None) -> int:
             if alt.is_dir():
                 corpus_dir = alt
         task_ids = args.task or None
+        log_root = Path(args.log_dir) if getattr(args, "log_dir", None) else None
         results = run_corpus(
             corpus_dir,
             task_ids=task_ids,
             dry_run=args.dry_run,
             store=store,
+            reference=getattr(args, "reference", False),
+            log_root=log_root,
         )
         passed = sum(1 for r in results if r.passed)
         print(f"Finished {len(results)} task(s): {passed} passed, {len(results) - passed} failed")
