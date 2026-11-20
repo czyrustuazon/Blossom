@@ -33,6 +33,7 @@ TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\r?\n([\s\S]*?)```", re.IGNOREC
 _VALID_ESCAPES = set('\\"/bfnrtu')
 _JSON = json.JSONDecoder()
 _DANGLING_KEY_RE = re.compile(r'",\s*"(\}+)\s*$')
+_STRAY_PAREN_RE = re.compile(r'"\s*\)+\s*(\}+)\s*$')
 
 
 def repair_json_escapes(text: str) -> str:
@@ -115,10 +116,35 @@ class AgentRunLog:
 
 
 # --------------------------------------------------------------------------- parsing
+_BARE_TOOL_CALL_RE = re.compile(r"(^|\n)[ \t]*tool_call[ \t]*\r?\n(?=\s*\{)", re.IGNORECASE)
+_FENCE_OPEN_SPLIT_RE = re.compile(r"(```tool_call[ \t]*\r?\n)", re.IGNORECASE)
+
+
+def normalize_tool_fences(text: str) -> str:
+    """
+    Restore a tool_call fence that lost its opening backticks (cycle 5, split-module: the
+    final reply was `tool_call\\n{"name":"delete_file",…}` + "```" and was taken for a
+    finished prose answer), and close a final fence the reply cut off.
+    Mirrors normalizeToolFences() in the extension's toolProtocol.ts.
+    """
+    text = _BARE_TOOL_CALL_RE.sub(lambda m: m.group(1) + "```tool_call\n", text or "")
+    # Every fence body must close before the next opener; otherwise the next opener's
+    # backticks are taken as this fence's close and that call is lost (cycle 8: two
+    # bare `tool_call` lines in a row, the second call vanished).
+    parts = _FENCE_OPEN_SPLIT_RE.split(text)
+    out = [parts[0]]
+    for k in range(1, len(parts), 2):
+        body = parts[k + 1] if k + 1 < len(parts) else ""
+        if "```" not in body:
+            body = body.rstrip("\n") + "\n```\n"
+        out += [parts[k], body]
+    return "".join(out)
+
+
 def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for match in TOOL_CALL_FENCE_RE.finditer(text or ""):
+    for match in TOOL_CALL_FENCE_RE.finditer(normalize_tool_fences(text)):
         body = (match.group(1) or "").strip()
         if not body:
             continue
@@ -130,6 +156,13 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
         # Stray `,"` before the closing braces ({…"new_string":"x","}}}) — 3 of 8 lost
         # edits in training cycle 3 ended this way.
         candidates += [_DANGLING_KEY_RE.sub(r'"\1', c) for c in list(candidates)]
+        # Stray ")" between the last string and the closing braces (cycle 7, globals-to-di:
+        # `…\"dry-run\"\n")}}` — a Python call's paren leaked into the JSON).
+        candidates += [_STRAY_PAREN_RE.sub(r'"\1', c) for c in list(candidates) if _STRAY_PAREN_RE.search(c)]
+        # Last resort: a bare " inside code (cycle 5, extract-helpers: r\"[\\s-]+", \"-\").
+        candidates += [repair_unescaped_quotes(c) for c in list(candidates)]
+        # Missing closing braces (cycle 8, split-module: a write ended `…]"}` — 7 rounds lost).
+        candidates += [b for b in (balance_braces(c) for c in list(candidates)) if b not in candidates]
         for cand in candidates:
             try:
                 # raw_decode takes the first complete object and ignores trailing junk:
@@ -148,6 +181,8 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                 args = json.loads(args)
             except json.JSONDecodeError:
                 args = {"value": args}
+        if isinstance(args, dict):
+            args = undo_double_escape(name, args)
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if name and key not in seen:
             seen.add(key)
@@ -155,14 +190,109 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
     return out
 
 
+def balance_braces(text: str) -> str:
+    """Append the `}` a call is missing, counting braces outside JSON strings only."""
+    depth, in_str, i = 0, False, 0
+    text = text.rstrip()
+    while i < len(text):
+        ch = text[i]
+        if in_str:
+            if ch == "\\":
+                i += 1
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return text + "}" * depth if depth > 0 and not in_str else text
+
+
+def repair_unescaped_quotes(text: str) -> str:
+    """
+    Escape a bare `"` inside a JSON string when it cannot be the string's end. A real
+    closing quote is followed (after whitespace) by } ] : or by a comma and then the
+    next value ("…", {…}, […]). Code in "content"/"old_string" breaks that: in
+    `re.sub(r\\"[\\\\s-]+", \\"-\\"` the bare quote is followed by `, \\"`, so it is content.
+    Mirrors repairUnescapedQuotes() in the extension's toolProtocol.ts.
+    """
+    out: list[str] = []
+    in_str = False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if in_str and ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if ch == '"':
+            if not in_str:
+                in_str = True
+            else:
+                j = i + 1
+                while j < n and text[j].isspace():
+                    j += 1
+                closes = j >= n or text[j] in "}]:"
+                if not closes and text[j] == ",":
+                    j += 1
+                    while j < n and text[j].isspace():
+                        j += 1
+                    closes = j >= n or text[j] in '"{['
+                if closes:
+                    in_str = False
+                else:
+                    out.append("\\")
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+_DOUBLE_ESCAPE_KEYS = ("content", "old_string", "new_string")
+
+
+def undo_double_escape(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """
+    Code strings with no real newline but several literal "\\n" were JSON-escaped twice
+    (cycle 7, split-module: after "unescaped quote" errors the coder wrote `\\\\n` and
+    `\\\\\\"`, and reports.py became one line of backslashes). Decode them once more.
+    Mirrors undoDoubleEscape() in the extension's toolProtocol.ts.
+    """
+    if name not in {"write_file", "search_replace"}:
+        return args
+    fixed = dict(args)
+    for key in _DOUBLE_ESCAPE_KEYS:
+        val = fixed.get(key)
+        if not isinstance(val, str) or "\n" in val or val.count("\\n") < 2:
+            continue
+        try:
+            fixed[key] = json.loads(f'"{val}"')
+        except json.JSONDecodeError:
+            fixed[key] = (val.replace("\\\\", "\x00").replace("\\n", "\n").replace("\\t", "\t")
+                          .replace('\\"', '"').replace("\x00", "\\"))
+    return fixed
+
+
 def strip_tool_calls(text: str) -> str:
-    return re.sub(r"\n{3,}", "\n\n", TOOL_CALL_FENCE_RE.sub("", text or "")).strip()
+    return re.sub(r"\n{3,}", "\n\n", TOOL_CALL_FENCE_RE.sub("", normalize_tool_fences(text))).strip()
 
 
 # ----------------------------------------------------------------------------- tools
 class Workspace:
     def __init__(self, root: Path):
         self.root = root.resolve()
+        # Files whose current content the model has seen: read in an EARLIER round (it had
+        # the result in its prompt) or written by itself. Reads from the current round only
+        # count once the round ends — a reply that sends read_file and write_file together
+        # wrote from a guess (cycle 4: package.json overwritten with invented content).
+        self._known: set[Path] = set()
+        self._read_this_round: set[Path] = set()
+
+    def end_round(self) -> None:
+        self._known |= self._read_this_round
+        self._read_this_round.clear()
 
     def _resolve(self, rel: str) -> Path:
         rel = str(rel or ".").replace("\\", "/").lstrip("/")
@@ -213,6 +343,7 @@ class Workspace:
         start = max(1, int(args.get("startLine") or 1))
         end = min(len(lines), int(args.get("endLine") or len(lines)))
         body = "\n".join(f"{i}| {lines[i - 1]}" for i in range(start, end + 1))
+        self._read_this_round.add(path)
         return True, f"{args.get('path')} (lines {start}-{end} of {len(lines)})\n{body}"
 
     def t_search_text(self, args):
@@ -259,9 +390,16 @@ class Workspace:
         content = args.get("content")
         if content is None:
             return False, "content is required"
-        path.parent.mkdir(parents=True, exist_ok=True)
         existed = path.exists()
+        if existed and path not in self._known:
+            return False, (
+                f"Refused: {args.get('path')} exists and you have not read it yet — NOT written, "
+                "nothing changed. Overwriting a file you have not seen replaces real content with "
+                "a guess. read_file it this round, then write it next round from what it contains."
+            )
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(content), encoding="utf-8", newline="\n")
+        self._known.add(path)
         return True, f"{'Overwrote' if existed else 'Created'} {args.get('path')} ({len(str(content))} chars)"
 
     def t_delete_file(self, args):
@@ -280,7 +418,10 @@ class Workspace:
         except ValueError:
             head = command.split()[0].lower()
         head = Path(head.strip("\"'")).stem
-        if head not in ALLOWED_COMMAND_HEADS or re.search(r"[|&;<>`]|\.\.[\\/]", command):
+        # A trailing "2>&1" only merges stderr (already captured); the extension allows it.
+        # Quoted text is code, not shell syntax: `python -c "import x; print(x)"` (cycle 7).
+        checked = re.sub(r'"[^"]*"|\'[^\']*\'', '""', re.sub(r"\s+2>&1\s*$", "", command))
+        if head not in ALLOWED_COMMAND_HEADS or re.search(r"[|&;<>`]|\.\.[\\/]", checked):
             return False, (
                 f"Command refused by eval host (allowed: {', '.join(sorted(ALLOWED_COMMAND_HEADS))}; "
                 "no pipes/chaining/redirects/parent paths)."
@@ -331,6 +472,7 @@ def _one_line(e: TranscriptEntry) -> str:
 
 WORKING_SET_CHARS = 40000
 _EDIT_TOOLS = {"search_replace", "write_file", "delete_file", "apply_fence"}
+_FULL_WRITE_TOOLS = {"write_file", "apply_fence"}
 
 
 def working_set_indices(entries: list[TranscriptEntry], budget: int = WORKING_SET_CHARS) -> set[int]:
@@ -353,16 +495,61 @@ def working_set_indices(entries: list[TranscriptEntry], budget: int = WORKING_SE
                 keep.add(i)
             continue
         path = str(e.args.get("path") or "")
-        if e.name in _EDIT_TOOLS and e.ok:
+        if not e.ok or path in seen:
+            continue
+        if e.name in _FULL_WRITE_TOOLS:
+            # A whole-file write IS the file's current content. Without it the coder sees
+            # only "Overwrote x (169 chars)" and re-reads every file it just wrote
+            # (cycle 5, cjs-to-esm: "I don't actually know what the current file contents are").
+            seen.add(path)
+            size = len(str(e.args.get("content") or ""))
+            if size and size <= budget:
+                keep.add(i)
+                budget -= size
+            continue
+        if e.name == "delete_file":
+            # The last read of a deleted file is the only copy of its code left (cycle 6,
+            # split-module: inventory.py deleted while its replacements failed, then the
+            # package was rewritten from memory with renamed fields). Not marking the path
+            # as seen keeps the older read in view.
+            continue
+        if e.name in _EDIT_TOOLS:
             seen.add(path)  # content changed after any earlier read: that read is stale
             continue
-        if e.name != "read_file" or not e.ok or path in seen:
+        if e.name != "read_file":
             continue
         seen.add(path)
         if len(e.result) <= budget:
             keep.add(i)
             budget -= len(e.result)
     return keep
+
+
+def _numbered(text: str) -> str:
+    return "\n".join(f"{n}| {line}" for n, line in enumerate(text.splitlines(), 1))
+
+
+def deleted_paths(entries: list[TranscriptEntry]) -> set[str]:
+    """Paths whose latest successful edit is a delete (not recreated since)."""
+    last: dict[str, str] = {}
+    for e in entries:
+        if e.ok and e.name in _EDIT_TOOLS:
+            last[str(e.args.get("path") or "")] = e.name
+    return {p for p, name in last.items() if name == "delete_file"}
+
+
+def _full_block(e: TranscriptEntry, in_working_set: bool, deleted: set[str] | None = None) -> str:
+    args = {k: v for k, v in e.args.items() if k != "content"} if e.name in _FULL_WRITE_TOOLS else e.args
+    limit = WORKING_SET_CHARS if e.name == "read_file" else MAX_RESULT_CHARS
+    result = e.result if len(e.result) <= limit else e.result[:limit] + "\n…(truncated)"
+    if e.name == "read_file" and deleted and str(e.args.get("path") or "") in deleted:
+        result = (f"(DELETED since — this is its content from before the delete, the only copy left. "
+                  f"Keep every name, field and behavior when you move this code.)\n{result}")
+    if e.name in _FULL_WRITE_TOOLS and e.ok and in_working_set:
+        result += (f"\nCurrent content of {e.args.get('path')} (exactly what you wrote; "
+                   f"no need to read it again):\n{_numbered(str(e.args.get('content') or ''))}")
+    return (f"### Round {e.round} — {e.name} ({'ok' if e.ok else 'error'})\n"
+            f"Args: {json.dumps(args)[:600]}\nResult:\n{result}")
 
 
 def format_transcript(entries: list[TranscriptEntry]) -> str:
@@ -375,7 +562,8 @@ def format_transcript(entries: list[TranscriptEntry]) -> str:
     first_of_last = next(i for i, e in enumerate(entries) if e.round == last_round)
     full_from = min(full_from, first_of_last)
     one_from = max(0, full_from - ONE_LINE_MIDDLE)
-    full = set(range(full_from, len(entries))) | working_set_indices(entries)
+    working = working_set_indices(entries)
+    full = set(range(full_from, len(entries))) | working
     parts = ["[AGENT TOOL TRANSCRIPT — compact]"]
     older = [e for i, e in enumerate(entries[:one_from]) if i not in full]
     if older:
@@ -383,15 +571,10 @@ def format_transcript(entries: list[TranscriptEntry]) -> str:
     parts.extend(_one_line(entries[i]) for i in range(one_from, full_from) if i not in full)
     ws = sorted(i for i in full if i < full_from)
     if ws:
-        parts.append("[WORKING SET — files you read (unchanged since) + latest result of each command]")
+        parts.append("[WORKING SET — current content of files you read or wrote + latest result of each command]")
+    gone = deleted_paths(entries)
     for i in ws + list(range(full_from, len(entries))):
-        e = entries[i]
-        limit = WORKING_SET_CHARS if e.name == "read_file" else MAX_RESULT_CHARS
-        result = e.result if len(e.result) <= limit else e.result[:limit] + "\n…(truncated)"
-        parts.append(
-            f"### Round {e.round} — {e.name} ({'ok' if e.ok else 'error'})\n"
-            f"Args: {json.dumps(e.args)[:600]}\nResult:\n{result}"
-        )
+        parts.append(_full_block(entries[i], i in working, gone))
     return "\n\n".join(parts)
 
 
@@ -400,7 +583,7 @@ def _has_plan(prose: str) -> bool:
 
 
 def build_round_prompt(base: str, entries: list[TranscriptEntry], round_i: int, max_rounds: int,
-                       last_prose: str) -> str:
+                       last_prose: str, host_note: str = "") -> str:
     fails = sum(1 for e in entries if not e.ok)
     had_plan = _has_plan(last_prose)
     if not entries:
@@ -425,13 +608,69 @@ def build_round_prompt(base: str, entries: list[TranscriptEntry], round_i: int, 
         ]))
     status = build_research_status(entries)
     prior = ""
-    if last_prose.strip():
+    # Once tests pass after the last edit the green output is the truth; older prose
+    # ("npm test failed with an import error…") then misleads (cycle 6, cjs-to-esm
+    # rounds 10-14 re-ran green tests because of it).
+    if last_prose.strip() and not verified_after_last_edit(entries):
         prior = (
             "[PRIOR ASSISTANT PROSE — do not repeat verbatim"
             + ("; PLAN already present — do not rewrite" if had_plan else "")
             + "]\n" + last_prose.strip()[:600]
         )
-    return "\n\n".join(p for p in [base, format_transcript(entries), block, status, prior] if p)
+    return "\n\n".join(p for p in [base, format_transcript(entries), block, status, prior, host_note] if p)
+
+
+UNVERIFIED_FINISH_NOTE = (
+    "[HOST — not finished yet]\n"
+    "You edited files but no test run has passed since your last edit. If the project has "
+    "tests, run them now with run_command (e.g. the package.json test script, or "
+    "python -m pytest -q). If they fail, fix the cause from the error and run them again. "
+    "Only then finish with a short summary."
+)
+
+
+VERIFIED_STOP_NOTE = (
+    "[HOST — work is verified]\n"
+    "Tests passed after your last edit and the rounds since only re-read, re-searched or "
+    "re-ran checks. Those tool calls were NOT run. Reply now with the short summary for the "
+    "user (files created / edited / deleted, test result) and NO tool_call fences."
+)
+
+
+def green_idle_rounds(entries: list[TranscriptEntry]) -> int:
+    """Rounds after the first passing test that followed the last edit (0 if not verified)."""
+    if not verified_after_last_edit(entries):
+        return 0
+    last_edit = max(i for i, e in enumerate(entries) if e.name in _EDIT_TOOLS and e.ok)
+    first_green = next(e.round for e in entries[last_edit + 1:]
+                       if e.name == "run_command" and e.ok and _TEST_CMD_RE.search(str(e.args.get("command") or "")))
+    return len({e.round for e in entries if e.round > first_green})
+
+
+FABRICATED_SUMMARY_NOTE = (
+    "[HOST — nothing was changed]\n"
+    "Your last reply described files as created/edited/deleted and tests as passing, but it "
+    "contained NO tool calls and NO path fences, so nothing ran and no file changed. Do the "
+    "work now: emit the write_file / search_replace / delete_file tool calls (or path fences), "
+    "then run the tests. Do not describe results you have not seen."
+)
+_CLAIM_RE = re.compile(r"\b(created|edited|updated|deleted|renamed|rewrote|tests? (all )?pass)", re.I)
+
+
+def claims_unrun_work(prose: str, entries: list[TranscriptEntry]) -> bool:
+    """
+    A finishing reply claims edits or green tests while no edit ever succeeded (cycle 8,
+    globals-to-di round 2: a "### Summary" of six changed files and "All tests pass",
+    with zero tool calls).
+    """
+    # Two or more claims: one stray "updated" in an ordinary answer is not a fabricated summary.
+    return (not any(e.name in _EDIT_TOOLS and e.ok for e in entries)
+            and len(_CLAIM_RE.findall(prose or "")) >= 2)
+
+
+def wants_verify_push(entries: list[TranscriptEntry]) -> bool:
+    """Edits happened and nothing proved them since (finishing now would be unverified)."""
+    return any(e.name in _EDIT_TOOLS and e.ok for e in entries) and not verified_after_last_edit(entries)
 
 
 _RAW_PATH_RE = re.compile(r'"path"\s*:\s*"([^"]+)"')
@@ -468,8 +707,8 @@ def repeated_searches(entries: list[TranscriptEntry]) -> tuple[str, str] | None:
                 break
             if (p.name == "search_text" and p.ok and p.round < last_round
                     and str(p.args.get("query") or "").lower() == q):
-                if p.result.strip() == "No matches.":
-                    break
+                # "No matches." repeats are circling too (cycle 6, cjs-to-esm: `require`
+                # searched 4 times, always empty); the caller words that case separately.
                 return str(e.args.get("query")), "\n".join(p.result.splitlines()[:20])
     return None
 
@@ -487,11 +726,84 @@ def verified_after_last_edit(entries: list[TranscriptEntry]) -> bool:
     return bool(tests) and tests[-1].ok
 
 
+_HIT_RE = re.compile(r"^(?P<path>[^:\n]+):(?P<line>\d+): (?P<text>.+)$")
+
+
+def edit_templates(hits: str, cap: int = 5) -> list[str]:
+    """
+    Ready-to-copy search_replace calls for search hits, old_string verbatim from the hit
+    (a hit is the stripped line, so it is an exact substring of the file). Cycle 8,
+    rename-symbol: it knew the test name had to change but kept writing the line from
+    memory (`def test_calc_total_with_tax:` without the parens), failed, and searched
+    for 8 rounds instead.
+    """
+    calls = []
+    for raw in hits.splitlines()[:cap]:
+        m = _HIT_RE.match(raw.strip())
+        if not m:
+            continue
+        args = {"path": m["path"], "old_string": m["text"], "new_string": "<the corrected line>"}
+        calls.append(FENCE_TOOL_CALL + json.dumps({"name": "search_replace", "arguments": args}) + "\n```")
+    if not calls:
+        return []
+    return ["Copy these, keep old_string EXACTLY as given, and replace only the new_string value:", *calls]
+
+
+FENCE_TOOL_CALL = "```tool_call\n"
+
+
+def edit_rounds_since_test(entries: list[TranscriptEntry]) -> int:
+    """
+    Rounds with a successful edit since the last test command ran (cycle 7, globals-to-di:
+    after one failing run it rewrote the test file 5 times without ever re-running it).
+    """
+    last_test = max((i for i, e in enumerate(entries)
+                     if e.name == "run_command" and _TEST_CMD_RE.search(str(e.args.get("command") or ""))),
+                    default=-1)
+    return len({e.round for e in entries[last_test + 1:] if e.ok and e.name in _EDIT_TOOLS})
+
+
+def searches_since_last_edit(entries: list[TranscriptEntry], cap: int = 12) -> list[str]:
+    """Hit lines of the latest search per query run after the last successful edit."""
+    last_edit = max((i for i, e in enumerate(entries) if e.name in _EDIT_TOOLS and e.ok), default=-1)
+    latest: dict[str, TranscriptEntry] = {}
+    for e in entries[last_edit + 1:]:
+        if e.name == "search_text" and e.ok:
+            latest[str(e.args.get("query") or "")] = e
+    lines: list[str] = []
+    empty = [q for q, e in latest.items() if e.result.strip() == "No matches."]
+    if len(empty) == len(latest):
+        return []
+    # Cycle 6, rename-symbol: listing only the NEW name's hits hid the decisive
+    # `calc_total: No matches` and the coder kept re-checking.
+    lines += [f'- search "{q}": No matches (nothing left for it)' for q in empty]
+    for query, e in latest.items():
+        if query in empty:
+            continue
+        lines.append(f'- search "{query}":')
+        lines += [f"    {h}" for h in e.result.splitlines()[:cap]]
+    return lines
+
+
 def build_research_status(entries: list[TranscriptEntry]) -> str:
     """Mirror of buildResearchStatus() in the extension's toolProtocol.ts."""
     if not entries:
         return ""
     if verified_after_last_edit(entries):
+        hits = searches_since_last_edit(entries)
+        if hits:
+            # Cycle 5, rename-symbol: tests green, the leftover search still hit
+            # `def test_calc_total_with_tax`, and "finish if nothing to change" left it
+            # re-running the same two searches for 10 rounds without ever acting on the hit.
+            return "\n".join([
+                "[RESEARCH STATUS — from the host]",
+                "Tests pass after your last edit. Your searches since then still find these lines:",
+                *hits,
+                "Decide NOW, without searching again: if any line above still contains a name, "
+                "import or pattern the task asked you to remove or change (also in test names, "
+                "comments and docs), fix it with search_replace and re-run the tests. If none do, "
+                "FINISH: short summary, NO tool_call fences.",
+            ])
         return "\n".join([
             "[RESEARCH STATUS — from the host]",
             "VERIFIED: the tests passed after your last edit. If every planned file is done and "
@@ -503,9 +815,26 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
         stuck = repeated_failure_paths(entries)
         return ("[RESEARCH STATUS — from the host]\nThe same edit failed more than once for: "
                 + ", ".join(stuck) + ". Send the COMPLETE file(s) in a path fence (```lang path=…) now.")
+    blind = edit_rounds_since_test(entries)
+    if blind >= 3:
+        return "\n".join([
+            "[RESEARCH STATUS — from the host]",
+            f"You have edited files in {blind} rounds since the last test run, without checking "
+            "the result. If the project has tests, run them NOW (one run_command) and fix what the error names; do "
+            "not edit again before you have seen the test output.",
+        ])
+    re_searched = repeated_searches(entries)
+    if re_searched and re_searched[1].strip() == "No matches.":
+        return "\n".join([
+            "[RESEARCH STATUS — from the host]",
+            f"You already searched {re_searched[0]!r}: No matches, and nothing was edited since. "
+            "Nothing is left for that query — do NOT search it again.",
+            "Next: run the tests if you have not since your last edit; if they fail, fix the cause "
+            "named in the error; if they pass and every planned file is done, FINISH with a short summary.",
+        ])
     read_now = [
         str(entries[i].args.get("path")) for i in sorted(working_set_indices(entries))
-        if entries[i].name == "read_file"
+        if entries[i].name == "read_file" or entries[i].name in _FULL_WRITE_TOOLS
     ]
     read_now = [p for p in read_now if p]
     if not read_now:
@@ -520,6 +849,8 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
         for p in reversed(entries[:i]):
             if p.args.get("path") != path:
                 continue
+            if p.name in _FULL_WRITE_TOOLS and p.ok and p.args.get("content"):
+                return True  # its own whole-file write is already shown verbatim
             if p.name in _EDIT_TOOLS and p.ok:
                 return False
             if p.name == "read_file" and p.ok and p.round < e.round:
@@ -528,7 +859,6 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
 
     repeated = reread_only and any(e.name == "read_file" and _reread_unchanged(i, e) for i, e in last)
     stuck = repeated_failure_paths(entries)
-    re_searched = repeated_searches(entries)
     if re_searched and not stuck:
         query, hits = re_searched
         return "\n".join([
@@ -538,6 +868,7 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
             hits,
             "Searching again will not change it. Your next reply MUST edit each line listed above "
             "(search_replace or a path fence), then search once more and run the tests.",
+            *edit_templates(hits),
         ])
     if stuck:
         nxt = ("The same edit failed more than once for: " + ", ".join(stuck) + ". Stop using JSON for it. "
@@ -607,12 +938,17 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
     base = build_base_prompt(user_request, ws)
     log = AgentRunLog()
     last_prose = ""
+    host_note = ""
+    verify_pushed = False
+    fabrication_pushed = False
+    verified_stop_sent = False
     started = time.time()
     if log_dir:
         log_dir.mkdir(parents=True, exist_ok=True)
 
     for round_i in range(max_rounds):
-        prompt = build_round_prompt(base, log.transcript, round_i, max_rounds, last_prose)
+        prompt = build_round_prompt(base, log.transcript, round_i, max_rounds, last_prose, host_note)
+        host_note = ""
         t0 = time.time()
         try:
             reply = _ask(prompt, timeout_sec=timeout_sec)
@@ -625,25 +961,54 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
 
         # Path-labeled fences in prose are applied like the extension's Apply step.
         fence_writes = extract_file_writes(prose)
+        round_start = len(log.transcript)
+
+        # Verified and idle: tests passed after the last edit and 2+ rounds since only
+        # re-checked (cycle 6, globals-to-di: green at round 7, re-read 7 files per round
+        # until round 15). Check-only calls are not run; edits still are.
+        blocked: list[str] = []
+        if (calls and not fence_writes and green_idle_rounds(log.transcript) >= 2
+                and not any(c["name"] in _EDIT_TOOLS for c in calls)):
+            blocked = [c["name"] for c in calls]
+            calls = []
+            if not verified_stop_sent:  # first time: ask for the summary; second: end here
+                verified_stop_sent = True
+                host_note = VERIFIED_STOP_NOTE
         applied = []
         for rel, body in fence_writes.items():
             ok, res = ws.run("write_file", {"path": rel, "content": body})
-            log.transcript.append(TranscriptEntry(round_i + 1, "apply_fence", {"path": rel}, res, ok))
+            log.transcript.append(TranscriptEntry(round_i + 1, "apply_fence", {"path": rel, "content": body}, res, ok))
             if ok:
                 applied.append(rel)
                 log.edits.append(rel)
 
+        # Deletes run last and only if every edit this round landed: the old file is the
+        # source for its replacement (cycle 6, split-module deleted inventory.py while all
+        # six replacement writes were malformed).
+        calls = [c for c in calls if c["name"] != "delete_file"] + [c for c in calls if c["name"] == "delete_file"]
         for call in calls:
+            if call["name"] == "delete_file":
+                failed = [e for e in log.transcript[round_start:]
+                          if not e.ok and (e.name in _EDIT_TOOLS or e.name == "__malformed__")]
+                if failed:
+                    res = (f"Not deleted: {len(failed)} edit(s) in this reply failed, and "
+                           f"{call['arguments'].get('path')} is the source for them. Fix those edits "
+                           "first (path fences for code with quotes), then delete it in a later round.")
+                    log.transcript.append(TranscriptEntry(round_i + 1, "delete_file", call["arguments"], res, False))
+                    continue
             ok, res = ws.run(call["name"], call["arguments"])
             log.transcript.append(TranscriptEntry(round_i + 1, call["name"], call["arguments"], res, ok))
             if ok and call["name"] in {"search_replace", "write_file", "delete_file"}:
                 log.edits.append(str(call["arguments"].get("path")))
+        ws.end_round()
 
         round_rec = {
             "round": round_i + 1, "sec": round(time.time() - t0, 1), "chars": len(text),
             "tool_calls": [c["name"] for c in calls], "fence_writes": applied,
             "source": reply["source"],
         }
+        if blocked:
+            round_rec["blocked_check_calls"] = blocked
         log.rounds.append(round_rec)
         if log_dir:
             (log_dir / f"round-{round_i + 1:02d}.prompt.md").write_text(prompt, encoding="utf-8")
@@ -652,11 +1017,27 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
                 + (f"<!-- reasoning -->\n{reply['reasoning']}\n<!-- /reasoning -->\n\n" if reply["reasoning"] else "")
                 + text, encoding="utf-8")
         if on_round:
-            on_round(round_i + 1, f"{round_rec['sec']}s tools={round_rec['tool_calls']} fences={applied}")
+            on_round(round_i + 1, f"{round_rec['sec']}s tools={round_rec['tool_calls']} fences={applied}"
+                     + (f" blocked={blocked}" if blocked else ""))
 
         if prose.strip():
             last_prose = prose
+        if blocked and host_note == VERIFIED_STOP_NOTE:
+            continue  # first verified-idle block: one more round for the summary
         if not calls:
+            if blocked:
+                log.final_text = prose
+                log.stop_reason = "finished (host: verified, check-only calls ignored)"
+                break
+            if not fabrication_pushed and claims_unrun_work(prose, log.transcript) and round_i + 1 < max_rounds:
+                fabrication_pushed = True
+                host_note = FABRICATED_SUMMARY_NOTE
+                continue
+            # Cycle 5, split-module: finished right after its last write, never ran the tests.
+            if not verify_pushed and wants_verify_push(log.transcript) and round_i + 1 < max_rounds:
+                verify_pushed = True
+                host_note = UNVERIFIED_FINISH_NOTE
+                continue
             log.final_text = prose
             log.stop_reason = "finished"
             break

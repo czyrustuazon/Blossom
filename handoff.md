@@ -1,8 +1,11 @@
 # Handoff — Blossom Assistant refactor training ("Dr. Light" loop)
 
-**Paused:** 2026-11-20, partway through cycle 4. Work so far is committed: Blossom
-`e3ebef8` (router, memory, rules, eval capsule, this file) and Blossom Assistant
-`839fda9` (extension tool loop).
+**Status (2026-11-20, second session): DONE CRITERION MET.** Cycle 9 = 5/5, confirmation
+cycle 10 = 4/5. Caveat: passes still lean on host recovery (cycle 10 tool failures:
+cjs-to-esm 25, globals-to-di 18, split-module 11 — mostly malformed JSON), so the
+next step is reliability (see "Next: hardening" below), not more one-off patches.
+The second-session changes are **NOT committed yet**. Earlier work is committed:
+Blossom `e3ebef8` and Blossom Assistant `839fda9`.
 
 Full technical record of the session (architecture of the loops, cycle-by-cycle
 findings, every correction and why): [`tools/eval/TRAINING.md`](tools/eval/TRAINING.md).
@@ -32,18 +35,59 @@ leave it alone.
 | 2, 3 | not scored | Stopped early once the lesson was clear (diagnostics only). Cycle 3: `extract-helpers` reached green tests but was never scored. |
 | 4 | interrupted | Paused at `cjs-to-esm` round 7, at the user's request. |
 
-**Two problems seen in cycle 4 that are not fixed yet. Do these first:**
+| 5 | 3/5 | First passes. rename-symbol looped on a leftover hit; split-module lost a tool call and never ran tests. |
+| 6 | 4/5 | rename-symbol passes. split-module deleted its source module while the replacement writes were malformed, then rewrote it from memory. |
+| 7 | 3/5 | Passing tasks finish in 7–10 rounds (were 13–16). Double-escaped code; blind test edits. |
+| 8 | 2/5 | Fabricated "### Summary … All tests pass" with zero tool calls; missing `}`; two bare tool_call lines lost one. |
+| 9 | **5/5** | First clean sweep. |
+| 10 | **4/5** | Confirmation. rename-symbol hit max rounds; many recovered malformed calls. |
 
-1. **Writes before reads.** In round 1 Blossom sent `read_file` and `write_file`
-   in the same reply, so the writes were based on guesses. It overwrote
-   `package.json` with invented content (`"name": "task-manager"`). Add a
-   coding rule ("never write an existing file you have not read this turn")
-   and a host check in both `agent_loop.py` and the extension: reject
-   `write_file` on an existing path that has no successful `read_file` this
-   turn, with an error telling it to read first.
-2. **Over-strict test rig.** `agent_loop.py` refused `npm test 2>&1` because
-   of the redirect, and the real extension would not. Allow a trailing `2>&1`
-   in `Workspace.t_run_command`.
+### Next: hardening (recommended order)
+
+1. **Native tool calls / constrained JSON.** llama-server already runs with `--jinja`
+   (`LlamaServerManager.py`), so OpenAI `tools` or a JSON-schema/grammar on agent
+   rounds is available; ChatRouter does not use it. Probe Nemotron 3.5's template first.
+2. **Host-run tests** after every edit round (test command from package.json / pytest).
+3. **Re-sample a round once** when it has malformed calls, before reporting an error.
+4. **Writes as path fences only** (no code inside JSON strings).
+5. **Measure with N=3 runs per task** + 2–3 new tasks (PHP modernization) to avoid overfitting five tasks.
+6. LoRA on the clean trajectories in the run logs — only with the user's approval.
+
+### Second session (uncommitted) — every fix is in BOTH `agent_loop.py` and the extension
+
+Items 15–18 (cycles 7–8): double-escape decode (`undoDoubleEscape`), stray `)` and
+missing-`}` repair (`balanceBraces`), every fence closed before the next opener,
+edit-rounds-without-test nudge, exact `search_replace` templates for repeated hits
+(`editTemplates`), fabricated-summary push (`claimsUnrunWork`), eval host allows
+`;`/`|` inside quotes.
+
+Each fix has a regression test in `test_agent_loop.py` (39 pass) built from
+Blossom's real output; the extension side was checked by compiling to a scratch
+dir and running `toolProtocol.js` in node with a stub `vscode` module.
+
+1. **Read before overwrite.** `write_file` on an existing file is refused unless
+   it was read in an EARLIER round or written by the coder itself (cycle 4
+   package.json guess). Extension: `unreadOverwriteRefusal` + `workspaceFileExists`.
+2. **`npm test 2>&1`** allowed in the eval host (trailing stderr merge only).
+3. **Own writes stay in view.** A whole-file write is shown in the working set as
+   the file's current content (cycle 5: "I don't know the current contents" → re-read all).
+4. **Bare-quote JSON repair** (`repairUnescapedQuotes`): a `"` that cannot end a
+   string is escaped (cycle 5 regex code in JSON).
+5. **Missing opening fence** (`tool_call\n{…}```) is parsed (`normalizeToolFences`).
+6. **Verify push:** finishing with edits and no passing test since → one push to run tests.
+7. **Leftover quoting:** tests green + searches since still hit → host lists the
+   hits AND the empty searches and forces "fix or finish".
+8. **Repeated empty search** flagged ("nothing left for that query").
+9. **Stale prose dropped** once tests pass after the last edit.
+10. **Verified-idle cut-off:** green + 2 rounds of check-only calls → those calls
+    are not run, summary demanded; a second such round ends the task. Edits still run.
+11. **Deleted file's last read kept** in the working set, labeled DELETED.
+12. **Deletes run last and are skipped if an edit in the same reply failed.**
+13. **Extension bug fixed:** `findMalformedToolCallFences` looped forever (the
+    parser reset the shared global regex's `lastIndex`). Any rebuild of `839fda9`
+    would have hung on the first tool call.
+14. `coding_rules.txt`: never write an unread file; no generator scripts;
+    one command per run_command; `python` not `python3`.
 
 ## How to run a cycle
 

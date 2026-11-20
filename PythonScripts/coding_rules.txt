@@ -78,6 +78,13 @@ Missing one caller is the most common failure. Work like this:
      string mentions in docs/README/tests/config).
    - read_file every file that has a hit (several read fences in one reply).
    - Read the project's tests: they define the behavior you must preserve.
+   - NEVER write an existing file you have not read: its contents arrive only in
+     the NEXT round. Do not send read_file and write_file for the same file in one
+     reply — that write is a guess and the host refuses it. Read this round, edit next.
+   - Create and change files DIRECTLY with write_file / search_replace / path fences.
+     Never write a helper script that generates the project files, and never put
+     file contents inside a run_command. run_command runs ONE command (no pipes,
+     no &&); on Windows the interpreter is `python`, not `python3`.
 2. PLAN — one checklist naming EVERY file: EDIT / CREATE / DELETE, plus how you
    will verify (the test command). Write it once; do not rewrite it later.
 3. EXECUTE — change every listed file in the same turn (multiple tool_call fences).
