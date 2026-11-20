@@ -4,8 +4,12 @@
 cycle 10 = 4/5. Caveat: passes still lean on host recovery (cycle 10 tool failures:
 cjs-to-esm 25, globals-to-di 18, split-module 11 — mostly malformed JSON), so the
 next step is reliability (see "Next: hardening" below), not more one-off patches.
-The second-session changes are **NOT committed yet**. Earlier work is committed:
-Blossom `e3ebef8` and Blossom Assistant `839fda9`.
+Committed: Blossom `738417b`, Blossom Assistant `e016c00` (earlier: `e3ebef8` / `839fda9`).
+**Third part of the session (native tool calls, NOT committed):** implemented and
+A/B-tested — fence 11/15 vs native 10/15 over 3 alternating cycles each, so no
+measured gain; native is opt-in. The real pass rate is ~70%, with high run-to-run
+variance. The user said: do NOT seed lessons into the real Mind until scores are
+more robust.
 
 Full technical record of the session (architecture of the loops, cycle-by-cycle
 findings, every correction and why): [`tools/eval/TRAINING.md`](tools/eval/TRAINING.md).
@@ -44,9 +48,40 @@ leave it alone.
 
 ### Next: hardening (recommended order)
 
-1. **Native tool calls / constrained JSON.** llama-server already runs with `--jinja`
-   (`LlamaServerManager.py`), so OpenAI `tools` or a JSON-schema/grammar on agent
-   rounds is available; ChatRouter does not use it. Probe Nemotron 3.5's template first.
+1. **Native tool calls.** llama-server already runs with `--jinja`
+   (`LlamaServerManager.py`); ChatRouter does not pass `tools`. **Probed 2026-11-20
+   (direct to llama-server, same sampling, "save this file verbatim" on escape-heavy
+   code, 16 requests per mode):** native = a call in 15/16 requests, code intact every
+   time, avg 14 s / 2.5k tokens. Fence protocol = 1/24 files correct even with all
+   repairs, avg 50 s / 9.4k tokens, 9/16 replies burned the whole 12k-token budget
+   reasoning about JSON escaping. Cause: Nemotron's template calls tools as
+   `<tool_call><function=…><parameter=content>RAW TEXT</parameter>` (no escaping);
+   the fence protocol forces code into JSON strings. Caveat: native emitted ONE call
+   per reply (also with `parallel_tool_calls` and a system hint; one trial looped 82 calls).
+   **Implemented 2026-11-20 (uncommitted), opt-in:**
+   - Host sends OpenAI `tools` in the request. On agent rounds ChatRouter
+     (`_stream_local_chat`) forwards them to llama-server and writes each parsed call
+     back into the reply as a ```` ```tool_call ```` fence with valid JSON, marked
+     `"native": true` (hosts skip their repairs for those; backticks are `\u0060`).
+   - One call per reply → the router answers each call "Queued…" and asks for the
+     next, up to `CODER_NATIVE_BATCH_MAX` (6) per host round; stops after
+     `run_command` / `ask_user`.
+   - Switches: `CODER_NATIVE_TOOLS` (router, default on, only acts when the host sends
+     `tools`), `BLOSSOM_EVAL_NATIVE_TOOLS=1` (eval, default off),
+     `blossom.agent.nativeToolCalls` (extension, default off).
+   - **Result.** Edits: zero malformed calls in every native run inspected. Pass rate:
+     no gain. Alternating A/B on identical host code — fence 4, 3, 4 (11/15); native
+     1, 4, 5 (10/15). Earlier native runs: 3, 2 (before the command fix), 4, 3, 2.
+     Failures are now behaviour, not format: re-running failing tests without editing,
+     finishing with visible tests green but acceptance failing, shell habits.
+   - Host fixes found on the way (both hosts, tests in `test_agent_loop.py`, 45 pass):
+     `normalize_command` drops `cd /workspace &&` and `2>&1 || true`;
+     `failed_reruns_without_edit` status names the failing file/line after 2 failed test
+     runs with no edit; the "you already searched X" status no longer comes back empty
+     when no file is in the working set.
+   - Conclusion: format is not the bottleneck any more; variance is. Five tasks × one
+     run cannot tell a 70% loop from an 80% one — measure with ≥3 cycles before judging
+     any change (a cycle takes 5–11 minutes).
 2. **Host-run tests** after every edit round (test command from package.json / pytest).
 3. **Re-sample a round once** when it has malformed calls, before reporting an error.
 4. **Writes as path fences only** (no code inside JSON strings).

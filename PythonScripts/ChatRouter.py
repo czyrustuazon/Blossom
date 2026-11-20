@@ -307,6 +307,55 @@ _AGENT_ROUND_CV: contextvars.ContextVar[bool] = contextvars.ContextVar(
 # malformed calls and "```</think>" loops. Plain coding answers keep the card's 1.0.
 CODER_AGENT_TEMPERATURE = float(os.getenv("CODER_AGENT_TEMPERATURE", "0.6"))
 
+# Native tool calls on agent rounds. The host sends OpenAI `tools`; llama-server renders
+# them through the model's chat template and parses the model's own call format, where
+# parameter values are raw text. The parsed calls go back to the host as ```tool_call
+# fences holding valid JSON, so hosts keep one parser. Probe (2026-11-20, escape-heavy
+# files): hand-written JSON fences 1/24 files intact, native 15/16 requests intact.
+CODER_NATIVE_TOOLS = os.getenv("CODER_NATIVE_TOOLS", "true").strip().lower() in {"1", "true", "yes", "on"}
+# The coder makes ONE native call per reply. After each call the router answers
+# "queued" and asks for the next, up to this many calls per host round (1 = no batching).
+CODER_NATIVE_BATCH_MAX = max(1, int(os.getenv("CODER_NATIVE_BATCH_MAX", "6")))
+_AGENT_TOOLS_CV: contextvars.ContextVar[list | None] = contextvars.ContextVar(
+    "blossom_agent_tools", default=None
+)
+# Calls whose result decides the next step: the batch ends after one of these.
+_NATIVE_BATCH_STOPPERS = {"run_command", "ask_user"}
+_NATIVE_QUEUED_RESULT = (
+    "Queued. The host runs it when your reply ends; its result arrives next round. "
+    "If another call is needed now that does not depend on this result (another file "
+    "to read, another file to write or edit), make that call. Otherwise reply with "
+    "exactly: WAIT"
+)
+NATIVE_TOOLS_SYSTEM_NOTE = (
+    "[TOOL CALL FORMAT — this overrides every mention of ```tool_call fences and JSON "
+    "escaping above]\n"
+    "This session has native function calling. Call tools ONLY in your native tool-call "
+    "format. Never write ```tool_call fences or tool JSON yourself.\n"
+    "Parameter values are raw text: write code exactly as it must appear in the file. "
+    "No JSON escaping, no \\n for line breaks, no \\\" for quotes.\n"
+    "Make one call, then stop. The host answers each call and tells you when to make "
+    "the next. A reply with no tool call ends the turn."
+)
+
+
+def _native_agent_tools(source: str) -> list | None:
+    """Tool schemas to pass to llama-server: only on a coder agent round whose host sent them."""
+    if not CODER_NATIVE_TOOLS or source != "local_coder" or not _AGENT_ROUND_CV.get():
+        return None
+    return _AGENT_TOOLS_CV.get() or None
+
+
+def _native_call_fence(name: str, arguments: Any) -> str:
+    """One parsed native call as the ```tool_call fence the hosts already execute.
+
+    "native": true tells the host this JSON is machine-written (skip its repairs).
+    Backticks are written as \\u0060 so file content can never close the fence."""
+    body = json.dumps(
+        {"name": name, "arguments": arguments, "native": True}, ensure_ascii=False
+    ).replace("`", "\\u0060")
+    return f"\n```tool_call\n{body}\n```\n"
+
 
 def _model_sampling(source: str, temperature: float) -> dict[str, Any]:
     """Nemotron cards sample at 1.0 / 0.95 (agent tool rounds: CODER_AGENT_TEMPERATURE).
@@ -737,14 +786,10 @@ def _stream_local_chat(
         kwargs["enable_thinking"] = False
         extra["chat_template_kwargs"] = kwargs
         sampling["extra_body"] = extra
-    stream = LOCAL_CLIENT.chat.completions.create(
-        model=model,
-        messages=messages,
-        stream=True,
-        **sampling,
-    )
+    tools = _native_agent_tools(source)
+    if tools:
+        sampling["tools"] = tools
     content_parts: list[str] = []
-    splitter = ThinkSplitter()
     label = _label_intel_source(source)
 
     def emit_reasoning(piece: str) -> None:
@@ -757,10 +802,12 @@ def _stream_local_chat(
             log=False,
         )
 
-    def emit_segments(segments: list[tuple[str, str]]) -> None:
+    def emit_segments(segments: list[tuple[str, str]], visible: bool = True) -> None:
         for kind, text in segments:
             if kind == "reasoning":
                 emit_reasoning(text)
+                continue
+            if not visible:
                 continue
             content_parts.append(text)
             if on_content:
@@ -776,30 +823,134 @@ def _stream_local_chat(
                     transient=True,
                 )
 
-    for chunk in stream:
-        choices = getattr(chunk, "choices", None) or []
-        if not choices:
-            continue
-        choice0 = choices[0]
-        delta = getattr(choice0, "delta", None)
-        if delta is None and isinstance(choice0, dict):
-            delta = choice0.get("delta")
-        finish = getattr(choice0, "finish_reason", None)
-        if finish is None and isinstance(choice0, dict):
-            finish = choice0.get("finish_reason")
-        if finish and meta is not None:
-            meta["finish_reason"] = finish
-        reasoning_piece = _delta_text(delta, "reasoning_content")
-        if reasoning_piece:
-            emit_reasoning(reasoning_piece)
-        content_piece = _delta_text(delta, "content")
-        if content_piece:
-            emit_segments(splitter.feed(content_piece))
-    emit_segments(splitter.flush())
+    def run_pass(pass_messages: list[dict], visible: bool) -> tuple[list[dict], str | None]:
+        """One streamed completion. Returns (native tool calls, finish_reason)."""
+        stream = LOCAL_CLIENT.chat.completions.create(
+            model=model,
+            messages=pass_messages,
+            stream=True,
+            **sampling,
+        )
+        splitter = ThinkSplitter()
+        slots: dict[int, dict[str, str]] = {}
+        finish_reason: str | None = None
+        for chunk in stream:
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            choice0 = choices[0]
+            delta = getattr(choice0, "delta", None)
+            if delta is None and isinstance(choice0, dict):
+                delta = choice0.get("delta")
+            finish = getattr(choice0, "finish_reason", None)
+            if finish is None and isinstance(choice0, dict):
+                finish = choice0.get("finish_reason")
+            if finish:
+                finish_reason = finish
+            reasoning_piece = _delta_text(delta, "reasoning_content")
+            if reasoning_piece:
+                emit_reasoning(reasoning_piece)
+            content_piece = _delta_text(delta, "content")
+            if content_piece:
+                emit_segments(splitter.feed(content_piece), visible)
+            for index, call_id, name, args in _delta_tool_calls(delta):
+                slot = slots.setdefault(index, {"id": "", "name": "", "arguments": ""})
+                slot["id"] = slot["id"] or call_id
+                slot["name"] += name
+                slot["arguments"] += args
+        emit_segments(splitter.flush(), visible)
+        calls: list[dict] = []
+        for index in sorted(slots):
+            slot = slots[index]
+            try:
+                arguments = json.loads(slot["arguments"] or "{}")
+            except json.JSONDecodeError:
+                # Cut off mid-call (output limit): an incomplete call must not run.
+                logger.warning("native tool call %s had unparseable arguments; dropped", slot["name"])
+                continue
+            if slot["name"] and isinstance(arguments, dict):
+                calls.append({"id": slot["id"], "name": slot["name"], "arguments": arguments})
+        return calls, finish_reason
+
+    calls, finish_reason = run_pass(messages, True)
+    if tools and calls:
+        # One native call per reply is all the coder emits, so keep asking for the next
+        # one until it needs a result (WAIT / no call), repeats itself, or hits the cap.
+        convo = list(messages)
+        seen: set[str] = set()
+        emitted = 0
+        while True:
+            fresh = []
+            for call in calls:
+                key = call["name"] + ":" + json.dumps(call["arguments"], sort_keys=True)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(call)
+            for call in fresh:
+                emit_segments([("content", _native_call_fence(call["name"], call["arguments"]))])
+            emitted += len(fresh)
+            if (
+                not fresh
+                or finish_reason == "length"
+                or emitted >= CODER_NATIVE_BATCH_MAX
+                or calls[-1]["name"] in _NATIVE_BATCH_STOPPERS
+            ):
+                break
+            for n, call in enumerate(calls):
+                call["id"] = call["id"] or f"call_{emitted}_{n}"
+            convo.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+                            },
+                        }
+                        for call in calls
+                    ],
+                }
+            )
+            convo.extend(
+                {"role": "tool", "tool_call_id": call["id"], "content": _NATIVE_QUEUED_RESULT}
+                for call in calls
+            )
+            calls, finish_reason = run_pass(convo, False)
+            if not calls:
+                break
+        if meta is not None:
+            meta["native_calls"] = emitted
+    if finish_reason and meta is not None:
+        meta["finish_reason"] = finish_reason
     text = "".join(content_parts)
     if meta is not None:
         meta["raw"] = text  # exactly what on_content received, unstripped
     return _message_text({"content": text})
+
+
+def _delta_tool_calls(delta: Any) -> list[tuple[int, str, str, str]]:
+    """Streamed tool-call pieces of one delta as (index, id, name piece, arguments piece)."""
+    if delta is None:
+        return []
+    raw = delta.get("tool_calls") if isinstance(delta, dict) else getattr(delta, "tool_calls", None)
+    out: list[tuple[int, str, str, str]] = []
+    for item in raw or []:
+        get = item.get if isinstance(item, dict) else lambda k, _i=item: getattr(_i, k, None)
+        fn = get("function")
+        fget = fn.get if isinstance(fn, dict) else lambda k, _f=fn: getattr(_f, k, None)
+        out.append(
+            (
+                int(get("index") or 0),
+                str(get("id") or ""),
+                str((fget("name") if fn is not None else "") or ""),
+                str((fget("arguments") if fn is not None else "") or ""),
+            )
+        )
+    return out
 
 
 def _think(
@@ -1536,6 +1687,9 @@ def _local_coder_answer(
     if edit_ask:
         # Plan-first models (Nemotron, Qwen3 thinking) otherwise narrate and stop.
         messages.append({"role": "system", "content": FILE_EDIT_OUTPUT_CONTRACT})
+    native_tools = bool(_native_agent_tools("local_coder"))
+    if native_tools:
+        messages.append({"role": "system", "content": NATIVE_TOOLS_SYSTEM_NOTE})
     messages.append({"role": "user", "content": packed_prompt})
 
     _think(
@@ -1629,10 +1783,17 @@ def _local_coder_answer(
                     "content": (
                         "Your reply had no tool call and no path-labeled file, so nothing "
                         "happened and the turn would end (a code block without path= is "
-                        "never applied). Do it now: emit the ```tool_call "
-                        "fences that perform it (write_file with COMPLETE file contents, "
-                        "search_replace, delete_file, run_command for the tests). One JSON "
-                        "object per fence. No plan text, no prose before the fences."
+                        "never applied). Do it now: "
+                        + (
+                            "call the tool that performs it (write_file with the COMPLETE "
+                            "file content, search_replace, delete_file, run_command for "
+                            "the tests). No plan text."
+                            if native_tools
+                            else "emit the ```tool_call "
+                            "fences that perform it (write_file with COMPLETE file contents, "
+                            "search_replace, delete_file, run_command for the tests). One JSON "
+                            "object per fence. No plan text, no prose before the fences."
+                        )
                     ),
                 },
             ]
@@ -2183,12 +2344,17 @@ def run_chat_pipeline(
     on_progress: ProgressFn | None = None,
     *,
     ask: str = "",
+    agent_tools: list | None = None,
     **kwargs,
 ) -> tuple[dict, str | None]:
     """run_chat_pipeline with the host-sent ask (blossom_ask) pinned for every
     _extract_user_request call, so IDE/tool blocks around it never count as the ask."""
-    with host_ask(ask):
-        return _run_chat_pipeline(last_user_message, on_progress, **kwargs)
+    token = _AGENT_TOOLS_CV.set(agent_tools if isinstance(agent_tools, list) and agent_tools else None)
+    try:
+        with host_ask(ask):
+            return _run_chat_pipeline(last_user_message, on_progress, **kwargs)
+    finally:
+        _AGENT_TOOLS_CV.reset(token)
 
 
 def _run_chat_pipeline(
@@ -3152,6 +3318,8 @@ async def route_chat(request: Request):
         session_context = ""
     raw_tier = str(body.get("blossom_tier") or "").strip().lower()
     host_tier = PromptTier(raw_tier) if raw_tier in {t.value for t in PromptTier} else None
+    # OpenAI `tools` from the host: used only for native tool calls on agent rounds.
+    agent_tools = body.get("tools") if isinstance(body.get("tools"), list) else None
     raw_ask = body.get("blossom_ask")
     ask = raw_ask.strip() if isinstance(raw_ask, str) else ""
     locale = normalize_locale(
@@ -3173,6 +3341,7 @@ async def route_chat(request: Request):
                     session_context=session_context,
                     host_tier=host_tier,
                     ask=ask,
+                    agent_tools=agent_tools,
                     chat_surface=chat_surface,
                 )
                 final["blossom_surface"] = chat_surface
@@ -3210,6 +3379,7 @@ async def route_chat(request: Request):
                 session_context=session_context,
                 host_tier=host_tier,
                 ask=ask,
+                agent_tools=agent_tools,
                 chat_surface=chat_surface,
             )
             final["blossom_surface"] = chat_surface

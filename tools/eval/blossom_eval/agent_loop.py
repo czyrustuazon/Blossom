@@ -79,7 +79,8 @@ TOOL_CATALOG = [
      "fence instead (```lang path=x), which needs no escaping."),
     ("delete_file", "path*", "Delete a workspace file."),
     ("run_command", "command*",
-     "Run a shell command in the workspace root (tests, python/node probes, git). Returns exit code + output."),
+     "Run ONE shell command (tests, python/node probes, git). It already runs in the workspace root: "
+     "no `cd … &&` prefix, no `|| true`, no pipes. Example: python -m pytest -q. Returns exit code + output."),
     ("ask_user", "question*, options", "Ask the user to choose between real forks."),
 ]
 
@@ -94,6 +95,42 @@ FULL_PROFILE_RULES = [
     "- Prefer multiple ```tool_call fences in one reply for independent reads — the host may run them in parallel.",
     "- Finish by talking to the user in short prose (no ### Summary card; no more tool_call fences).",
 ]
+
+
+def native_tools_enabled() -> bool:
+    """Native tool calls are opt-in (BLOSSOM_EVAL_NATIVE_TOOLS=1); the fence protocol is the default.
+    A/B on 2026-11-20 (3 cycles each): fence 11/15, native 10/15 — no measured gain yet."""
+    return os.getenv("BLOSSOM_EVAL_NATIVE_TOOLS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_NATIVE_PARAM_TYPES = {"startLine": "integer", "endLine": "integer", "maxResults": "integer",
+                       "replace_all": "boolean", "options": "array"}
+_NATIVE_DESCRIPTIONS = {
+    "write_file": "Create/replace a file with the given COMPLETE content (raw text, exactly as it "
+                  "must appear in the file). For existing product files prefer search_replace.",
+}
+
+
+def native_tool_schemas() -> list[dict[str, Any]]:
+    """TOOL_CATALOG as OpenAI `tools`; ChatRouter passes them to llama-server on agent rounds."""
+    out = []
+    for name, arg_spec, desc in TOOL_CATALOG:
+        props: dict[str, Any] = {}
+        required = []
+        for raw in arg_spec.split(","):
+            arg = raw.strip()
+            if not arg:
+                continue
+            key = arg.rstrip("*")
+            kind = _NATIVE_PARAM_TYPES.get(key, "string")
+            props[key] = {"type": kind, "items": {"type": "string"}} if kind == "array" else {"type": kind}
+            if arg.endswith("*"):
+                required.append(key)
+        out.append({"type": "function", "function": {
+            "name": name, "description": _NATIVE_DESCRIPTIONS.get(name, desc),
+            "parameters": {"type": "object", "properties": props, "required": required},
+        }})
+    return out
 
 
 @dataclass
@@ -181,7 +218,8 @@ def parse_tool_calls(text: str) -> list[dict[str, Any]]:
                 args = json.loads(args)
             except json.JSONDecodeError:
                 args = {"value": args}
-        if isinstance(args, dict):
+        # "native": true = ChatRouter serialized a native call; that JSON is exact.
+        if isinstance(args, dict) and obj.get("native") is not True:
             args = undo_double_escape(name, args)
         key = f"{name}:{json.dumps(args, sort_keys=True)}"
         if name and key not in seen:
@@ -280,6 +318,21 @@ def strip_tool_calls(text: str) -> str:
 
 
 # ----------------------------------------------------------------------------- tools
+_CD_PREFIX_RE = re.compile(r"^\s*cd\s+(?:/[\w./-]*|~[\w./-]*|\.)\s*(?:&&|;)\s*")
+_CMD_TAIL_RE = re.compile(r"(?:\s*(?:2>&1|2>\s*/dev/null|\|\|\s*true))+\s*$")
+
+
+def normalize_command(command: str) -> str:
+    """
+    Drop shell habits that mean nothing here: a leading `cd /workspace &&` (commands already
+    run in the workspace root; that path does not exist) and a trailing `2>&1` / `|| true`.
+    Native cycles 1-2: `cd /workspace && python -m pytest … 2>&1 || true` was refused up to
+    12 rounds in a row and three tasks ended at max_rounds with correct edits unverified.
+    Mirrors normalizeCommand() in the extension's tools.ts.
+    """
+    return _CMD_TAIL_RE.sub("", _CD_PREFIX_RE.sub("", (command or "").strip())).strip()
+
+
 class Workspace:
     def __init__(self, root: Path):
         self.root = root.resolve()
@@ -410,7 +463,7 @@ class Workspace:
         return True, f"Deleted {args.get('path')}"
 
     def t_run_command(self, args):
-        command = str(args.get("command") or "").strip()
+        command = normalize_command(str(args.get("command") or ""))
         if not command:
             return False, "command is required"
         try:
@@ -424,7 +477,9 @@ class Workspace:
         if head not in ALLOWED_COMMAND_HEADS or re.search(r"[|&;<>`]|\.\.[\\/]", checked):
             return False, (
                 f"Command refused by eval host (allowed: {', '.join(sorted(ALLOWED_COMMAND_HEADS))}; "
-                "no pipes/chaining/redirects/parent paths)."
+                "no pipes/chaining/redirects/parent paths). Commands already run in the workspace "
+                "root: send ONE plain command with no cd, e.g. `python -m pytest -q`. Sending this "
+                "same command again will be refused again."
             )
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         try:
@@ -445,7 +500,31 @@ class Workspace:
 
 
 # ------------------------------------------------------------------ prompt assembly
-def format_catalog() -> str:
+NATIVE_PROFILE_RULES = [
+    "Rules:",
+    "- Prefer RESEARCH tools before writing product files on non-trivial tasks.",
+    "- After search_text, read_file with startLine/endLine around hits (avoid whole-file reads).",
+    "- Use search_text to discover related files that must change together.",
+    "- You may CREATE/EDIT any path in the workspace (not only the open/attached file).",
+    "- After tool results appear in [AGENT TOOL TRANSCRIPT], continue or finish — do not invent results.",
+    "- Approved plans: EXECUTE all planned files in this turn (every path) → VERIFY → talk to the user in prose.",
+    "- Finish by talking to the user in short prose with no tool call (no ### Summary card).",
+]
+
+
+def format_catalog(native: bool | None = None) -> str:
+    if native_tools_enabled() if native is None else native:
+        return "\n".join([
+            "[AVAILABLE TOOLS — profile:full; native function calling]",
+            "Call the tools with your native tool-call format. Parameter values are raw text:",
+            "write code exactly as it must appear in the file — no JSON, no escaping.",
+            "Make one call, then stop; the host tells you when to make the next one.",
+            "Several calls can be queued in one turn (e.g. every file you need to read).",
+            "",
+            *NATIVE_PROFILE_RULES,
+            "",
+            "Tools: " + ", ".join(n for n, _a, _d in TOOL_CATALOG) + " (parameters are in the tool definitions).",
+        ])
     lines = [f"- {n}({a}): {d}" for n, a, d in TOOL_CATALOG]
     return "\n".join([
         "[AVAILABLE TOOLS — profile:full; ChatRouter has no native function-calling; use fences]",
@@ -785,6 +864,33 @@ def searches_since_last_edit(entries: list[TranscriptEntry], cap: int = 12) -> l
     return lines
 
 
+def failed_reruns_without_edit(entries: list[TranscriptEntry]) -> tuple[int, str]:
+    """
+    (count, last output) of failed run_command results since the last successful edit.
+    Native cycle 4, rename-symbol: the same failing pytest ran 9 rounds in a row
+    (`NameError: name 'calc_total' is not defined`, shopkit\\cart.py:13) with no edit between.
+    """
+    count, last = 0, ""
+    for e in reversed(entries):
+        if e.name in _EDIT_TOOLS and e.ok:
+            break
+        if e.name == "run_command" and not e.ok and e.result.startswith("exit "):
+            count += 1
+            last = last or e.result
+    return count, last
+
+
+def _error_lines(output: str, cap: int = 6) -> list[str]:
+    """The lines of a test run that name the fault: pytest `E ` lines, file:line refs, Error lines."""
+    picked = [ln.rstrip() for ln in output.splitlines()
+              if re.match(r"\s*(E\s|FAILED\b|\S+\.(?:py|js|mjs|ts):\d+)", ln) or re.search(r"\b\w*Error\b", ln)]
+    seen: list[str] = []
+    for ln in picked:
+        if ln and ln not in seen:
+            seen.append(ln[:200])
+    return seen[:cap]
+
+
 def build_research_status(entries: list[TranscriptEntry]) -> str:
     """Mirror of buildResearchStatus() in the extension's toolProtocol.ts."""
     if not entries:
@@ -815,6 +921,16 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
         stuck = repeated_failure_paths(entries)
         return ("[RESEARCH STATUS — from the host]\nThe same edit failed more than once for: "
                 + ", ".join(stuck) + ". Send the COMPLETE file(s) in a path fence (```lang path=…) now.")
+    reruns, last_output = failed_reruns_without_edit(entries)
+    if reruns >= 2:
+        return "\n".join([
+            "[RESEARCH STATUS — from the host]",
+            f"The tests failed {reruns} times in a row and you edited nothing in between. Running "
+            "them again will fail the same way. The failure names:",
+            *(_error_lines(last_output) or [last_output[-300:]]),
+            "Your next reply MUST edit the file and line named above (read_file it first only if "
+            "its current content is not shown above), and only then run the tests again.",
+        ])
     blind = edit_rounds_since_test(entries)
     if blind >= 3:
         return "\n".join([
@@ -838,6 +954,18 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
     ]
     read_now = [p for p in read_now if p]
     if not read_now:
+        # Native cycle 4: after its edits the reads left the working set, so this returned ""
+        # and the same search repeated every round with no status at all.
+        if re_searched and not repeated_failure_paths(entries):
+            query, hits = re_searched
+            return "\n".join([
+                "[RESEARCH STATUS — from the host]",
+                f"You already searched {query!r} and nothing was edited since. The answer is still:",
+                hits,
+                "Searching again will not change it. Your next reply MUST edit each line listed above "
+                "(search_replace), then search once more and run the tests.",
+                *edit_templates(hits),
+            ])
         return ""
     edited = any(e.name in _EDIT_TOOLS and e.ok for e in entries)
     last_round = entries[-1].round
@@ -909,6 +1037,8 @@ def _ask(prompt: str, *, timeout_sec: float) -> dict[str, Any]:
         "blossom_tier": "full",
         "blossom_defer_cloud": True,  # never spend cloud credits from the eval
     }
+    if native_tools_enabled():
+        payload["tools"] = native_tool_schemas()
     resp = requests.post(chat_router_url(), json=payload,
                          headers={"X-Blossom-Client": "assistant"}, timeout=timeout_sec)
     resp.raise_for_status()

@@ -6,6 +6,7 @@ project-refactor training cycles.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from blossom_eval.agent_loop import (
@@ -15,8 +16,12 @@ from blossom_eval.agent_loop import (
     claims_unrun_work,
     build_research_status,
     build_round_prompt,
+    failed_reruns_without_edit,
     format_transcript,
+    format_catalog,
     green_idle_rounds,
+    native_tool_schemas,
+    normalize_command,
     parse_tool_calls,
     repair_json_escapes,
     repair_unescaped_quotes,
@@ -382,3 +387,77 @@ def test_new_files_and_own_writes_need_no_read(tmp_path: Path):
     ws = Workspace(tmp_path)
     assert ws.run("write_file", {"path": "src/new.js", "content": "a"})[0]
     assert ws.run("write_file", {"path": "src/new.js", "content": "b"})[0]
+
+
+# ---------------------------------------------------------------- native tool calls
+def _native_fence(name: str, arguments: dict) -> str:
+    # Same serialization as ChatRouter._native_call_fence.
+    body = json.dumps({"name": name, "arguments": arguments, "native": True}, ensure_ascii=False)
+    return f"\n{FENCE}tool_call\n{body.replace('`', chr(92) + 'u0060')}\n{FENCE}\n"
+
+
+def test_native_fence_round_trips_code_with_backticks_and_literal_newlines():
+    # A one-line string with two literal "\n" would be "un-double-escaped" in a hand-written
+    # fence; a markdown file with ``` would close the fence early. Neither may touch a native call.
+    old = r'print("a\nb\n")'
+    doc = f"# Title\n\n{FENCE}js\nconst s = `x${{y}}`;\n{FENCE}\n"
+    text = _native_fence("search_replace", {"path": "a.py", "old_string": old, "new_string": "pass"}) \
+        + _native_fence("write_file", {"path": "README.md", "content": doc})
+    calls = parse_tool_calls(text)
+    assert [c["name"] for c in calls] == ["search_replace", "write_file"]
+    assert calls[0]["arguments"]["old_string"] == old
+    assert calls[1]["arguments"]["content"] == doc
+    assert strip_tool_calls("Reading.\n" + text) == "Reading."
+
+
+def test_native_schemas_cover_the_catalog_and_mark_required_params():
+    tools = {t["function"]["name"]: t["function"]["parameters"] for t in native_tool_schemas()}
+    assert set(tools) >= {"read_file", "search_replace", "write_file", "delete_file", "run_command"}
+    assert tools["search_replace"]["required"] == ["path", "old_string", "new_string"]
+    assert tools["read_file"]["properties"]["startLine"] == {"type": "integer"}
+    assert tools["search_replace"]["properties"]["replace_all"] == {"type": "boolean"}
+
+
+def test_native_catalog_never_asks_for_json_fences():
+    native, fence = format_catalog(native=True), format_catalog(native=False)
+    assert "tool_call" not in native.replace("tool-call", "") and "native" in native
+    assert FENCE + "tool_call" in fence
+
+
+def test_container_cd_prefix_and_shell_tails_are_dropped(tmp_path: Path):
+    # Native cycles 1-2: verbatim commands refused up to 12 rounds in a row.
+    assert normalize_command("cd /workspace && python -m pytest tests/test_pricing.py -q 2>&1 || true") \
+        == "python -m pytest tests/test_pricing.py -q"
+    assert normalize_command("cd /tmp/blossom-agent-rename-symbol-716lbykm/ws && python -m pytest -q") \
+        == "python -m pytest -q"
+    assert normalize_command("cd src && ls") == "cd src && ls"  # a real relative cd is not ours to drop
+    (tmp_path / "ok.py").write_text("print('ran')\n", encoding="utf-8")
+    ok, res = Workspace(tmp_path).run("run_command", {"command": "cd /workspace && python ok.py 2>&1 || true"})
+    assert ok and "ran" in res
+
+
+_NAME_ERROR_RUN = (
+    "exit 1\n.F.   [100%]\n___ test_cart_and_checkout ___\n\n    def total(self):\n"
+    ">       return calc_total(self.items, self.tax_rate)\n"
+    "E       NameError: name 'calc_total' is not defined\n\nshopkit\\cart.py:13: NameError\n1 failed, 2 passed in 0.04s"
+)
+
+
+def test_failing_tests_rerun_without_an_edit_get_a_status_naming_the_fault():
+    # Native cycle 4, rename-symbol: this pytest failed 9 rounds in a row, no edit between.
+    edit = TranscriptEntry(3, "search_replace", {"path": "shopkit/pricing.py"}, "Edited shopkit/pricing.py", True)
+    runs = [TranscriptEntry(r, "run_command", {"command": "python -m pytest -q"}, _NAME_ERROR_RUN, False) for r in (5, 6)]
+    assert failed_reruns_without_edit([edit, *runs])[0] == 2
+    status = build_research_status([edit, *runs])
+    assert "failed 2 times in a row" in status and "shopkit\\cart.py:13" in status
+    assert "NameError: name 'calc_total' is not defined" in status and "MUST edit" in status
+    fixed = TranscriptEntry(7, "search_replace", {"path": "shopkit/cart.py"}, "Edited shopkit/cart.py", True)
+    assert failed_reruns_without_edit([edit, *runs, fixed])[0] == 0
+
+
+def test_repeated_search_is_reported_even_when_no_file_is_in_the_working_set():
+    # Native cycle 4: the reads were summarized away after the edits and the status came back empty.
+    hits = "shopkit/cart.py:13: return calc_total(self.items, self.tax_rate)"
+    entries = [TranscriptEntry(r, "search_text", {"query": "calc_total"}, hits, True) for r in (4, 5)]
+    status = build_research_status(entries)
+    assert "You already searched 'calc_total'" in status and "shopkit/cart.py:13" in status
