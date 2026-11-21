@@ -25,12 +25,17 @@ the coder, the host runs the test command through `confirmRunCommand` (so
 with a stub `vscode`. Differences from the eval: path-fence-only rounds (no tool calls) do
 not trigger it, and a red host test does not need the "keep the turn going" rule because
 tool rounds always continue.
+**Sixth part (2026-11-21, committed: Blossom `194878c`, Blossom Assistant `c32ce25`, built
+and installed as 0.1.67 in Cursor and VS Code):** host checks on the coder's own edits,
+three new tasks (corpus is now 8), an A/B runner, and a timeout that kills the whole
+process tree. A/B over 8 tasks, 3 alternating cycles each: **hardening ON 19/24 (7, 6, 6),
+OFF 15/24 (4, 6, 5)**. Details in "Sixth part" below.
 
 **START HERE next session:**
 1. `git status` in both repos. Ask the user before committing. Leave
    `Mind/llama-server.model` unstaged in Blossom. Note: `tools.ts` has mixed CRLF/LF line
    endings; the Edit tool normalizes some lines — check `git diff` shows only real hunks.
-2. Smoke-test in real VS Code (everything through `dbd4fb4` is installed; reload the window
+2. Smoke-test in real VS Code (everything through `c32ce25` is installed; reload the window
    first) on a small project with tests: askBeforeRun on → expect a Run prompt after the
    first edit round; Deny → no more prompts that turn. Not done yet.
 3. Rebuild + reinstall after extension changes: `npm run compile`, `npm run package`,
@@ -75,8 +80,73 @@ leave it alone.
 | 8 | 2/5 | Fabricated "### Summary … All tests pass" with zero tool calls; missing `}`; two bare tool_call lines lost one. |
 | 9 | **5/5** | First clean sweep. |
 | 10 | **4/5** | Confirmation. rename-symbol hit max rounds; many recovered malformed calls. |
+| 11 (2026-11-21, host tests on, fence) | 4/5 | rename-symbol: green after round 2, then its own `search_replace` turned `def test_calc_total_with_tax()` into `def test_compute_order_total_with_tax` (dropped `()`). It saw the SyntaxError (pytest + `ast.parse`) but read the line as valid for 12 rounds and rewrote the file twice with the same bug. Model error, not host repair. Idea: warn when a search_replace changes non-identifier characters (here `()`) in what looks like a rename. |
+
+### Sixth part (2026-11-21): host checks, 8 tasks, A/B runner
+
+**Finding that shaped it.** The coder cannot see a missing `()`. In cycle 11 and again in
+A/B run `rw-on2` its own rename edit wrote `def test_compute_order_total_with_tax:`. Told
+"removed: ()", it answered "the colon was removed" and judged the line valid. A warning
+alone does not fix this (rename-warning A/B on 5 tasks: on 14/15, off 12/15, but the warning
+fired once and that run still failed — the gap is noise). So the host repairs it.
+
+**Host checks** (`tools/eval/blossom_eval/host_checks.py`; extension:
+`src/agent/hostChecks.ts`). Master switch `BLOSSOM_EVAL_HARDEN` (default 1); each check has
+its own `BLOSSOM_EVAL_<NAME>`:
+
+| Check | Switch | In extension |
+|-------|--------|--------------|
+| Syntax check after an edit (.py, .json, .js/.mjs/.cjs) | `SYNTAX_CHECK` | yes |
+| Diff of everything changed since the tests last passed, shown on a regression; research status points at it first (`REGRESSION_MARKER`) | `GREEN_DIFF` | yes |
+| Real closest text when a `search_replace` old_string is not found | `NEAR_MISS` | yes |
+| Rename-shaped edit that drops punctuation: host restores it if the file then parses ("HOST FIX: …") | `PUNCT_REPAIR` | yes |
+| Warning for the same case, punctuation spelled out in words | `RENAME_WARN` | yes |
+| One re-ask when a reply has malformed tool calls; the reply with fewer is kept | `RESAMPLE` | no (eval only) |
+| Unread overwrite is refused with the file's current content | `SHOW_UNREAD` | no (eval only) |
+
+**Timeout fix.** `subprocess.run(shell=True, timeout=…)` killed only the shell; a hung
+`npm test` (`node --test`) kept the pipe open and stalled cycle `off3` for 83 minutes.
+Now `blossom_eval/proc.py::run_shell` (used by `t_run_command` and the scorer) and the
+extension's `processTree.ts::killProcessTree` (foreground and background `run_command`)
+kill the whole tree (`taskkill /T /F` on Windows) and bound the wait for the pipes.
+
+**Corpus is 8 tasks**: added `print-to-logging`, `dict-to-dataclass`, `callbacks-to-async`.
+All 8 references pass; a dry run fails all 8 on acceptance, as intended. No PHP task: PHP
+is not installed here.
+
+**A/B, all hardening on vs off** (8 tasks, 3 alternating cycles each):
+
+| Task | ON | OFF |
+|------|----|-----|
+| callbacks-to-async | 3/3 | 2/3 |
+| cjs-to-esm | 1/3 | 2/3 |
+| dict-to-dataclass | 3/3 | 1/3 |
+| extract-helpers | 2/3 | 3/3 |
+| globals-to-di | 2/3 | 3/3 |
+| print-to-logging | 3/3 | 2/3 |
+| rename-symbol | 2/3 | 1/3 |
+| split-module | 3/3 | 1/3 |
+| **Total** | **19/24** | **15/24** |
+
+Failed tool calls per task run: 1.8 on, 3.0 off. Notes shown in the ON arm: near-miss 22,
+re-asked rounds 19, syntax error 3, regression diff 3, rename warning/repair 0. Caveats:
+24 runs per arm is still a small sample; `off3` callbacks-to-async includes the 83-minute
+hang (it passed anyway); the punctuation repair never fired in this A/B, so it is covered
+by tests only.
+
+**What still fails** (ON arm, 5 runs): four hit max rounds with red tests (`on2`
+extract-helpers and globals-to-di, `on3` cjs-to-esm and rename-symbol), and `on1`
+cjs-to-esm "finished" after 4 rounds with ZERO edits (ran the tests, saw green, stopped;
+same in `off2` print-to-logging). Next lever: do not accept
+"finished" when nothing was edited on a task that asks for a change.
+
+**Tests:** `tools/eval`: `python -m pytest -q -p no:cacheprovider test_agent_loop.py
+test_eval_harness.py test_host_checks.py test_proc.py` → 67 pass. Extension: 11
+`npm run test:*` scripts pass (`test:host-checks` 9 checks, `test:host-tests` 15).
 
 ### Next: hardening (recommended order)
+
+0. **Reject a zero-edit "finished"** (see "What still fails" above), in both hosts.
 
 1. **Native tool calls.** llama-server already runs with `--jinja`
    (`LlamaServerManager.py`); ChatRouter does not pass `tools`. **Probed 2026-11-20
@@ -120,12 +190,25 @@ leave it alone.
    `BLOSSOM_EVAL_HOST_TESTS=0` turns it off. Note the harness's
    `ran_tests_after_last_edit` / `verified_green` now also count host runs. Mirrored in
    the extension 2026-11-21 (uncommitted; see "Fifth part" at the top).
-3. **Re-sample a round once** when it has malformed calls, before reporting an error.
-4. **Writes as path fences only** (no code inside JSON strings).
-5. **Measure with N=3 runs per task** + 2–3 new tasks (PHP modernization) to avoid overfitting five tasks.
+3. **Re-sample a round once** when it has malformed calls — done in the eval loop
+   (`RESAMPLE`), not in the extension yet.
+4. **Writes as path fences only** — skipped: it breaks on files that contain code fences
+   (README), and the rules file is shared with the real router.
+5. **Measure with N=3 runs per task** + new tasks — done (8 tasks, `scripts/run_ab.ps1`).
+   Mirror `RESAMPLE` and `SHOW_UNREAD` into the extension if they keep paying off.
 6. LoRA on the clean trajectories in the run logs — only with the user's approval.
 
-### A/B scripts (scratchpad — recreate if the temp folder was cleaned)
+### A/B scripts
+
+**In the repo (use these):** `tools/eval/scripts/run_ab.ps1 -Out <dir> -Var
+BLOSSOM_EVAL_HARDEN -Cycles 3 [-Task …] [-Port 8093]` alternates the variable 1/0 over full
+cycles (writes `<Out>\on1.log`, `<Out>\runs\on1\<task>\…`; refuses port 8083).
+`python tools/eval/scripts/ab_summary.py <Out>` prints the per-task table, per-cycle
+scores, mean rounds / failures and host-note counts. An 8-task cycle takes 12–30 minutes.
+Do not edit `agent_loop.py`, `host_checks.py`, `harness.py` or the corpus while an A/B
+runs: every cycle is a fresh process that reloads them.
+
+Older scratchpad scripts (recreate if the temp folder was cleaned):
 
 `run_cycles.ps1 -Names a,b -Native 0|1` runs full cycles in sequence against the test
 router on `:8093`, writing `<name>.log` and `runs\<name>\`. `run_ab.ps1` alternates
