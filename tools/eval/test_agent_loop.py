@@ -20,6 +20,8 @@ from blossom_eval.agent_loop import (
     format_transcript,
     format_catalog,
     green_idle_rounds,
+    detect_test_command,
+    host_test_entry,
     native_tool_schemas,
     normalize_command,
     parse_tool_calls,
@@ -461,3 +463,24 @@ def test_repeated_search_is_reported_even_when_no_file_is_in_the_working_set():
     entries = [TranscriptEntry(r, "search_text", {"query": "calc_total"}, hits, True) for r in (4, 5)]
     status = build_research_status(entries)
     assert "You already searched 'calc_total'" in status and "shopkit/cart.py:13" in status
+
+
+def test_host_runs_the_tests_after_an_edit_round_unless_the_coder_did(tmp_path: Path):
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text("def test_x():\n    assert 1 + 1 == 2\n", encoding="utf-8")
+    assert detect_test_command(tmp_path) == "python -m pytest -q"
+    ws = Workspace(tmp_path)
+    edit = TranscriptEntry(2, "search_replace", {"path": "a.py"}, "Edited a.py", True)
+    entry = host_test_entry(ws, [edit], 2)
+    assert entry and entry.ok and entry.args == {"command": "python -m pytest -q", "by": "host"}
+    assert entry.result.startswith("exit 0") and "host ran this automatically" in entry.result
+    own_run = TranscriptEntry(2, "run_command", {"command": "pytest -q"}, "exit 0", True)
+    assert host_test_entry(ws, [edit, own_run], 2) is None           # the coder already ran them
+    assert host_test_entry(ws, [TranscriptEntry(2, "read_file", {"path": "a.py"}, "x", True)], 2) is None
+
+
+def test_test_command_comes_from_package_json(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "node --test test/*.test.js"}}', encoding="utf-8")
+    assert detect_test_command(tmp_path) == "npm test"
+    (tmp_path / "package.json").write_text('{"scripts": {"test": "echo \\"Error: no test specified\\" && exit 1"}}', encoding="utf-8")
+    assert detect_test_command(tmp_path) is None

@@ -795,6 +795,48 @@ def repeated_searches(entries: list[TranscriptEntry]) -> tuple[str, str] | None:
 _TEST_CMD_RE = re.compile(r"\b(pytest|unittest|node\s+--test|npm\s+(run\s+)?test)\b", re.I)
 
 
+HOST_TEST_NOTE = ("(The host ran this automatically after your edits. Do not run it again "
+                  "until you have edited something.)")
+
+
+def host_tests_enabled() -> bool:
+    """Host runs the project's tests after every round that edited a file (BLOSSOM_EVAL_HOST_TESTS=0 = off)."""
+    return os.getenv("BLOSSOM_EVAL_HOST_TESTS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def detect_test_command(root: Path) -> str | None:
+    """The project's own test command: the package.json test script, else pytest when test files exist."""
+    pkg = root / "package.json"
+    if pkg.is_file():
+        try:
+            script = str((json.loads(pkg.read_text(encoding="utf-8")).get("scripts") or {}).get("test") or "")
+        except (json.JSONDecodeError, OSError, AttributeError):
+            script = ""
+        if script and "no test specified" not in script:
+            return "npm test"
+    patterns = ("test_*.py", "*_test.py", "tests/test_*.py", "tests/*_test.py", "test/test_*.py")
+    if any(next(root.glob(pat), None) for pat in patterns):
+        return "python -m pytest -q"
+    return None
+
+
+def host_test_entry(ws: "Workspace", round_entries: list[TranscriptEntry], round_no: int) -> TranscriptEntry | None:
+    """
+    Run the tests for the coder after a round that changed files, unless it ran them itself.
+    A/B 2026-11-20: with edits landing cleanly, runs still failed by finishing or circling
+    without a real test result after the last edit; the host can supply that result every time.
+    """
+    if not any(e.ok and e.name in _EDIT_TOOLS for e in round_entries):
+        return None
+    if any(e.name == "run_command" and _TEST_CMD_RE.search(str(e.args.get("command") or "")) for e in round_entries):
+        return None
+    command = detect_test_command(ws.root)
+    if not command:
+        return None
+    ok, res = ws.run("run_command", {"command": command})
+    return TranscriptEntry(round_no, "run_command", {"command": command, "by": "host"}, f"{res}\n{HOST_TEST_NOTE}", ok)
+
+
 def verified_after_last_edit(entries: list[TranscriptEntry]) -> bool:
     """A test command succeeded after the last successful edit (the work is proven)."""
     last_edit = max((i for i, e in enumerate(entries) if e.name in _EDIT_TOOLS and e.ok), default=-1)
@@ -1130,6 +1172,9 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
             log.transcript.append(TranscriptEntry(round_i + 1, call["name"], call["arguments"], res, ok))
             if ok and call["name"] in {"search_replace", "write_file", "delete_file"}:
                 log.edits.append(str(call["arguments"].get("path")))
+        host_test = host_test_entry(ws, log.transcript[round_start:], round_i + 1) if host_tests_enabled() else None
+        if host_test:
+            log.transcript.append(host_test)
         ws.end_round()
 
         round_rec = {
@@ -1139,6 +1184,8 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
         }
         if blocked:
             round_rec["blocked_check_calls"] = blocked
+        if host_test:
+            round_rec["host_test"] = "pass" if host_test.ok else "fail"
         log.rounds.append(round_rec)
         if log_dir:
             (log_dir / f"round-{round_i + 1:02d}.prompt.md").write_text(prompt, encoding="utf-8")
@@ -1154,6 +1201,8 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
             last_prose = prose
         if blocked and host_note == VERIFIED_STOP_NOTE:
             continue  # first verified-idle block: one more round for the summary
+        if not calls and host_test and not host_test.ok and round_i + 1 < max_rounds:
+            continue  # the failing result is in the transcript; the coder gets a round to fix it
         if not calls:
             if blocked:
                 log.final_text = prose

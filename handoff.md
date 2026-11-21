@@ -5,11 +5,27 @@ cycle 10 = 4/5. Caveat: passes still lean on host recovery (cycle 10 tool failur
 cjs-to-esm 25, globals-to-di 18, split-module 11 — mostly malformed JSON), so the
 next step is reliability (see "Next: hardening" below), not more one-off patches.
 Committed: Blossom `738417b`, Blossom Assistant `e016c00` (earlier: `e3ebef8` / `839fda9`).
-**Third part of the session (native tool calls, NOT committed):** implemented and
-A/B-tested — fence 11/15 vs native 10/15 over 3 alternating cycles each, so no
-measured gain; native is opt-in. The real pass rate is ~70%, with high run-to-run
-variance. The user said: do NOT seed lessons into the real Mind until scores are
-more robust.
+**Third part of the session (committed: Blossom `1c0efea`, Blossom Assistant `e05f643`):**
+native tool calls implemented and A/B-tested — fence 11/15 vs native 10/15 over 3
+alternating cycles each, so no measured gain; native is opt-in (off).
+**Fourth part (NOT committed, eval loop only):** the host runs the project's tests
+after every edit round. A/B, fence mode, alternating: host tests ON 4, 5, 5 (14/15);
+OFF 4, 3, 4 (11/15). First change that clearly moved the pass rate (3 cycles each; small sample).
+
+**START HERE next session:**
+1. `git status` in both repos. Uncommitted in Blossom: `tools/eval/blossom_eval/agent_loop.py`,
+   `tools/eval/test_agent_loop.py` (host-run tests, 47 tests pass), `handoff.md`.
+   Ask the user before committing. Leave `Mind/llama-server.model` unstaged.
+2. If the user agrees, mirror host-run tests into the extension
+   (`orchestrator.ts`: after a round with a successful edit and no test command, run the
+   detected test command and add it to the transcript). It runs a command in the user's
+   workspace unasked, so it needs their OK and must respect `commands.askBeforeRun`.
+3. The extension has not been rebuilt/reinstalled since `839fda9`; nothing from this
+   session is live in VS Code until `compile.bat` + package/install the `.vsix`.
+4. User decisions that still hold: do NOT seed lessons into the real Mind, and hold off
+   on seeding experiments too ("hold off on seeding for now"), until scores are robust.
+5. Judge every change on 3+ alternating cycles (scripts below), never on one cycle:
+   identical code has scored anywhere from 1/5 to 5/5.
 
 Full technical record of the session (architecture of the loops, cycle-by-cycle
 findings, every correction and why): [`tools/eval/TRAINING.md`](tools/eval/TRAINING.md).
@@ -82,13 +98,29 @@ leave it alone.
    - Conclusion: format is not the bottleneck any more; variance is. Five tasks × one
      run cannot tell a 70% loop from an 80% one — measure with ≥3 cycles before judging
      any change (a cycle takes 5–11 minutes).
-2. **Host-run tests** after every edit round (test command from package.json / pytest).
+2. **Host-run tests** after every edit round — **done in the eval loop 2026-11-20
+   (uncommitted)**: `detect_test_command` (`npm test` when package.json has a test
+   script, else `python -m pytest -q` when test files exist) and `host_test_entry` in
+   `agent_loop.py`; the result is appended to the transcript as a `run_command` with
+   `"by": "host"`, and a red host test keeps the turn from ending that round.
+   `BLOSSOM_EVAL_HOST_TESTS=0` turns it off. Note the harness's
+   `ran_tests_after_last_edit` / `verified_green` now also count host runs. Not in the
+   extension yet (see START HERE).
 3. **Re-sample a round once** when it has malformed calls, before reporting an error.
 4. **Writes as path fences only** (no code inside JSON strings).
 5. **Measure with N=3 runs per task** + 2–3 new tasks (PHP modernization) to avoid overfitting five tasks.
 6. LoRA on the clean trajectories in the run logs — only with the user's approval.
 
-### Second session (uncommitted) — every fix is in BOTH `agent_loop.py` and the extension
+### A/B scripts (scratchpad — recreate if the temp folder was cleaned)
+
+`run_cycles.ps1 -Names a,b -Native 0|1` runs full cycles in sequence against the test
+router on `:8093`, writing `<name>.log` and `runs\<name>\`. `run_ab.ps1` alternates
+fence/native; `run_ab2.ps1` alternates `BLOSSOM_EVAL_HOST_TESTS` 1/0. `fails.py
+<transcript.json>…` lists the failed tool calls of a run. A cycle takes 5–11 minutes.
+The test router must be restarted after any `ChatRouter.py` change (it does not reload),
+and it binds to `CHAT_ROUTER_HOST`, not 127.0.0.1 — check port 8093 is free first.
+
+### Second session (committed in `738417b` / `e016c00`) — every fix is in BOTH `agent_loop.py` and the extension
 
 Items 15–18 (cycles 7–8): double-escape decode (`undoDoubleEscape`), stray `)` and
 missing-`}` repair (`balanceBraces`), every fence closed before the next opener,
