@@ -8,20 +8,34 @@ Committed: Blossom `738417b`, Blossom Assistant `e016c00` (earlier: `e3ebef8` / 
 **Third part of the session (committed: Blossom `1c0efea`, Blossom Assistant `e05f643`):**
 native tool calls implemented and A/B-tested — fence 11/15 vs native 10/15 over 3
 alternating cycles each, so no measured gain; native is opt-in (off).
-**Fourth part (NOT committed, eval loop only):** the host runs the project's tests
+**Fourth part (committed: Blossom `cf10a07`, eval loop):** the host runs the project's tests
 after every edit round. A/B, fence mode, alternating: host tests ON 4, 5, 5 (14/15);
 OFF 4, 3, 4 (11/15). First change that clearly moved the pass rate (3 cycles each; small sample).
+**Fifth part (2026-11-21, extension, committed Blossom Assistant `dbd4fb4`, built and
+installed as 0.1.67 in Cursor and VS Code):** host-run tests mirrored into
+Blossom Assistant. `toolProtocol.ts`: `isTestCommand`, `pickTestCommand`,
+`shouldHostRunTests`, `HOST_TEST_NOTE`; `tools.ts`: `detectWorkspaceTestCommand` (primary
+root: package.json test script, else `test_*.py`/`*_test.py` in `.`, `tests/`, `test/`);
+`orchestrator.ts`: `deliverPendingEdit` now returns whether it applied; after a ChatRouter
+tool round with ≥1 applied edit, NO edit left waiting for Apply, and no test command from
+the coder, the host runs the test command through `confirmRunCommand` (so
+`commands.askBeforeRun` / allowlist / fast mode apply) and pushes a `run_command` entry with
+`by: "host"` + `HOST_TEST_NOTE`. A Deny turns it off for the rest of the turn. Setting
+`blossom.agent.hostRunsTests` (default on). `tsc --noEmit` clean; helpers checked in node
+with a stub `vscode`. Differences from the eval: path-fence-only rounds (no tool calls) do
+not trigger it, and a red host test does not need the "keep the turn going" rule because
+tool rounds always continue.
 
 **START HERE next session:**
-1. `git status` in both repos. Uncommitted in Blossom: `tools/eval/blossom_eval/agent_loop.py`,
-   `tools/eval/test_agent_loop.py` (host-run tests, 47 tests pass), `handoff.md`.
-   Ask the user before committing. Leave `Mind/llama-server.model` unstaged.
-2. If the user agrees, mirror host-run tests into the extension
-   (`orchestrator.ts`: after a round with a successful edit and no test command, run the
-   detected test command and add it to the transcript). It runs a command in the user's
-   workspace unasked, so it needs their OK and must respect `commands.askBeforeRun`.
-3. The extension has not been rebuilt/reinstalled since `839fda9`; nothing from this
-   session is live in VS Code until `compile.bat` + package/install the `.vsix`.
+1. `git status` in both repos. Ask the user before committing. Leave
+   `Mind/llama-server.model` unstaged in Blossom. Note: `tools.ts` has mixed CRLF/LF line
+   endings; the Edit tool normalizes some lines — check `git diff` shows only real hunks.
+2. Smoke-test in real VS Code (everything through `dbd4fb4` is installed; reload the window
+   first) on a small project with tests: askBeforeRun on → expect a Run prompt after the
+   first edit round; Deny → no more prompts that turn. Not done yet.
+3. Rebuild + reinstall after extension changes: `npm run compile`, `npm run package`,
+   `cursor|code --install-extension blossom-assistant-<ver>.vsix --force` (`install.bat`
+   does the same but ends in `pause`).
 4. User decisions that still hold: do NOT seed lessons into the real Mind, and hold off
    on seeding experiments too ("hold off on seeding for now"), until scores are robust.
 5. Judge every change on 3+ alternating cycles (scripts below), never on one cycle:
@@ -104,8 +118,8 @@ leave it alone.
    `agent_loop.py`; the result is appended to the transcript as a `run_command` with
    `"by": "host"`, and a red host test keeps the turn from ending that round.
    `BLOSSOM_EVAL_HOST_TESTS=0` turns it off. Note the harness's
-   `ran_tests_after_last_edit` / `verified_green` now also count host runs. Not in the
-   extension yet (see START HERE).
+   `ran_tests_after_last_edit` / `verified_green` now also count host runs. Mirrored in
+   the extension 2026-11-21 (uncommitted; see "Fifth part" at the top).
 3. **Re-sample a round once** when it has malformed calls, before reporting an error.
 4. **Writes as path fences only** (no code inside JSON strings).
 5. **Measure with N=3 runs per task** + 2–3 new tasks (PHP modernization) to avoid overfitting five tasks.
