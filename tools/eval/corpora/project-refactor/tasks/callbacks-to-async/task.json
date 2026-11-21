@@ -1,0 +1,32 @@
+{
+  "id": "callbacks-to-async",
+  "title": "Convert a callback-style Node API to async/await",
+  "domain": "javascript",
+  "tags": [
+    "javascript",
+    "node",
+    "async",
+    "api-change",
+    "multi-file"
+  ],
+  "mode": "agent",
+  "prompt": "This Node project (ES modules) uses error-first callbacks everywhere. Convert it to async/await: every exported function and method in src/ that takes a callback must instead return a Promise and take no callback argument. Where a function passed an Error to its callback it must now reject (throw) with the same message. Keep the same exports from src/index.js and the same results. Convert the tests in test/ to async/await too, and keep `npm test` passing.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {
+      "id": "visible_tests",
+      "type": "command",
+      "command": "node --test test/*.test.js",
+      "expect_exit": 0,
+      "description": "Project's own tests pass"
+    },
+    {
+      "id": "acceptance",
+      "type": "command",
+      "command": "node _acceptance/accept.mjs",
+      "expect_exit": 0,
+      "description": "Hidden acceptance checks pass"
+    }
+  ]
+}

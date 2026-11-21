@@ -18,7 +18,6 @@ import json
 import os
 import re
 import shlex
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +27,11 @@ import requests
 
 from .apply import extract_file_writes
 from .client import chat_router_url
+from .proc import run_shell
+from .host_checks import (
+    GreenTracker, flag, near_miss_hint, punctuation_in_words, restore_dropped_punctuation,
+    syntax_error_note, syntax_warning,
+)
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\r?\n([\s\S]*?)```", re.IGNORECASE)
 _VALID_ESCAPES = set('\\"/bfnrtu')
@@ -431,7 +435,9 @@ class Workspace:
         text = path.read_text(encoding="utf-8")
         count = text.count(old)
         if count == 0:
-            return False, "old_string not found in file (must match exactly, including whitespace; no 'N| ' prefixes)"
+            hint = near_miss_hint(text, str(old)) if flag("NEAR_MISS") else ""
+            return False, ("old_string not found in file (must match exactly, including whitespace; "
+                           "no 'N| ' prefixes)" + (f"\n{hint}" if hint else ""))
         if count > 1 and not args.get("replace_all"):
             return False, f"old_string matches {count} times; add context to make it unique or set replace_all"
         text = text.replace(old, new) if args.get("replace_all") else text.replace(old, new, 1)
@@ -445,6 +451,21 @@ class Workspace:
             return False, "content is required"
         existed = path.exists()
         if existed and path not in self._known:
+            # 6 refusals in cycle 11 alone, each costing a read round: show the file with the
+            # refusal instead, and count that as the read (it is in the next prompt).
+            current = ""
+            if flag("SHOW_UNREAD") and path.is_file():
+                try:
+                    current = path.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    current = ""
+            if current and len(current) <= MAX_RESULT_CHARS:
+                self._read_this_round.add(path)
+                return False, (
+                    f"Refused: {args.get('path')} exists and you had not read it — NOT written, nothing "
+                    "changed. Its current content is below. Next round, write it again starting from "
+                    "this content (keep what the task does not ask you to change):\n" + _numbered(current)
+                )
             return False, (
                 f"Refused: {args.get('path')} exists and you have not read it yet — NOT written, "
                 "nothing changed. Overwriting a file you have not seen replaces real content with "
@@ -483,13 +504,14 @@ class Workspace:
             )
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         try:
-            proc = subprocess.run(
-                command, shell=True, cwd=self.root, capture_output=True, text=True,
-                timeout=COMMAND_TIMEOUT_SEC, env=env, encoding="utf-8", errors="replace",
-            )
-        except subprocess.TimeoutExpired:
-            return False, f"Timed out after {COMMAND_TIMEOUT_SEC}s: {command}"
+            proc = run_shell(command, cwd=self.root, timeout=COMMAND_TIMEOUT_SEC, env=env)
+        except OSError as exc:
+            return False, f"Command failed to start: {exc}"
         out = (proc.stdout + ("\n" + proc.stderr if proc.stderr.strip() else "")).strip()
+        if proc.timed_out:
+            # The host killed the command and everything it started; show what it printed.
+            tail = f"\n{out[-MAX_RESULT_CHARS:]}" if out else ""
+            return False, f"Timed out after {COMMAND_TIMEOUT_SEC}s: {command}{tail}"
         return proc.returncode == 0, f"exit {proc.returncode}\n{out[-MAX_RESULT_CHARS:]}"
 
     def t_ask_user(self, args):
@@ -804,6 +826,48 @@ def host_tests_enabled() -> bool:
     return os.getenv("BLOSSOM_EVAL_HOST_TESTS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
 
+def rename_warn_enabled() -> bool:
+    """Warn when a rename-shaped search_replace drops punctuation (BLOSSOM_EVAL_RENAME_WARN=0 = off)."""
+    return flag("RENAME_WARN")
+
+
+def _punct(line: str) -> str:
+    return re.sub(r"[\w\s]", "", line)
+
+
+def _is_subsequence(short: str, long: str) -> bool:
+    it = iter(long)
+    return all(ch in it for ch in short)
+
+
+def dropped_punctuation_warning(old: str, new: str) -> str:
+    """
+    A search_replace that renames something on a line AND loses punctuation from it
+    (cycle 11, rename-symbol: `def test_calc_total_with_tax()` → `def test_compute_order_total_with_tax`;
+    the coder saw the SyntaxError but read the line as valid for 12 rounds). Lines are compared
+    pairwise, so only edits with the same line count are checked. Empty string = nothing to say.
+    """
+    old_lines, new_lines = old.splitlines(), new.splitlines()
+    if not old_lines or len(old_lines) != len(new_lines):
+        return ""
+    notes = []
+    for o, n in zip(old_lines, new_lines):
+        wo, wn = re.findall(r"\w+", o), re.findall(r"\w+", n)
+        if wo == wn or len(wo) != len(wn):  # unchanged, or not a rename (words added/removed)
+            continue
+        po, pn = _punct(o), _punct(n)
+        if len(pn) < len(po) and _is_subsequence(pn, po):
+            lost = list(po)
+            for ch in pn:
+                lost.remove(ch)
+            notes.append(f"  was: {o.strip()}\n  now: {n.strip()}\n"
+                         f"  removed: {''.join(lost)}  ({punctuation_in_words(''.join(lost))})")
+    if not notes:
+        return ""
+    return ("WARNING: this edit changed a name AND removed punctuation from the line. "
+            "If you only meant to rename, put the punctuation back:\n" + "\n".join(notes[:3]))
+
+
 def detect_test_command(root: Path) -> str | None:
     """The project's own test command: the package.json test script, else pytest when test files exist."""
     pkg = root / "package.json"
@@ -933,6 +997,30 @@ def _error_lines(output: str, cap: int = 6) -> list[str]:
     return seen[:cap]
 
 
+REGRESSION_MARKER = "[HOST] These tests PASSED at round"
+
+
+def regression_status(entries: list[TranscriptEntry]) -> str:
+    """
+    The latest test run failed and carries the diff since the last passing run: that is the
+    one thing to act on. (rw-on2, rename-symbol round 13: the status still said "send
+    shopkit/__init__.py as a path fence" from an old failure while the test file was broken.)
+    """
+    tests = [e for e in entries
+             if e.name == "run_command" and _TEST_CMD_RE.search(str(e.args.get("command") or ""))]
+    if not tests or tests[-1].ok or REGRESSION_MARKER not in tests[-1].result:
+        return ""
+    m = re.search(r"PASSED at round (\d+)", tests[-1].result)
+    return "\n".join([
+        "[RESEARCH STATUS — from the host]",
+        f"The tests PASSED at round {m.group(1) if m else '?'} and FAIL now. The cause is in the diff "
+        "printed under the last test result ('-' = when they passed, '+' = now).",
+        "Your next reply MUST repair the '+' lines with search_replace: copy the '-' line's "
+        "parentheses, brackets, colons and quotes exactly and change only the names the task asks "
+        "for. Do not re-read files and do not search: the diff already shows everything that changed.",
+    ])
+
+
 def build_research_status(entries: list[TranscriptEntry]) -> str:
     """Mirror of buildResearchStatus() in the extension's toolProtocol.ts."""
     if not entries:
@@ -959,6 +1047,9 @@ def build_research_status(entries: list[TranscriptEntry]) -> str:
             "summary (files created / edited / deleted, test result) and NO tool_call fences. "
             "Re-running the same checks will not add anything.",
         ])
+    regressed = regression_status(entries)
+    if regressed:
+        return regressed
     if not working_set_indices(entries) and repeated_failure_paths(entries):
         stuck = repeated_failure_paths(entries)
         return ("[RESEARCH STATUS — from the host]\nThe same edit failed more than once for: "
@@ -1109,6 +1200,51 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
     ws = Workspace(work_dir)
     base = build_base_prompt(user_request, ws)
     log = AgentRunLog()
+
+    def _read_rel(rel: str) -> str | None:
+        try:
+            p = ws._resolve(rel)
+            return p.read_text(encoding="utf-8") if p.is_file() else None
+        except (ValueError, UnicodeDecodeError, OSError):
+            return None
+
+    green = GreenTracker(_read_rel)
+
+    def _repair_punctuation(args: dict[str, Any]) -> str:
+        """
+        The file parsed before this search_replace, the edit dropped punctuation while renaming,
+        and now it does not parse: put the punctuation back if that makes it parse again.
+        Returns the note for the coder, or '' when nothing was repaired (file left as edited).
+        """
+        rel = str(args.get("path") or "")
+        new = str(args.get("new_string") or "")
+        repaired = restore_dropped_punctuation(str(args.get("old_string") or ""), new)
+        text = _read_rel(rel)
+        if not repaired or repaired == new or text is None or new not in text:
+            return ""
+        if not syntax_error_note(ws.root, rel):
+            return ""  # the edit parses as written: not ours to change
+        path = ws._resolve(rel)
+        candidate = text.replace(new, repaired) if args.get("replace_all") else text.replace(new, repaired, 1)
+        path.write_text(candidate, encoding="utf-8", newline="\n")
+        if syntax_error_note(ws.root, rel):
+            path.write_text(text, encoding="utf-8", newline="\n")  # did not help: leave the coder's edit
+            return ""
+        return ("HOST FIX: your new_string dropped punctuation that old_string had, and the file no "
+                "longer parsed. The host put it back; the file parses again. It now reads:\n"
+                + "\n".join(f"  {ln}" for ln in repaired.splitlines()[:6])
+                + "\nDo not edit this line again unless the task needs it.")
+
+    def _note_test_result(entry: TranscriptEntry) -> None:
+        """A passing test run is the new 'last green'; a failing one gets the diff since."""
+        if not flag("GREEN_DIFF"):
+            return
+        if entry.ok:
+            green.mark_green(entry.round)
+            return
+        note = green.regression_note()
+        if note:
+            entry.result = f"{entry.result}\n{note}"
     last_prose = ""
     host_note = ""
     verify_pushed = False
@@ -1129,6 +1265,20 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
             break
         text = reply["content"]
         calls = parse_tool_calls(text)
+        # A reply with malformed calls: ask once more before running anything, and keep the
+        # reply with fewer of them (17 malformed calls over 30 task runs on 2026-11-20).
+        resampled = False
+        bad = sum(1 for c in calls if c["name"] == "__malformed__")
+        if bad and flag("RESAMPLE"):
+            try:
+                retry = _ask(prompt, timeout_sec=timeout_sec)
+            except Exception:
+                retry = None
+            if retry:
+                retry_calls = parse_tool_calls(retry["content"])
+                retry_bad = sum(1 for c in retry_calls if c["name"] == "__malformed__")
+                if retry_bad < bad and (retry_calls or extract_file_writes(strip_tool_calls(retry["content"]))):
+                    reply, text, calls, resampled = retry, retry["content"], retry_calls, True
         prose = strip_tool_calls(text)
 
         # Path-labeled fences in prose are applied like the extension's Apply step.
@@ -1148,6 +1298,7 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
                 host_note = VERIFIED_STOP_NOTE
         applied = []
         for rel, body in fence_writes.items():
+            green.before_edit(rel)
             ok, res = ws.run("write_file", {"path": rel, "content": body})
             log.transcript.append(TranscriptEntry(round_i + 1, "apply_fence", {"path": rel, "content": body}, res, ok))
             if ok:
@@ -1168,12 +1319,37 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
                            "first (path fences for code with quotes), then delete it in a later round.")
                     log.transcript.append(TranscriptEntry(round_i + 1, "delete_file", call["arguments"], res, False))
                     continue
+            parsed_before = False
+            if call["name"] in _EDIT_TOOLS:
+                green.before_edit(str(call["arguments"].get("path") or ""))
+                if call["name"] == "search_replace" and flag("PUNCT_REPAIR"):
+                    rel = str(call["arguments"].get("path") or "")
+                    parsed_before = _read_rel(rel) is not None and not syntax_error_note(ws.root, rel)
             ok, res = ws.run(call["name"], call["arguments"])
+            if ok and call["name"] == "search_replace" and rename_warn_enabled():
+                warn = dropped_punctuation_warning(str(call["arguments"].get("old_string") or ""),
+                                                   str(call["arguments"].get("new_string") or ""))
+                if warn:
+                    fixed = _repair_punctuation(call["arguments"]) if parsed_before else ""
+                    res = f"{res}\n{fixed or warn}"
             log.transcript.append(TranscriptEntry(round_i + 1, call["name"], call["arguments"], res, ok))
             if ok and call["name"] in {"search_replace", "write_file", "delete_file"}:
                 log.edits.append(str(call["arguments"].get("path")))
+            if call["name"] == "run_command" and _TEST_CMD_RE.search(str(call["arguments"].get("command") or "")):
+                _note_test_result(log.transcript[-1])
+        # An edit that left a file unparseable: say so on the last edit of that file this round.
+        if flag("SYNTAX_CHECK"):
+            last_edit_of: dict[str, TranscriptEntry] = {}
+            for e in log.transcript[round_start:]:
+                if e.ok and e.name in _EDIT_TOOLS and e.name != "delete_file":
+                    last_edit_of[str(e.args.get("path") or "").replace("\\", "/").lstrip("/")] = e
+            for rel, e in last_edit_of.items():
+                note = syntax_error_note(ws.root, rel) if rel else ""
+                if note:
+                    e.result = f"{e.result}\n{syntax_warning(note)}"
         host_test = host_test_entry(ws, log.transcript[round_start:], round_i + 1) if host_tests_enabled() else None
         if host_test:
+            _note_test_result(host_test)
             log.transcript.append(host_test)
         ws.end_round()
 
@@ -1184,6 +1360,8 @@ def run_agent(user_request: str, work_dir: Path, *, max_rounds: int = 16,
         }
         if blocked:
             round_rec["blocked_check_calls"] = blocked
+        if resampled:
+            round_rec["resampled"] = True
         if host_test:
             round_rec["host_test"] = "pass" if host_test.ok else "fail"
         log.rounds.append(round_rec)

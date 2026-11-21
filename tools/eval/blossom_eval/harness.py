@@ -63,6 +63,18 @@ def process_metrics(log: AgentRunLog) -> dict[str, Any]:
         "ran_tests_after_last_edit": bool(tests_after),
         "verified_green": verified,
         "tool_failures": sum(1 for e in tools if not e.ok),
+        # tool_failures mixes two things: a failing test run is normal feedback, a failed
+        # call (malformed JSON, old_string not found, refused write/command) is a wasted step.
+        "test_failures": sum(1 for i in test_idx if not tools[i].ok),
+        "call_failures": sum(1 for i, e in enumerate(tools) if not e.ok and i not in set(test_idx)),
+        "host_notes": {
+            "syntax_error": sum(1 for e in tools if "SYNTAX ERROR" in e.result),
+            "regression_diff": sum(1 for e in tools if "[HOST] These tests PASSED at round" in e.result),
+            "near_miss": sum(1 for e in tools if "Closest text in the file" in e.result),
+            "rename_warning": sum(1 for e in tools if "removed punctuation from the line" in e.result),
+            "unread_shown": sum(1 for e in tools if "Its current content is below" in e.result),
+            "resampled_rounds": sum(1 for r in log.rounds if r.get("resampled")),
+        },
         "unverified_success_claim": bool(_CLAIM_RE.search(log.final_text or "")) and not verified,
     }
 

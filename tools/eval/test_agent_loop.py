@@ -21,6 +21,7 @@ from blossom_eval.agent_loop import (
     format_catalog,
     green_idle_rounds,
     detect_test_command,
+    dropped_punctuation_warning,
     host_test_entry,
     native_tool_schemas,
     normalize_command,
@@ -380,6 +381,7 @@ def test_delete_is_skipped_when_an_edit_in_the_same_reply_failed(tmp_path: Path,
     replies = iter([{"content": delete + "\n" + bad_write, "reasoning": "", "steps": [], "source": "t"},
                     {"content": "Done.", "reasoning": "", "steps": [], "source": "t"}])
     monkeypatch.setattr("blossom_eval.agent_loop._ask", lambda prompt, timeout_sec: next(replies))
+    monkeypatch.setenv("BLOSSOM_EVAL_RESAMPLE", "0")  # this test is about the reply as first sent
     log = run_agent("split it", tmp_path, max_rounds=3)
     assert (tmp_path / "inventory.py").exists()
     assert any(e.name == "delete_file" and "Not deleted" in e.result for e in log.transcript)
@@ -484,3 +486,17 @@ def test_test_command_comes_from_package_json(tmp_path: Path):
     assert detect_test_command(tmp_path) == "npm test"
     (tmp_path / "package.json").write_text('{"scripts": {"test": "echo \\"Error: no test specified\\" && exit 1"}}', encoding="utf-8")
     assert detect_test_command(tmp_path) is None
+
+
+def test_rename_that_drops_parens_is_flagged():
+    # cycle 11, rename-symbol round 4: the coder's own search_replace dropped the ().
+    warn = dropped_punctuation_warning("def test_calc_total_with_tax()", "def test_compute_order_total_with_tax")
+    assert "removed: ()" in warn and "def test_calc_total_with_tax()" in warn
+
+
+def test_ordinary_edits_are_not_flagged():
+    assert dropped_punctuation_warning("x = calc_total(cart)", "x = compute_order_total(cart)") == ""
+    assert dropped_punctuation_warning("f(a, b)", "f(a)") == ""                 # removed an argument, not a rename
+    assert dropped_punctuation_warning("a = 1\nb = 2", "a = 1") == ""           # line count changed
+    assert dropped_punctuation_warning("total = calc(x)", "total = calc(x)") == ""
+    assert dropped_punctuation_warning("from .a import b", "from .c import b") == ""

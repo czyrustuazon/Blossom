@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from .corpus import CheckSpec, TaskSpec
+from .proc import run_shell
 
 
 @dataclass
@@ -88,18 +88,11 @@ def run_check(
         if not cmd:
             return CheckResult(check.id, False, "empty command")
         try:
-            proc = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=str(work_dir),
-                capture_output=True,
-                text=True,
-                timeout=timeout_sec,
-            )
-        except subprocess.TimeoutExpired:
-            return CheckResult(check.id, False, f"timeout: {cmd}")
+            proc = run_shell(cmd, cwd=work_dir, timeout=timeout_sec)
         except OSError as exc:
             return CheckResult(check.id, False, f"command failed to start: {exc}")
+        if proc.timed_out:
+            return CheckResult(check.id, False, f"timeout: {cmd}")
 
         ok = proc.returncode == check.expect_exit
         detail = f"exit {proc.returncode} (expected {check.expect_exit})"

@@ -1,0 +1,30 @@
+{
+  "id": "print-to-logging",
+  "title": "Replace diagnostic prints with the logging module across a package",
+  "domain": "python",
+  "tags": [
+    "python",
+    "logging",
+    "multi-file"
+  ],
+  "mode": "agent",
+  "prompt": "Replace the diagnostic print() calls in the syncer package with the logging module. Every module that logs gets `logger = logging.getLogger(__name__)`. Progress messages become logger.info; messages that start with \"WARNING: \" become logger.warning and messages that start with \"ERROR: \" become logger.error, both without that prefix. Keep the message text otherwise identical. The one summary line printed by syncer/cli.py main() is the program's output and must stay a print(). Do not call logging.basicConfig inside the package modules other than cli.py. Keep the tests passing.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {
+      "id": "visible_tests",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider tests",
+      "expect_exit": 0,
+      "description": "Project's own tests pass"
+    },
+    {
+      "id": "acceptance",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider _acceptance",
+      "expect_exit": 0,
+      "description": "Hidden acceptance tests pass"
+    }
+  ]
+}

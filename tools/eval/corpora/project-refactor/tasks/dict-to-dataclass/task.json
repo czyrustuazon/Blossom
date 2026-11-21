@@ -1,0 +1,31 @@
+{
+  "id": "dict-to-dataclass",
+  "title": "Replace record dicts with a dataclass across a package and its tests",
+  "domain": "python",
+  "tags": [
+    "python",
+    "dataclass",
+    "api-change",
+    "multi-file"
+  ],
+  "mode": "agent",
+  "prompt": "The ledger package passes entries around as plain dicts built by make_entry(). Replace them with a frozen dataclass named Entry in ledger/models.py, with the fields description (str), amount (Decimal) and category (str, default \"misc\"). Entry must still convert amount to Decimal and reject an empty description with ValueError, as make_entry does now. Remove make_entry (no alias); callers build Entry(...) directly. Change every module and the tests from entry[\"...\"] subscripts to attribute access, and export Entry from ledger/__init__.py instead of make_entry. Behaviour stays the same. Keep the tests passing.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "checks": [
+    {
+      "id": "visible_tests",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider tests",
+      "expect_exit": 0,
+      "description": "Project's own tests pass"
+    },
+    {
+      "id": "acceptance",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider _acceptance",
+      "expect_exit": 0,
+      "description": "Hidden acceptance tests pass"
+    }
+  ]
+}
