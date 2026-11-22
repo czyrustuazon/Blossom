@@ -755,6 +755,22 @@ class ThinkSplitter:
         return out
 
 
+CODER_AGENT_MAX_TOKENS = int(os.getenv("CODER_AGENT_MAX_TOKENS", "16000"))
+_REPEAT_WINDOW = 12000
+_REPEAT_PROBE = 400
+_REPEAT_MIN = 6
+
+
+def _is_repeating(tail: str) -> bool:
+    """True when the last 400 chars already occur 6+ times in the last 12k (a decode loop)."""
+    if len(tail) < _REPEAT_PROBE * _REPEAT_MIN:
+        return False
+    probe = tail[-_REPEAT_PROBE:]
+    if not probe.strip():
+        return False
+    return tail.count(probe) >= _REPEAT_MIN
+
+
 def _stream_local_chat(
     messages: list[dict],
     *,
@@ -823,6 +839,12 @@ def _stream_local_chat(
                     transient=True,
                 )
 
+    agent_round = _AGENT_ROUND_CV.get()
+    if agent_round and "max_tokens" not in sampling:
+        # Real-extension eval 2026-11-21: an agent round repeated the same two tool calls for
+        # 34k tokens / 138k chars with no limit until the run was killed.
+        sampling["max_tokens"] = CODER_AGENT_MAX_TOKENS
+
     def run_pass(pass_messages: list[dict], visible: bool) -> tuple[list[dict], str | None]:
         """One streamed completion. Returns (native tool calls, finish_reason)."""
         stream = LOCAL_CLIENT.chat.completions.create(
@@ -834,7 +856,10 @@ def _stream_local_chat(
         splitter = ThinkSplitter()
         slots: dict[int, dict[str, str]] = {}
         finish_reason: str | None = None
+        answer_tail = ""
+        chunk_no = 0
         for chunk in stream:
+            chunk_no += 1
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -853,6 +878,18 @@ def _stream_local_chat(
             content_piece = _delta_text(delta, "content")
             if content_piece:
                 emit_segments(splitter.feed(content_piece), visible)
+                answer_tail = (answer_tail + content_piece)[-_REPEAT_WINDOW:]
+                if chunk_no % 50 == 0 and _is_repeating(answer_tail):
+                    logger.warning("coder output is repeating itself; stopping the stream")
+                    _think(on_progress, "repetition_stop",
+                           "Coder output started repeating itself — stopped the generation.",
+                           source=source, label=label)
+                    try:
+                        stream.close()  # closes the HTTP response → llama-server stops decoding
+                    except Exception:  # noqa: BLE001 — best effort
+                        pass
+                    finish_reason = "repetition"
+                    break
             for index, call_id, name, args in _delta_tool_calls(delta):
                 slot = slots.setdefault(index, {"id": "", "name": "", "arguments": ""})
                 slot["id"] = slot["id"] or call_id

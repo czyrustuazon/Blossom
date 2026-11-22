@@ -163,6 +163,21 @@ functions, PDO/mysqli, no variables spliced into SQL, prepared statements, balan
 helpers and page inputs kept (`hidden/_php_scan.py`). `coding_rules.txt` gained a short
 legacy-PHP section (PDO + placeholders, not a mysqli rename).
 
+**9-task run, real extension 0.1.79/0.1.80 (1 run each): 6/9.** Pass: callbacks-to-async,
+cjs-to-esm, dict-to-dataclass, print-to-logging, split-module (+ rename-symbol passed once
+on 0.1.79, failed on 0.1.80). Fail: extract-helpers, globals-to-di, php-modernize (4 of 5
+files converted, login.php left — ran out of rounds), rename-symbol.
+
+**Decode loops (fixed after the 6/9 run).** An agent round repeated the same two tool
+calls for 34k tokens / 138k chars: no max_tokens, the stall watchdog counts tokens as
+activity, and the extension's Stop did not reach llama-server (ChatRouter does not abort the
+upstream stream when the client disconnects — still open; restart the router to stop one).
+Now: ChatRouter caps agent rounds at `CODER_AGENT_MAX_TOKENS` (16000) and closes the stream
+when the last 400 chars already occur 6+ times in the last 12k; the extension has the same
+guard, runs identical tool calls in one reply once, rejects non-path fence labels
+(`</think>`), and parses `[tool_call name {json}]` lines (a final reply in that form had
+ended a turn as "done").
+
 **UI changes the user asked for:** live thinking as cards per step (grouped per round,
 collapsing); reasoning updates throttled to 250 ms (spinner stutter came from re-sending
 50k chars per token); escalation asked in the chat, Claude/Gemini removed (fallback chain and
