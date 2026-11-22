@@ -1242,7 +1242,10 @@ def _is_agent_round(user_prompt: str) -> bool:
 
 def _looks_nlpp(focus: str, attached: list[str], user_prompt: str = "") -> bool:
     """NLPP / 3DS RE work: only then do hard bans and the NLPP constitution belong in the prompt."""
-    blob = " ".join([focus or "", *attached, (user_prompt or "")[:6000]])
+    # A Blossom Assistant prompt carries its own tool rules ("read_ghidra when …") in the first
+    # 6k chars, so every coding task looked like NLPP work. Judge those by the ask + paths only.
+    host_prompt = "[USER REQUEST]" in (user_prompt or "")
+    blob = " ".join([focus or "", *attached, "" if host_prompt else (user_prompt or "")[:6000]])
     return bool(_NLPP_SIGNAL_RE.search(blob))
 
 

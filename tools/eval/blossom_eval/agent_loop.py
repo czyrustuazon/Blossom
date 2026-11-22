@@ -29,8 +29,8 @@ from .apply import extract_file_writes
 from .client import chat_router_url
 from .proc import run_shell
 from .host_checks import (
-    GreenTracker, flag, near_miss_hint, punctuation_in_words, restore_dropped_punctuation,
-    syntax_error_note, syntax_warning,
+    GreenTracker, flag, near_miss_hint, punctuation_in_words, regex_fallback,
+    restore_dropped_punctuation, syntax_error_note, syntax_warning,
 )
 
 TOOL_CALL_FENCE_RE = re.compile(r"```tool_call\s*\r?\n([\s\S]*?)```", re.IGNORECASE)
@@ -409,21 +409,36 @@ class Workspace:
             return False, "query is required"
         base = self._resolve(args.get("path") or ".")
         cap = int(args.get("maxResults") or 50)
-        hits = []
         files = [base] if base.is_file() else sorted(base.rglob("*"))
-        for p in files:
-            if not p.is_file() or set(p.relative_to(self.root).parts) & SKIP_DIRS:
-                continue
-            try:
-                text = p.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
-            for n, line in enumerate(text.splitlines(), 1):
-                if query.lower() in line.lower():
-                    hits.append(f"{p.relative_to(self.root).as_posix()}:{n}: {line.strip()}")
-                    if len(hits) >= cap:
-                        break
-        return True, "\n".join(hits) if hits else "No matches."
+
+        def scan(match) -> list[str]:
+            hits: list[str] = []
+            for p in files:
+                if not p.is_file() or set(p.relative_to(self.root).parts) & SKIP_DIRS:
+                    continue
+                try:
+                    text = p.read_text(encoding="utf-8")
+                except (UnicodeDecodeError, OSError):
+                    continue
+                for n, line in enumerate(text.splitlines(), 1):
+                    if match(line):
+                        hits.append(f"{p.relative_to(self.root).as_posix()}:{n}: {line.strip()}")
+                        if len(hits) >= cap:
+                            return hits
+            return hits
+
+        hits = scan(lambda line: query.lower() in line.lower())
+        if hits:
+            return True, "\n".join(hits)
+        rx = regex_fallback(query) if flag("REGEX_FALLBACK") else None
+        if rx is None:
+            return True, "No matches."
+        hits = scan(lambda line: rx.search(line) is not None)
+        return True, (
+            f"search_text is LITERAL: no line contains the text {query!r}. It looks like a regular "
+            f"expression, so the host also ran it as one (/{rx.pattern}/i): "
+            + (f"{len(hits)} hit(s).\n" + "\n".join(hits) if hits else "no matches either.")
+        )
 
     def t_search_replace(self, args):
         path = self._resolve(args.get("path", ""))

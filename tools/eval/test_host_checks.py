@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from blossom_eval.host_checks import GreenTracker, near_miss_hint, syntax_error_note, syntax_warning
+from blossom_eval.host_checks import (
+    GreenTracker, near_miss_hint, php_balance_error, regex_fallback, syntax_error_note, syntax_warning,
+)
 
 # cycle 11, rename-symbol: the test file after the coder's round-4 search_replace.
 BROKEN_TEST = (
@@ -247,3 +249,80 @@ def test_status_points_at_the_regression_before_older_failures():
     ]
     status = build_research_status(entries)
     assert "PASSED at round 2 and FAIL now" in status and "path fence" not in status
+
+
+# ---------------------------------------------------------------- php-modernize eval, 2026-11-21
+
+# text_filter.php after the coder's round-5 search_replace of the each() loop: one ')' too many.
+PHP_BROKEN = (
+    "<?PHP\n"
+    "function tag_list($tags)\n"
+    "{\n"
+    "\t$out = array();\n"
+    "\t$parts = explode(',', $tags);\n"
+    "\tforeach ($parts as $key => $value))\n"
+    "\t{\n"
+    "\t\t$out[] = trim($value);\n"
+    "\t}\n"
+    "\treturn $out;\n"
+    "}\n"
+    "?>\n"
+)
+
+
+def test_php_syntax_error_names_the_line(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("PATH", "")  # no php on PATH: the bracket check must catch it
+    (tmp_path / "includes").mkdir()
+    (tmp_path / "includes" / "text_filter.php").write_text(PHP_BROKEN, encoding="utf-8")
+    note = syntax_error_note(tmp_path, "includes/text_filter.php")
+    assert note.startswith("includes/text_filter.php:6: unexpected ')'"), note
+    assert "foreach ($parts as $key => $value))" in note
+    fixed = PHP_BROKEN.replace("$value))", "$value)")
+    (tmp_path / "includes" / "text_filter.php").write_text(fixed, encoding="utf-8")
+    assert syntax_error_note(tmp_path, "includes/text_filter.php") == ""
+
+
+def test_php_balance_ignores_strings_comments_and_html():
+    src = (
+        "<html><p>(unbalanced html is fine</p>\n"
+        "<?php\n"
+        "$a = 'a ) in a string'; // and ( in a comment\n"
+        "/* { block comment */\n"
+        "$b = \"escaped \\\" quote )\";\n"
+        "$sql = <<<SQL\nSELECT ( FROM t\nSQL;\n"
+        "if ($a) { echo $b; }\n"
+        "?>\n<p>)</p>\n"
+    )
+    assert php_balance_error(src) is None
+    assert php_balance_error("<?php\nif ($x) {\n  echo 1;\n") == (2, "'{' is never closed")
+    assert php_balance_error("<?php\n$s = 'open;\n")[1].startswith("unterminated")
+
+
+@pytest.mark.parametrize("query,line,expected", [
+    ("each\\(", "while (list($k, $v) = each($parts))", True),                      # escaped paren
+    ("mysql_|ereg_|each\\(", "$r = mysql_query($q);", True),                       # alternation
+    ("ereg_replace\\\\|eregi\\\\|each\\\\(", "return eregi('x', $e);", True),      # double-escaped grep style
+])
+def test_regex_shaped_queries_get_a_regex_search(query, line, expected):
+    rx = regex_fallback(query)
+    assert rx is not None
+    assert bool(rx.search(line)) is expected
+
+
+@pytest.mark.parametrize("query", ["mysql_", "get_magic_quotes", "foo()", "$_GET['id']", "a.b"])
+def test_plain_queries_stay_literal(query):
+    assert regex_fallback(query) is None
+
+
+def test_search_text_runs_regex_shaped_query_as_regex(tmp_path: Path):
+    from blossom_eval.agent_loop import Workspace
+
+    (tmp_path / "text_filter.php").write_text("<?php\n$p = split(',', $t);\nwhile (list($k,$v) = each($p)) {}\n",
+                                               encoding="utf-8")
+    ws = Workspace(tmp_path)
+    ok, msg = ws.run("search_text", {"query": "each\\(|split\\("})
+    assert ok
+    assert "LITERAL" in msg and "2 hit(s)" in msg
+    assert "text_filter.php:2:" in msg and "text_filter.php:3:" in msg
+    ok, msg = ws.run("search_text", {"query": "split("})
+    assert msg.startswith("text_filter.php:2:")  # literal hit: unchanged behaviour

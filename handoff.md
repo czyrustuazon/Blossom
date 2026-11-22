@@ -31,20 +31,41 @@ three new tasks (corpus is now 8), an A/B runner, and a timeout that kills the w
 process tree. A/B over 8 tasks, 3 alternating cycles each: **hardening ON 19/24 (7, 6, 6),
 OFF 15/24 (4, 6, 5)**. Details in "Sixth part" below.
 
+**Seventh part (2026-11-21 evening) — the eval now runs through the REAL extension.**
+The replica (`agent_loop.py`) scored well while the user's VS Code Blossom made no edits at
+all: they had drifted apart. Running the real extension found the main cause in ChatRouter
+(below). Real extension, 4 tasks × 2 cycles: **0/4 before the router fix → 5/8 after.**
+Committed: Blossom Assistant `883c00b` (installed as 0.1.79 in VS Code), Blossom (this commit).
+Details: "Seventh part" section below.
+
 **START HERE next session:**
 1. `git status` in both repos. Ask the user before committing. Leave
-   `Mind/llama-server.model` unstaged in Blossom. Note: `tools.ts` has mixed CRLF/LF line
-   endings; the Edit tool normalizes some lines — check `git diff` shows only real hunks.
-2. Smoke-test in real VS Code (everything through `c32ce25` is installed; reload the window
-   first) on a small project with tests: askBeforeRun on → expect a Run prompt after the
-   first edit round; Deny → no more prompts that turn. Not done yet.
-3. Rebuild + reinstall after extension changes: `npm run compile`, `npm run package`,
-   `cursor|code --install-extension blossom-assistant-<ver>.vsix --force` (`install.bat`
-   does the same but ends in `pause`).
-4. User decisions that still hold: do NOT seed lessons into the real Mind, and hold off
-   on seeding experiments too ("hold off on seeding for now"), until scores are robust.
-5. Judge every change on 3+ alternating cycles (scripts below), never on one cycle:
-   identical code has scored anywhere from 1/5 to 5/5.
+   `Mind/llama-server.model` unstaged in Blossom. Never rewrite repo files with PowerShell
+   `Set-Content`/`Get-Content` (adds a BOM and mojibake to package.json — happened twice);
+   edit bytes with Python or the Edit tool and check `git diff --stat`.
+2. Evaluate through the real extension, not the replica:
+   `python tools/eval/run_vscode.py --task <id> --runs N --name <arm> --out <dir>
+   [--set blossom.agent.leanPrompt=true]` with `BLOSSOM_EVAL_CHAT_URL` = the test router
+   (:8093). It opens a VS Code window per task (parent folder
+   `Documents\blossom-eval-runs`, trusted), sends the prompt through the chat panel, auto-
+   answers prompts (plan card → Approve), saves `trace.log`, `summary.json`, `score.json`
+   and `round-NN.md` (full prompt + router steps + reasoning + reply per round), closes it.
+   Read the round files before theorizing.
+3. The user must restart their own ChatRouter (:8083) to get today's router fixes; only the
+   test router (:8093) was restarted. A 9-task real-extension run on 0.1.79 was started at
+   the end of the session (results not recorded here — rerun it).
+4. Next levers (all general, measure each with alternating cycles):
+   - `dict-to-dataclass` runs out of rounds (13–15) one test short: raise the full-tier
+     round cap (replica used 16) and measure.
+   - Prompt diet for the FULL prompt by section (lean as a whole lost 2/8 vs 5/8 — find
+     which sections matter instead of dropping all; lean also drops the plan-tier rules).
+   - Router still appends retrieved coding lessons that include the coder's own failed
+     answers (it "learned" "please share the files" and copied it); audit auto-learn.
+   - Repo knowledge lists README.md twice (readme.md) — case-insensitive dedupe.
+5. User decisions that still hold: do NOT seed lessons into the real Mind ("hold off on
+   seeding for now"). Big changes: plan → in-chat Approve card → same turn (user's choice).
+   Claude and Gemini are no longer escalation options; only Cursor, asked in the chat.
+6. Judge every change on 2–3+ alternating cycles, never on one: identical code still swings.
 
 Full technical record of the session (architecture of the loops, cycle-by-cycle
 findings, every correction and why): [`tools/eval/TRAINING.md`](tools/eval/TRAINING.md).
@@ -81,6 +102,71 @@ leave it alone.
 | 9 | **5/5** | First clean sweep. |
 | 10 | **4/5** | Confirmation. rename-symbol hit max rounds; many recovered malformed calls. |
 | 11 (2026-11-21, host tests on, fence) | 4/5 | rename-symbol: green after round 2, then its own `search_replace` turned `def test_calc_total_with_tax()` into `def test_compute_order_total_with_tax` (dropped `()`). It saw the SyntaxError (pytest + `ast.parse`) but read the line as valid for 12 rounds and rewrote the file twice with the same bug. Model error, not host repair. Idea: warn when a search_replace changes non-identifier characters (here `()`) in what looks like a rename. |
+
+### Seventh part (2026-11-21 evening): real extension via debug MCP
+
+**Why.** The user's real requests ("refactor this repo to be more modern and php compliant")
+kept ending with no edits in VS Code while the replica passed most tasks. Two days of replica
+fixes had not moved the real thing.
+
+**Tooling (extension `src/debug/mcpServer.ts`, `src/agent/turnTrace.ts`).** Setting
+`blossom.debug.mcpServer` (off by default) starts a JSON-RPC MCP server on 127.0.0.1:8790
+(refuses requests with an Origin header; port +1..+9 if taken; URL written to
+`~/.blossom/mcp/<workspace-hash>.json`). Tools: `blossom_send/wait/status/cancel/clear/
+respond/close_window/info`, `blossom_trace` (Blossom Trace channel: streams with finish
+reason and [DONE], agent rounds, statuses, tool results, edits, webview errors),
+`blossom_rounds` (last 40 router exchanges in full), `blossom_last_prompt`, `blossom_tool`
+(run any agent tool directly). Stall watchdog `blossom.agent.stallTimeoutSec` (240 s).
+
+**Root causes found, in order of impact (all general, none task-specific):**
+1. **ChatRouter dropped the agent loop.** `EditorContext.pack_editor_context` rebuilt any
+   prompt containing `[EDITOR CONTEXT]` / `<<<FILE` as task brief + request + files, so
+   every VS Code agent round lost its tool transcript, working set and host status. The
+   coder re-read the attached files every round (12 identical rounds in one run). The
+   replica never sends editor context, so it never saw this. Fix: agent rounds pass through
+   untouched; over budget, only the file blocks are condensed in place
+   (`test_editor_context.py`). Effect: 0/4 → 5/8.
+2. **Plan-first gate.** `promptTier.ts` classes multi-file asks as plan-only ("ANSWER ONLY":
+   no edits, host discards fences) and waits for a new "go ahead" message. Now the plan ends
+   with an in-chat Approve / type changes / Cancel card that continues the same turn.
+3. **Unknown tool names.** The coder calls `list_files`, `list`, `grep`, `cat`, passes
+   `pattern` for `query`, `read_file "."`, `cwd: /workspace`. A bare "Unknown tool" for 5
+   rounds led it to write a fake tool transcript and invent a project. `normalizeToolCall`
+   in `tools.ts` maps these and tells the model what ran.
+4. **Invented tool output written to disk.** Live fence apply took `system` and
+   `**index.php:**` labels from a role-played transcript and wrote those files.
+   `trustedReplyText` cuts a reply at host-only markers; bare-stem labels need a heading.
+5. **read_file returned a 16-line "search window"** after any search hit unless a range was
+   given — the coder re-read whole files for rounds. Range-less reads return the whole file.
+6. Smaller: search-loop guard aborted healthy reasoning (looked like a freeze); path-fence
+   edits did not count as edits (turn ended after one fence); `| head` / `|| true` hid
+   failing exit codes; regex-shaped `search_text` queries now also run as regex; PHP syntax
+   check (php -l or bracket balance); NLPP hard bans were injected into every coding task
+   because the extension prompt mentions Ghidra (router now judges by ask + paths).
+
+**Measured (real extension, test router, 2 cycles × 4 tasks, router fix in both arms):**
+
+| Task | full prompt | lean prompt |
+|------|-------------|-------------|
+| callbacks-to-async | 2/2 | 0/2 |
+| cjs-to-esm | 2/2 | 1/2 |
+| dict-to-dataclass | 0/2 | 1/2 |
+| extract-helpers | 1/2 | 0/2 |
+| **Total** | **5/8** | **2/8** |
+
+Lean (`blossom.agent.leanPrompt`, ~8k chars instead of ~45k) stays off.
+
+**Corpus:** new task `php-modernize` (9 tasks now): a small mysql_*-era PHP site modelled on
+the user's real project, prompt = the user's own words + "has to run on PHP 8.3", no visible
+tests (the real project has none). Acceptance is static (php not installed): removed
+functions, PDO/mysqli, no variables spliced into SQL, prepared statements, balanced syntax,
+helpers and page inputs kept (`hidden/_php_scan.py`). `coding_rules.txt` gained a short
+legacy-PHP section (PDO + placeholders, not a mysqli rename).
+
+**UI changes the user asked for:** live thinking as cards per step (grouped per round,
+collapsing); reasoning updates throttled to 250 ms (spinner stutter came from re-sending
+50k chars per token); escalation asked in the chat, Claude/Gemini removed (fallback chain and
+handoff compression no longer call them).
 
 ### Sixth part (2026-11-21): host checks, 8 tasks, A/B runner
 

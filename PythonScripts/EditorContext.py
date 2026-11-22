@@ -559,6 +559,63 @@ def pack_editor_context_sequential(
     return packed, stats
 
 
+_AGENT_ROUND_MARKERS_EC = ("[AGENT LOOP", "[CONTINUE — AGENT ROUND", "[CONTINUE - AGENT ROUND",
+                           "[AGENT TOOL TRANSCRIPT")
+
+
+def _looks_agent_round(user_prompt: str) -> bool:
+    """Same markers as ChatRouter._is_agent_round (kept local to avoid an import cycle)."""
+    upper = (user_prompt or "").upper()
+    return any(m in upper for m in _AGENT_ROUND_MARKERS_EC)
+
+
+def _pack_editor_section_in_place(user_prompt: str, budget: int, stats: dict) -> tuple[str, dict]:
+    """
+    Over-budget agent round: shrink only the attached-file blocks, keep every other section
+    (request, tools, transcript, working set, host status) exactly where it was.
+    """
+    blocks = list(_FILE_BLOCK_RE.finditer(user_prompt))
+    if not blocks:
+        return user_prompt, stats
+    start, end = blocks[0].start(), blocks[-1].end()
+    rest_tokens = approx_tokens(user_prompt[:start] + user_prompt[end:])
+    room = max(1024, budget - rest_tokens)
+    ask = extract_user_request(user_prompt)
+    ask_tokens = _tokens(ask)
+    files = parse_editor_files(user_prompt)
+    stats["files_in"] = len(files)
+    chunks: list[FileChunk] = []
+    for f in select_files(files, ask):
+        bonus = _file_relevance(f.path, ask)
+        for chunk in _chunk_file(f.path, f.body):
+            chunk.score = _score_chunk(chunk, ask_tokens, bonus)
+            chunks.append(chunk)
+    chunks.sort(key=lambda c: c.score, reverse=True)
+    kept: list[FileChunk] = []
+    used = 0
+    for chunk in chunks:
+        cost = approx_tokens(chunk.text) + 20
+        if kept and used + cost > room:
+            continue
+        kept.append(chunk)
+        used += cost
+    kept.sort(key=lambda c: (c.path, c.start_line))
+    packed_files = "".join(
+        f"<<<FILE path=\"{c.path}\" lines={c.start_line}-{c.end_line}>>>\n{c.text}\n<<<END_FILE>>>\n"
+        for c in kept
+    )
+    note = "(Attached files trimmed to fit; read_file for the rest.)\n"
+    packed = user_prompt[:start] + note + packed_files + user_prompt[end:]
+    stats.update({
+        "packed": True,
+        "files_kept": len({c.path for c in kept}),
+        "chunks_kept": len(kept),
+        "approx_tokens": approx_tokens(packed),
+        "budget": budget,
+    })
+    return packed, stats
+
+
 def pack_editor_context(
     user_prompt: str,
     *,
@@ -579,6 +636,16 @@ def pack_editor_context(
         return user_prompt, stats
 
     budget = token_budget or EDITOR_TOKEN_BUDGET
+    # Agent tool-loop rounds carry the tool transcript, working set and host status AFTER the
+    # editor files. Rebuilding the prompt from request + files (below) dropped all of that:
+    # the coder never saw its own read results and re-read the attached files every round
+    # (real-extension eval 2026-11-21, dict-to-dataclass: identical read calls for 12 rounds).
+    if _looks_agent_round(user_prompt):
+        stats["mode"] = "agent-round"
+        if approx_tokens(user_prompt) <= budget:
+            return user_prompt, stats
+        return _pack_editor_section_in_place(user_prompt, budget, stats)
+
     ask = extract_user_request(user_prompt)
     files = parse_editor_files(user_prompt)
     stats["files_in"] = len(files)

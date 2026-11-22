@@ -80,13 +80,102 @@ def _node_syntax(rel: str, path: Path, root: Path) -> str:
     return f"{rel}:{lineno}: {message}\n{code}".rstrip()
 
 
+_PHP_OPEN_RE = re.compile(r"<\?(?:php\b|=)?", re.IGNORECASE)
+_PHP_HEREDOC_RE = re.compile(r"<<<[ \t]*(['\"]?)([A-Za-z_]\w*)\1\r?\n")
+
+
+def php_balance_error(text: str) -> tuple[int, str] | None:
+    """
+    (line, message) for the first unbalanced bracket / unterminated string or comment in PHP code,
+    else None. Used when `php -l` is not available (php-modernize eval, 2026-11-21: an `each()`
+    rewrite left `foreach ($parts as $key => $value))` and nothing told the coder).
+    """
+    i, n = 0, len(text)
+    stack: list[tuple[str, int]] = []
+    pairs = {")": "(", "]": "[", "}": "{"}
+
+    def line_at(pos: int) -> int:
+        return text.count("\n", 0, pos) + 1
+
+    while i < n:
+        m = _PHP_OPEN_RE.search(text, i)
+        if not m:
+            break
+        i = m.end()
+        while i < n:
+            c, two = text[i], text[i:i + 2]
+            if two == "?>":
+                i += 2
+                break
+            if two == "//" or (c == "#" and text[i + 1:i + 2] != "["):
+                while i < n and text[i] != "\n" and text[i:i + 2] != "?>":
+                    i += 1
+                continue
+            if two == "/*":
+                j = text.find("*/", i + 2)
+                if j < 0:
+                    return line_at(i), "unterminated /* comment"
+                i = j + 2
+                continue
+            if c in "'\"":
+                j = i + 1
+                while j < n and text[j] != c:
+                    j += 2 if text[j] == "\\" else 1
+                if j >= n:
+                    return line_at(i), f"unterminated {c}string{c}"
+                i = j + 1
+                continue
+            hd = _PHP_HEREDOC_RE.match(text, i)
+            if hd:
+                end = re.compile(r"^[ \t]*" + re.escape(hd.group(2)) + r"\b", re.MULTILINE).search(text, hd.end())
+                if not end:
+                    return line_at(i), "unterminated heredoc"
+                i = end.end()
+                continue
+            if c in "([{":
+                stack.append((c, i))
+            elif c in pairs:
+                if not stack or stack[-1][0] != pairs[c]:
+                    return line_at(i), f"unexpected '{c}'" + (
+                        f" (open '{stack[-1][0]}' from line {line_at(stack[-1][1])})" if stack else "")
+                stack.pop()
+            i += 1
+    if stack:
+        ch, pos = stack[-1]
+        return line_at(pos), f"'{ch}' is never closed"
+    return None
+
+
+def _php_syntax(rel: str, path: Path, root: Path, text: str) -> str:
+    try:
+        proc = subprocess.run(["php", "-l", str(path)], cwd=root, capture_output=True, text=True,
+                              timeout=20, encoding="utf-8", errors="replace")
+        if proc.returncode == 0:
+            return ""
+        msg = next((ln.strip() for ln in (proc.stdout + proc.stderr).splitlines() if "error" in ln.lower()), "")
+        if msg:
+            m = re.search(r"on line (\d+)", msg)
+            lines = text.splitlines()
+            shown = lines[int(m.group(1)) - 1].rstrip() if m and 0 < int(m.group(1)) <= len(lines) else ""
+            return f"{rel}:{m.group(1) if m else ''}: {msg}\n    {shown}".rstrip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # no php here: fall back to the bracket check
+    found = php_balance_error(text)
+    if not found:
+        return ""
+    lineno, msg = found
+    lines = text.splitlines()
+    shown = lines[lineno - 1].rstrip() if 0 < lineno <= len(lines) else ""
+    return f"{rel}:{lineno}: {msg}\n    {shown}".rstrip()
+
+
 def syntax_error_note(root: Path, rel: str) -> str:
     """'' when the file parses (or its type is not checked); else 'path:line: error' + the line."""
     path = root / rel
     if not path.is_file():
         return ""
     suffix = path.suffix.lower()
-    if suffix not in {".py", ".json"} | _NODE_EXTS:
+    if suffix not in {".py", ".json", ".php"} | _NODE_EXTS:
         return ""
     try:
         text = path.read_text(encoding="utf-8")
@@ -96,12 +185,39 @@ def syntax_error_note(root: Path, rel: str) -> str:
         return _python_syntax(rel, text)
     if suffix == ".json":
         return _json_syntax(rel, text)
+    if suffix == ".php":
+        return _php_syntax(rel, path, root, text)
     return _node_syntax(rel, path, root)
 
 
 def syntax_warning(note: str) -> str:
     return ("SYNTAX ERROR — this file no longer parses after your edit. Fix this line before anything "
             "else (compare it character by character with how it was: brackets, colons, quotes):\n" + note)
+
+
+# ------------------------------------------------------------------ regex-shaped literal search
+_REGEXY_RE = re.compile(r"\\[()\[\].*+?|^$sSwWdDb{}]|\||\.\*|\.\+|^\^|\$$|\[\^?[\w\\-]+\]")
+
+
+def regex_fallback(query: str) -> re.Pattern | None:
+    """
+    The compiled regex for a search_text query that looks like a regular expression, else None.
+
+    php-modernize eval 2026-11-21: the coder searched `each\\(`, `mysql_|ereg_|each\\(` and
+    `ereg_replace\\\\|eregi` with the literal tool, got "No matches." every time, and spent 11
+    rounds unsure which removed functions were left. Double-escaped backslashes are collapsed.
+    """
+    q = query.strip()
+    if not q or not _REGEXY_RE.search(q):
+        return None
+    # Collapse double escapes, and read grep-style `\|` as alternation (how the coder writes "or").
+    normalized = q.replace("\\\\", "\\").replace("\\|", "|")
+    for candidate in (normalized, q):
+        try:
+            return re.compile(candidate, re.IGNORECASE)
+        except re.error:
+            continue
+    return None
 
 
 # ------------------------------------------------------------------ changes since green

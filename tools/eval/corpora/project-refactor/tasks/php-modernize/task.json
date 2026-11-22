@@ -1,0 +1,14 @@
+{
+  "id": "php-modernize",
+  "title": "Modernize a legacy PHP site (mysql_* era) for PHP 8.3",
+  "domain": "php",
+  "tags": ["php", "legacy", "mysql", "pdo", "sql-injection", "multi-file", "vague-prompt"],
+  "mode": "agent",
+  "prompt": "refactor this project to be more modern and php compliant in 2026. It has to run on PHP 8.3.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Mirrors the user's real request on blossom-php-modernization-training-set (2026-11-21), where Blossom finished with zero edits. No visible tests on purpose (the real project has none). Acceptance is static (php is not installed): no functions removed in PHP 7/8, PDO or mysqli, no variables spliced into SQL, prepared statements, balanced syntax, helpers and page inputs kept.",
+  "checks": [
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden static acceptance checks pass"}
+  ]
+}

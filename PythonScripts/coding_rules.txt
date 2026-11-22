@@ -115,6 +115,28 @@ When the user asked for a new API (e.g. "a class Foo(settings, transport)"), mat
 the exact names, parameter order and return values they gave, and update the tests
 to use it.
 
+LEGACY PHP → MODERN PHP 8 ("modern", "PHP 8", "php compliant", mysql_* code)
+1. INVENTORY with one LITERAL search_text fence per pattern (never `a|b`, never `\(`):
+   mysql_   ereg   split(   each(   create_function   get_magic_quotes   session_register
+2. DATABASE — switch to PDO with prepared statements. A 1:1 rename mysql_* → mysqli_*
+   is NOT modernizing: it keeps every SQL injection. Do this instead:
+   - connection: new PDO("mysql:host=$h;dbname=$n;charset=utf8mb4", $user, $pass,
+     [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC])
+   - change the shared query helper to db_query(string $sql, array $params = []) that
+     prepares, executes and returns the PDOStatement; then update EVERY caller.
+   - NEVER put a variable inside SQL text: not "... id = '$id'", not "... '" . $id . "'".
+     Use placeholders: db_query('SELECT name FROM t WHERE id = ?', [$id]).
+   - mysql_fetch_assoc/array/object → $stmt->fetch(); loops → foreach ($stmt->fetchAll() ...);
+     mysql_num_rows → check the fetched row / count(); COUNT(*) → ->fetchColumn().
+   - LIMIT ?, ? needs ints: bindValue(..., PDO::PARAM_INT) or PDO::ATTR_EMULATE_PREPARES => false.
+3. REMOVED FUNCTIONS: ereg/ereg_replace → preg_match/preg_replace with delimiters
+   ('/[^0-9]/'); eregi → same with the i flag; split → explode (preg_split for a regex);
+   get_magic_quotes_gpc → delete the check; create_function → fn() => ...
+   each() loops: replace the WHOLE line including its closing ')':
+   `while (list($k, $v) = each($a))` → `foreach ($a as $k => $v)`.
+4. KEEP function names, page files and the $_GET/$_POST keys the same.
+5. PROVE — search_text each removed name again; expected "No matches.".
+
 ════════════════════════════════════
 OPERATING LOOP (ALWAYS)
 ════════════════════════════════════
