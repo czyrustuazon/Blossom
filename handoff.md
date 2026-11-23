@@ -57,6 +57,15 @@ and the GPU held ~9 GB for other apps, so no eval ran.
   the 44 NLPP seeds and the `add()` lesson are kept. Lesson #46 (declines to replace `mysql_*`
   as "beyond minimal edits", missing `;`) still looks like code — deleting it from the real
   store needs the user's OK. Tests: `PythonScripts/test_coding_lessons.py` (from the real texts).
+- **Lesson review queue (user's request):** `learn_coding_lesson` no longer writes to Chroma;
+  it queues the lesson in `Mind/assistant/lesson_queue.db` (`LessonQueue.py`) and returns
+  `queued:<id>`. Review with `python PythonScripts/review_lessons.py` (`list`, `show <id>`,
+  `approve <id>…`, `reject <id>… --reason`); `list` flags NON-ANSWER / USER-VERIFIED. 👍 on a
+  queued answer marks it user-verified (still pending), 👎 rejects it; the user's own 👎
+  correction notes (coding_caution) are still stored directly. Companion still cannot write
+  coding lessons. `LESSON_QUEUE=0` = old direct writes. `/v1/memory/coding` answers
+  `queued: true`; the extension shows "Coding lesson queued for review". Tests:
+  `PythonScripts/test_lesson_queue.py`. Evals no longer add lessons to the capsule either.
 - **package.json mojibake fixed** (13 `â€”`/`â†’` spots in setting descriptions, committed since
   ~7 commits back); no BOM, CRLF kept.
 - **Round cap** needs no code: measure with `--set blossom.agent.maxToolRounds=16` vs default 11.

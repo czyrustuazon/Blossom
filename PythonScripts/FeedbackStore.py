@@ -16,6 +16,7 @@ from typing import Any
 
 import MindStores
 from MemoryUpdater import ensure_mind_db
+import LessonQueue
 from MindStores import require_surface
 from SemanticMemory import (
     COLLECTION_CODING,
@@ -240,7 +241,13 @@ def _resolve_coding(
     new_ids: list[str] = []
 
     if verdict == "correct":
-        if memory_id and get_memory(memory_id, collection=collection):
+        if LessonQueue.is_queued_id(memory_id) and LessonQueue.mark_verified(memory_id):
+            # Still waits for review; the flag shows the user confirmed it.
+            actions.append("verified_queued_lesson")
+            return {"actions": actions, "memory_id": memory_id, "stored": False, "queued": True}
+        if memory_id and not LessonQueue.is_queued_id(memory_id) and get_memory(
+            memory_id, collection=collection
+        ):
             set_memory_importance(memory_id, collection=collection, importance=9)
             update_memory_metadata(
                 memory_id,
@@ -259,6 +266,10 @@ def _resolve_coding(
             source=f"{source}+user_verified",
             importance_score=9,
         )
+        if mid and LessonQueue.is_queued_id(mid):
+            LessonQueue.mark_verified(mid)
+            actions.append("queued_coding_lesson")
+            return {"actions": actions, "memory_id": mid, "stored": False, "queued": True}
         if mid:
             update_memory_metadata(
                 mid,
@@ -277,6 +288,12 @@ def _resolve_coding(
         return {"actions": actions, "stored": False}
 
     # incorrect
+    if LessonQueue.is_queued_id(memory_id):
+        if LessonQueue.reject(memory_id, "user marked the answer incorrect"):
+            actions.append("rejected_queued_lesson")
+        else:
+            actions.append("queued_lesson_already_reviewed")
+        memory_id = None
     if memory_id:
         if delete_memory(memory_id, collection=collection):
             actions.append("deleted_coding_lesson")

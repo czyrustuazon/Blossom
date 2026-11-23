@@ -3285,6 +3285,9 @@ async def memory_coding_learn(request: Request):
             "stored": False,
             "reason": "answer not useful enough to store",
         }
+    if str(memory_id).startswith("queued:"):
+        # Waits in Mind/assistant/lesson_queue.db until reviewed (review_lessons.py).
+        return {"ok": True, "stored": False, "queued": True, "id": memory_id, "source": source}
     return {"ok": True, "stored": True, "id": memory_id, "source": source}
 
 

@@ -37,6 +37,7 @@ import chromadb
 from chromadb.config import Settings
 from dotenv import load_dotenv
 
+import LessonQueue
 import MindStores
 from MindStores import SURFACE_ASSISTANT, SURFACE_COMPANION, current_surface
 
@@ -603,10 +604,24 @@ def learn_coding_lesson(
         f"User ask: {user_prompt.strip()[:500]}\n"
         f"Working solution ({source}):\n{answer.strip()[:4000]}"
     )
+    metadata = {"source": source, "kind": "coding_lesson"}
+    if LessonQueue.queue_enabled():
+        # Reviewed before it reaches the Mind (PythonScripts/review_lessons.py). Same surface
+        # rule as add_memory: Companion may not write coding lessons, queued or not.
+        if store_surface_for(COLLECTION_CODING) is None:
+            logger.warning(
+                "Dropped coding lesson from %s: not owned by surface %s", source, current_surface()
+            )
+            return None
+        qid = LessonQueue.enqueue(
+            lesson, collection=COLLECTION_CODING, importance=importance_score, metadata=metadata
+        )
+        logger.info("Queued coding lesson from %s for review (%s).", source, qid)
+        return qid
     return add_memory(
         lesson,
         importance_score=importance_score,
-        metadata={"source": source, "kind": "coding_lesson"},
+        metadata=metadata,
         collection=COLLECTION_CODING,
     )
 
