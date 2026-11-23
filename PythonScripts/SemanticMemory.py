@@ -338,7 +338,8 @@ def query_coding_lessons(
 
     kept: list[dict[str, Any]] = []
     for row in raw:
-        if looks_like_broken_agent_output(str(row.get("text") or "")):
+        row_text = str(row.get("text") or "")
+        if looks_like_broken_agent_output(row_text) or looks_like_non_solution(row_text):
             # Auto-learned agent rounds that were never solutions; retrieving them
             # teaches the coder to repeat the same broken format.
             continue
@@ -535,6 +536,52 @@ def looks_like_broken_agent_output(text: str) -> bool:
     return bool(_BROKEN_AGENT_RE.search(text or ""))
 
 
+# The coder asking the user for files it could have read itself, or saying it cannot see the
+# code. Auto-learned as "Working solution", these were retrieved into later prompts and the
+# coder copied them ("if you can share store.js … I can do the conversion", real-extension
+# eval 2026-11-21).
+_NON_SOLUTION_RE = re.compile(
+    r"\b(?:please|could you|can you|if you (?:can|could)|would you(?: mind)?|you(?:'ll| will) need to)\s+"
+    r"(?:\w+\s+){0,2}(?:share|paste|provide|upload|send|attach)\b"
+    r"|\bi (?:don'?t|do not|cannot|can'?t|am unable to)\s+(?:have\s+)?(?:access|see|view|read)\b"
+    r"[^.\n]{0,40}\b(?:files?|code|contents?|repo(?:sitory)?|project|workspace)\b"
+    r"|\bi(?:'ll| will| would)? need (?:to see|you to (?:share|paste|provide)|the (?:actual )?(?:file|code|contents))",
+    re.IGNORECASE,
+)
+
+
+def _lesson_solution_part(text: str) -> str:
+    """The answer part of a stored lesson (after 'Working solution (...):'), else the text."""
+    m = re.search(r"Working solution \([^)]*\):\s*", text or "")
+    return (text or "")[m.end():] if m else (text or "")
+
+
+# Reply that only announces work ("Let me start by examining the file structure…") — the turn
+# ended there. Stored as a lesson, it teaches the coder to announce and stop (the user's PHP
+# refactor asks, 2026-11: three such "Working solution" lessons, zero edits made).
+_INTENT_TAIL_RE = re.compile(
+    r"^(?:let me|let's|i'll|i will|i need to|i am going to|i'm going to|"
+    r"(?:first|now|next|then),?\s+(?:i|let)\b)",
+    re.IGNORECASE,
+)
+# An empty language fence followed by a path label: the fence protocol broken mid-answer.
+_EMPTY_FENCE_LABEL_RE = re.compile(r"```[\w+-]*[ \t]*\r?\n```[ \t]*path=", re.IGNORECASE)
+_CODE_BLOCK_RE = re.compile(r"```[^\n`]*\n(?:[^\n]*\n){2,}?[ \t]*```")
+
+
+def looks_like_non_solution(text: str) -> bool:
+    """True when an answer is not a fix: asks the user for files / says it cannot see the code,
+    only announces what it will do, or has a broken fence label."""
+    sol = _lesson_solution_part(text).strip()
+    if _NON_SOLUTION_RE.search(sol) or _EMPTY_FENCE_LABEL_RE.search(sol):
+        return True
+    if not _CODE_BLOCK_RE.search(sol):
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?:])\s+|\n", sol) if s.strip()]
+        if sentences and _INTENT_TAIL_RE.match(sentences[-1].lstrip("*_#>- ")):
+            return True
+    return False
+
+
 def learn_coding_lesson(
     user_prompt: str,
     answer: str,
@@ -548,6 +595,9 @@ def learn_coding_lesson(
     if looks_like_broken_agent_output(answer) or _TOOL_CALL_FENCE_RE.search(answer):
         # A mid-loop tool request (or a malformed one) is not a working solution.
         logger.info("Skipped coding lesson save from %s (agent-loop round, not a solution).", source)
+        return None
+    if looks_like_non_solution(answer):
+        logger.info("Skipped coding lesson save from %s (asks for files instead of solving).", source)
         return None
     lesson = (
         f"User ask: {user_prompt.strip()[:500]}\n"

@@ -38,6 +38,33 @@ all: they had drifted apart. Running the real extension found the main cause in 
 Committed: Blossom Assistant `883c00b` (installed as 0.1.79 in VS Code), Blossom (this commit).
 Details: "Seventh part" section below.
 
+**Eighth part (2026-11-22, uncommitted, NOT yet measured):** four general fixes, built as
+Blossom Assistant 0.1.82 (`.vsix` packaged, not installed). The stack was down after a reboot
+and the GPU held ~9 GB for other apps, so no eval ran.
+- **Zero-edit finish guard** (extension `orchestrator.ts` + `promptTier.ts::asksForChange`): a
+  change request whose turn is about to end with no edit attempted (no write/replace/delete,
+  no path fence) and no question to the user gets one `[HOST — the requested change has not
+  been made]` push ("passing tests only show the OLD code still works"). `asksForChange`
+  covers all 9 corpus prompts (convert/replace/extract/turn it into…) and rejects
+  look/explain/report-only asks — `npm run test:prompt-tier`.
+- **README listed twice** in repo knowledge (Windows opens `README.md` and `readme.md` as one
+  file): only the first one found is used (`repoKnowledge.ts`).
+- **Poisoned coding lessons** (`SemanticMemory.py::looks_like_non_solution`, write + read
+  side, nothing deleted): answers that ask the user to share/paste files, say they cannot see
+  the code, end on intent only ("Let me start by examining…") with no code block, or open an
+  empty fence before a `path=` label. Real store audit (copy of `Mind/assistant`, 50 lessons):
+  all 5 auto-learned lessons are answers to the user's own PHP refactor asks; 4 are now hidden,
+  the 44 NLPP seeds and the `add()` lesson are kept. Lesson #46 (declines to replace `mysql_*`
+  as "beyond minimal edits", missing `;`) still looks like code — deleting it from the real
+  store needs the user's OK. Tests: `PythonScripts/test_coding_lessons.py` (from the real texts).
+- **package.json mojibake fixed** (13 `â€”`/`â†’` spots in setting descriptions, committed since
+  ~7 commits back); no BOM, CRLF kept.
+- **Round cap** needs no code: measure with `--set blossom.agent.maxToolRounds=16` vs default 11.
+
+**Next:** install 0.1.82, start broker + test router on :8093 (fresh capsule copy), run the
+9-task baseline, then alternating A/B cycles: (a) 0.1.82 vs the 6/9 result, (b) round cap 16
+vs 11. Restart the test router (and the user's :8083) to load the SemanticMemory change.
+
 **START HERE next session:**
 1. `git status` in both repos. Ask the user before committing. Leave
    `Mind/llama-server.model` unstaged in Blossom. Never rewrite repo files with PowerShell
