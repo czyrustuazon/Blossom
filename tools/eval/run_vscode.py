@@ -114,15 +114,62 @@ def parse_settings(pairs: list[str] | None) -> dict:
     return out
 
 
+def code_pids() -> set[int]:
+    """PIDs of running Code.exe processes (Windows); empty elsewhere or on error."""
+    if os.name != "nt":
+        return set()
+    try:
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH", "/FI", "IMAGENAME eq Code.exe"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    pids = set()
+    for line in out.splitlines():
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) > 1 and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+def wait_code_exit(pids: set[int], timeout: float = 90) -> None:
+    """Wait until the given Code.exe processes are gone. Launching the next window while the
+    last one's main process was still shutting down showed "Another instance of Code is running
+    but not responding" and the task failed (eval 2026-11-23, split-module v862)."""
+    deadline = time.time() + timeout
+    while pids and time.time() < deadline:
+        if not (pids & code_pids()):
+            return
+        time.sleep(1)
+
+
+def kill_launch(ws: Path) -> None:
+    """Kill a hung eval launch: only Code.exe trees whose command line names this workspace."""
+    if os.name != "nt":
+        return
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='Code.exe'\" | "
+          f"Where-Object {{ $_.CommandLine -like '*{ws.name}*' }} | "
+          "ForEach-Object { taskkill /PID $_.ProcessId /T /F | Out-Null }")
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, timeout=60)
+
+
 def run_one(task, run_name: str, args) -> dict:
     ws = Path(args.ws_root) / f"{task.id}-{run_name}"
     out = Path(args.out) / run_name / task.id
     out.mkdir(parents=True, exist_ok=True)
     prepare_workspace(task, ws, args.router_url, args.port, parse_settings(args.set))
 
+    before = code_pids()
     started = time.time()
     subprocess.Popen(f'code --new-window "{ws}"', shell=True)
-    url = find_window(ws, started)
+    try:
+        url = find_window(ws, started)
+    except Exception:  # noqa: BLE001 — hung launch (e.g. the "not responding" dialog): retry once
+        print(f"  [{task.id}] window did not come up; killing that launch and retrying", flush=True)
+        kill_launch(ws)
+        time.sleep(5)
+        started = time.time()
+        subprocess.Popen(f'code --new-window "{ws}"', shell=True)
+        url = find_window(ws, started)
     mcp = Mcp(url)
     mcp.initialize()
     info = json.loads(mcp.call("blossom_info"))
@@ -175,6 +222,8 @@ def run_one(task, run_name: str, args) -> dict:
         mcp.call("blossom_close_window")
     except Exception:  # noqa: BLE001 — the window may already be gone
         pass
+    # Let this window's VS Code processes exit before the next launch (single-instance race).
+    wait_code_exit(code_pids() - before)
 
     # Score: hidden acceptance copied in only now.
     if task.hidden_path and task.hidden_path.is_dir():
