@@ -70,7 +70,48 @@ and the GPU held ~9 GB for other apps, so no eval ran.
   ~7 commits back); no BOM, CRLF kept.
 - **Round cap** needs no code: measure with `--set blossom.agent.maxToolRounds=16` vs default 11.
 
-**Next:** install 0.1.82, start broker + test router on :8093 (fresh capsule copy), run the
+**Ninth part (2026-11-23, real extension, test router :8093, UNCOMMITTED as of writing):**
+reading every failing run's trace found host bugs, not model limits, behind most failures.
+Lesson #46 was deleted from the real store (user approved). Real-extension 9-task results:
+
+| Build | Score | Notes |
+|---|---|---|
+| 0.1.82 | 1/9 | baseline for today |
+| 0.1.83 | 2/9 | |
+| 0.1.84 | 3/9 | + router fixes |
+| 0.1.85 | 4/9, 4/9 (8/18) | first build where no failure was host misbehaviour; php-modernize passed once |
+| 0.1.86 | running | + last-plan-round, narrow-test, rename-leftover fixes |
+
+Fixes (each has a check built from the real failing run; extension `npm run test:*`, router
+`pytest`):
+- **Live apply overwrote files with tool-call JSON** (print-to-logging, six files):
+  `applyFromResponse.ts` — tool-protocol fences are never file writes; the heading-label lookup
+  stops at the previous fence's closer; FILE_NAME_RE has an end boundary (`package.json` was read
+  as `package.js`); the "filename anywhere on the line above" rule needs a short line and never
+  labels a bare ``` fence; end-of-turn matching never assigns a bare fence to an attached file.
+- **More call formats parsed** (`bracketCallsToFences`): `[tool_call]\n{json}\n[/tool_call]` and
+  `[code: tool_call]\n{json}`. Session history now collapses tool calls to prose
+  `(called read_file x.py)` — the `[code: tool_call, N lines]` marker was copied as a format.
+- **`root` arg** (`normalizeToolCall`): a folder name, `.`, `/`, `primary` (the
+  list_workspace_roots label) or the root's absolute path no longer fails as "Unknown workspace root".
+- **Turn steering** (`orchestrator.ts`): zero-edit push also after the plan card's Approve
+  ("go ahead" counts as a change ask); "Shall I proceed?" right after approval gets one push
+  (`isPermissionReask`); last plan round says "no tools, write the PLAN" (6 research rounds and no
+  plan ended with no Approve card, extract-helpers ×3); a narrow test run (file, `::`, `-k`) does not
+  outvote a failing full-suite run (`verifiedAfterLastEdit`); rename asks: the host searches the old
+  name before finishing and pushes once with the hits (`parseRenameAsk`).
+- **Edits**: small attached files count as read for the unread-overwrite guard
+  (`attachedFilePaths`); delete of a missing file = done; blank-line-tolerant unique match for
+  `search_replace` (`blankLineTolerantMatch`); clearer "file changed since you read it" miss text.
+- **Router** (`ChatRouter.py`, agent rounds only): an empty visible reply gets the "emit the tool
+  calls" push; an empty answer never swaps coder GGUFs mid-turn (Nemotron→Qwen swap then looped
+  772 calls / 9 min); no "continue the cut-off code block" after the CODER_AGENT_MAX_TOKENS cap.
+
+Remaining failures are model behaviour: ignores its own syntax error, stops one test short at
+the round cap, misses part of the ask (prefixes, leftovers). Next lever to measure: round cap
+16 vs 11 (`--set blossom.agent.maxToolRounds=16`), alternating cycles.
+
+**Next (eighth part, done above):** install 0.1.82, start broker + test router on :8093 (fresh capsule copy), run the
 9-task baseline, then alternating A/B cycles: (a) 0.1.82 vs the 6/9 result, (b) round cap 16
 vs 11. Restart the test router (and the user's :8083) to load the SemanticMemory change.
 

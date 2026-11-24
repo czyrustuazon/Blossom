@@ -1807,7 +1807,13 @@ def _local_coder_answer(
             agent_round
             and not _has_agent_tool_calls(streamed)
             and not _has_path_fence(streamed)
-            and (_AGENT_STALL_RE.search(streamed or "") or _has_complete_code_fence(streamed))
+            and (
+                _AGENT_STALL_RE.search(streamed or "")
+                or _has_complete_code_fence(streamed)
+                # Reasoning ended "Let me start by exploring…" and the visible reply was
+                # empty (eval 2026-11-23, php-modernize round 2).
+                or not (streamed or "").strip()
+            )
             and not _AGENT_WRAPUP_RE.search(streamed or "")
             and not _local_answer_requests_escalate(streamed)
         ):
@@ -1858,10 +1864,12 @@ def _local_coder_answer(
         for round_no in range(1, CODER_CONTINUE_ROUNDS + 1):
             if not _has_unclosed_fence(streamed):
                 break
-            if agent_round and meta.get("finish_reason") != "length":
-                # Tool-call JSON can read as an "unclosed" fence to the scanner. In the
-                # host loop only a real output-limit cut needs a continuation; a false
-                # positive cost ~9 minutes of regenerated output in training cycle 3.
+            if agent_round:
+                # Agent rounds never continue. Tool-call JSON can read as an "unclosed" fence
+                # (a false positive cost ~9 minutes in training cycle 3), and a real length cut
+                # is the CODER_AGENT_MAX_TOKENS cap stopping a runaway reply: continuing it
+                # tripled one (eval 2026-11-23, php-modernize: 149k chars, 772 tool calls,
+                # 9 minutes). The host reports a cut-off call as malformed and asks again.
                 break
             why = "hit the output limit" if meta.get("finish_reason") == "length" else "stopped"
             _think(
@@ -2056,6 +2064,18 @@ def _get_coding_intel(
                 )
                 answer_source = f"local_coder:{model.name}"
                 if not answer or len(answer.strip()) < 20:
+                    if _AGENT_ROUND_CV.get():
+                        # Mid tool loop: never swap coder models (the swap reloads a GGUF and
+                        # the next model has not seen the turn — eval 2026-11-23, php-modernize
+                        # round 2 switched to Qwen, which then looped for 9 minutes). The host
+                        # loop handles an empty round itself.
+                        _think(
+                            on_progress,
+                            "fallback",
+                            f"{model.name} reply was empty on an agent round; returning it to "
+                            "the host loop instead of switching coders.",
+                        )
+                        return answer or "", answer_source, None
                     if more_local:
                         _think(
                             on_progress,
