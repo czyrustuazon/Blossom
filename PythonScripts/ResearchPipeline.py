@@ -26,8 +26,16 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+# Same opt-in as ChatRouter: with BLOSSOM_KEEP_PROCESS_ENV=1 the launcher's values win (this
+# import ran after ChatRouter's restore and put .env's CODER_MODELS back — A/B 2026-11-24).
+_LAUNCHER_ENV = (
+    dict(os.environ)
+    if os.getenv("BLOSSOM_KEEP_PROCESS_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+    else {}
+)
 load_dotenv(SCRIPT_DIR / ".env", override=True)
 load_dotenv(PROJECT_ROOT / ".env", override=True)
+os.environ.update(_LAUNCHER_ENV)
 
 from EditorContext import extract_user_request
 from PromptTier import PromptTier, detect_prompt_tier

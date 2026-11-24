@@ -53,8 +53,17 @@ from dotenv import load_dotenv
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 # Project .env wins over stale shell / User env (e.g. old CHAT_ROUTER_HOST).
+# BLOSSOM_KEEP_PROCESS_ENV=1 (eval launchers only): values the launcher set win instead, so a
+# test router can run another coder order (A/B 2026-11-24: CODER_MODELS from the launcher was
+# silently replaced by .env, and a "Qwen" cycle ran on Nemotron).
+_LAUNCHER_ENV = (
+    dict(os.environ)
+    if os.getenv("BLOSSOM_KEEP_PROCESS_ENV", "").strip().lower() in {"1", "true", "yes", "on"}
+    else {}
+)
 load_dotenv(SCRIPT_DIR / ".env", override=True)
 load_dotenv(PROJECT_ROOT / ".env", override=True)
+os.environ.update(_LAUNCHER_ENV)
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request

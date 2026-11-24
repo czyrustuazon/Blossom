@@ -111,6 +111,30 @@ Remaining failures are model behaviour: ignores its own syntax error, stops one 
 the round cap, misses part of the ask (prefixes, leftovers). Next lever to measure: round cap
 16 vs 11 (`--set blossom.agent.maxToolRounds=16`), alternating cycles.
 
+**Tenth part (2026-11-24): model A/Bs and a dense coder, extension 0.1.88 → 0.1.89.**
+All on the test router (:8093), real extension, 9 tasks, fence mode unless noted:
+
+| Arm | Score | Notes |
+|---|---|---|
+| Nemotron, native tool calls | 11/27 | 3 cycles; no gain over fence |
+| Nemotron, fence | 10/27 + 12/27 | two sets of 3 cycles → baseline **22/54 (~41%)** |
+| Qwen3-Coder-30B-A3B | 7/27 | faster, worse |
+| Qwen2.5-Coder-32B-Instruct (dense, Q4_K_M) | **0/9** | one cycle, 86 min, ~21 tok/s at 32k ctx / q4_0 KV; deleted |
+
+The dense 2024 model loops: it rewrites its plan and repeats the same failed search despite the
+host status. Agent training matters more than parameter count here. StarCoder2 was ruled out without
+a test (base models, no tool training, 16k context).
+- **Coder order for A/Bs:** ChatRouter and ResearchPipeline load `.env` with `override=True`, so a
+  launcher's `CODER_MODELS` was silently replaced (a "Qwen" arm ran on Nemotron). With
+  `BLOSSOM_KEEP_PROCESS_ENV=1` the launcher environment wins. Any coder A/B needs it. A model's launch
+  profile (`CODER_MODEL_PROFILES`) is read by the BROKER, so restart the broker with it in its env.
+- **0.1.89 host fixes** (both affect every coder): an empty regex-fallback search counted as
+  "1 hit(s)" and the status demanded "edit each line listed above" (now: "do NOT search it again");
+  a ```` ```scratchpad ```` memo under a "Step 6: EDIT test/x.js" heading was written over that test.
+- **Next:** screen newer agent-trained coders that fit 24 GB (Qwen3.6-35B-A3B, Qwen3.8-27B,
+  Devstral Small 2 24B, GLM-4.7-Flash), one cycle each, then 3 cycles for any that match Nemotron;
+  otherwise a LoRA on Nemotron's own passing traces.
+
 **Next (eighth part, done above):** install 0.1.82, start broker + test router on :8093 (fresh capsule copy), run the
 9-task baseline, then alternating A/B cycles: (a) 0.1.82 vs the 6/9 result, (b) round cap 16
 vs 11. Restart the test router (and the user's :8083) to load the SemanticMemory change.
