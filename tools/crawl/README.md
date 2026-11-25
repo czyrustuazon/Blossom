@@ -12,7 +12,9 @@ collections per language (`crawl_code_<lang>`) and per topic (`crawl_3ds`, `craw
 | `tune_budget.py` | Measures how many stamped chunks fit the embedder's 256-token window at several budgets |
 | `build_topic_corpus.py` | `scan` → `select` (prints counts per collection) → `split` → `import` (scratch Mind, or `--real-mind` into a staging store) → `promote` (moves staging to `Mind/assistant/crawl_chromadb`; restart the Assistant router) |
 
-Work files live in `Mind/rag/topic_build/` (gitignored).
+Work files live in `Mind/rag/topic_build/` (gitignored). The split files there are kept
+zstd-compressed (`split/*.jsonl.zst`); `import` reads `crawl_*.jsonl`, so decompress first
+(`zstd -d --long=27 split/*.jsonl.zst`) to re-embed without re-running scan/select/split.
 
 **Keep the crawl JSONL files** (compressed is fine) and the crawler's `data/` after importing.
 The store holds a curated slice embedded with one model; the JSONL is the only full copy and the
