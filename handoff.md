@@ -235,7 +235,7 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
   queries checked (tokio → tokio examples, libavcodec → ffmpeg doxygen, PHP login → PasswordHash.php),
   0.1–1.2 s per collection. The split files are now `split/*.jsonl.zst` (2.2 GB → 220 MB, tested);
   `import` globs `crawl_*.jsonl`, so `zstd -d --long=27` them first to re-embed. `candidates.sqlite`
-  (3.4 GB) is still in the work dir. `rag_github.jsonl` → `.zst` (verified, original removed). Crawler
+  was deleted (a rebuild reruns scan + select). `rag_github.jsonl` → `.zst` (verified, original removed). Crawler
   state copied from mainserver (`~/crawler/rag-web-crawler/data`) to the PC.
 - **Targeted crawl** runs on mainserver in tmux (`config.targeted.yaml`; Playwright + Chromium
   installed for dev.epicgames.com / developer.arm.com / nuxt.com). Output via `tee` is block-buffered,
