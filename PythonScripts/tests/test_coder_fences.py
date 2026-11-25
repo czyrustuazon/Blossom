@@ -157,3 +157,35 @@ def test_complete_answer_runs_once_with_output_contract():
         m["content"] for m in fake.calls[0]["messages"] if m["role"] == "system"
     )
     assert "[OUTPUT CONTRACT" in system_text
+
+
+def test_qwen35_plus_coders_get_card_sampling():
+    """Qwen3.5+ thinking coders loop at the 0.2 default; their cards say 0.6 / 0.95 / top_k 20."""
+    for name in ("Qwen3.6-35B-A3B-UD-Q4_K_M.gguf", "Qwen3.8-27B-UD-Q4_K_M.gguf", "Qwen_Qwen3.5-27B-Q4_K_M.gguf"):
+        with patch.object(ChatRouter, "_loaded_gguf_name", return_value=name):
+            s = ChatRouter._model_sampling("local_coder", 0.2)
+        assert s["temperature"] == 0.6 and s["top_p"] == 0.95 and s["extra_body"] == {"top_k": 20}, name
+    for name in ("Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf", "Qwen_Qwen3-14B-Q4_K_M.gguf",
+                 "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf"):
+        with patch.object(ChatRouter, "_loaded_gguf_name", return_value=name):
+            assert ChatRouter._model_sampling("local_coder", 0.2) == {"temperature": 0.2}, name
+    with patch.object(ChatRouter, "_loaded_gguf_name", return_value="Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"):
+        assert ChatRouter._model_sampling("persona", 0.82) == {"temperature": 0.82}
+
+
+def test_single_system_templates_get_one_leading_system_message():
+    """Devstral's template raised on every request: only one system message, and only first."""
+    msgs = [
+        {"role": "system", "content": "SYS"},
+        {"role": "system", "content": "BRIEF"},
+        {"role": "user", "content": "ASK"},
+        {"role": "assistant", "content": "A"},
+        {"role": "system", "content": "PUSH"},
+        {"role": "user", "content": "MORE"},
+    ]
+    fitted = ChatRouter._fit_messages_to_template(msgs, "Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf")
+    assert [m["role"] for m in fitted] == ["system", "user", "assistant", "user"]
+    assert fitted[0]["content"] == "SYS\n\nBRIEF"
+    assert fitted[3]["content"] == "[HOST NOTE]\nPUSH\n\nMORE"
+    for name in ("NVIDIA-Nemotron-3.5-Lightning-30B-A3B-IQ4_XS.gguf", "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"):
+        assert ChatRouter._fit_messages_to_template(msgs, name) is msgs

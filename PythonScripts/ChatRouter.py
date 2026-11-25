@@ -366,6 +366,44 @@ def _native_call_fence(name: str, arguments: Any) -> str:
     return f"\n```tool_call\n{body}\n```\n"
 
 
+# Mistral-family chat templates raise "Only user, assistant and tool roles are supported" for any
+# system message after the first (Devstral Small 2 eval, 2026-11-24: every request failed).
+_SINGLE_SYSTEM_RE = re.compile(r"Devstral|Mistral|Magistral|Ministral", re.IGNORECASE)
+
+
+def _fit_messages_to_template(messages: list[dict], model_name: str | None = None) -> list[dict]:
+    """For single-system templates: merge the leading system messages into one, and fold any
+    later system message into a user turn. Other models get the list unchanged."""
+    name = _loaded_gguf_name() if model_name is None else model_name
+    if not _SINGLE_SYSTEM_RE.search(name or ""):
+        return messages
+    index = 0
+    leading: list[str] = []
+    while index < len(messages) and messages[index].get("role") == "system":
+        leading.append(str(messages[index].get("content") or ""))
+        index += 1
+    fitted: list[dict] = [{"role": "system", "content": "\n\n".join(leading)}] if leading else []
+    for message in messages[index:]:
+        if message.get("role") == "system":
+            message = {"role": "user", "content": "[HOST NOTE]\n" + str(message.get("content") or "")}
+        previous = fitted[-1] if fitted else None
+        if (
+            previous is not None
+            and message.get("role") == "user"
+            and previous.get("role") == "user"
+            and isinstance(previous.get("content"), str)
+            and isinstance(message.get("content"), str)
+        ):
+            fitted[-1] = {**previous, "content": previous["content"] + "\n\n" + message["content"]}
+        else:
+            fitted.append(message)
+    return fitted
+
+
+# Qwen3.5 / 3.6 / 3.8 … GGUFs (not Qwen3-Coder or Qwen3-14B, which keep the caller's sampling).
+_QWEN35_PLUS_RE = re.compile(r"Qwen_?3\.[5-9]", re.IGNORECASE)
+
+
 def _model_sampling(source: str, temperature: float) -> dict[str, Any]:
     """Nemotron cards sample at 1.0 / 0.95 (agent tool rounds: CODER_AGENT_TEMPERATURE).
     Qwen keeps the caller's temperature."""
@@ -378,6 +416,11 @@ def _model_sampling(source: str, temperature: float) -> dict[str, Any]:
             else 1.0
         )
         kwargs["top_p"] = 0.95
+    elif _QWEN35_PLUS_RE.search(name) and source in {"local_coder", "agent_execution"}:
+        # Qwen3.5+ cards: 0.6 / 0.95 / top_k 20. The 0.2 default makes thinking models loop.
+        kwargs["temperature"] = 0.6
+        kwargs["top_p"] = 0.95
+        kwargs["extra_body"] = {"top_k": 20}
     elif "Bolt-E4B" in name and source == "persona":
         kwargs["temperature"] = 1.0
         kwargs["top_p"] = 0.95
@@ -858,7 +901,7 @@ def _stream_local_chat(
         """One streamed completion. Returns (native tool calls, finish_reason)."""
         stream = LOCAL_CLIENT.chat.completions.create(
             model=model,
-            messages=pass_messages,
+            messages=_fit_messages_to_template(pass_messages),
             stream=True,
             **sampling,
         )
@@ -1054,7 +1097,7 @@ def _local_completion(
     )
     response = LOCAL_CLIENT.chat.completions.create(
         model=LOCAL_VOICE_MODEL,
-        messages=messages,
+        messages=_fit_messages_to_template(messages),
         stream=False,
         **sampling,
     )

@@ -135,6 +135,199 @@ a test (base models, no tool training, 16k context).
   Devstral Small 2 24B, GLM-4.7-Flash), one cycle each, then 3 cycles for any that match Nemotron;
   otherwise a LoRA on Nemotron's own passing traces.
 
+**Eleventh part (2026-11-24 afternoon): newer coders, and the plan for 2026-11-25.**
+Candidate screen on 0.1.89 (scratchpad of session 8339d2d3: `cand_queue.ps1`, `rerun_dev2.ps1`,
+`nemo_control.ps1`; one line per cycle in `cand-progress.log`, results in `evals\cand\<cycle>\`):
+
+| Coder | Mode | Cycles | Score | Speed |
+|---|---|---|---|---|
+| Nemotron 3.5 Lightning (0.1.88 baseline) | fence | 6 | 22/54 (41%) | ~40 min/cycle |
+| **Qwen3.6-35B-A3B** | **native** | 3 | **22/27 (81%)**: 7, 7, 8 | ~30 min/cycle, ~125 tok/s |
+| Qwen3.6-35B-A3B | fence | 1 | 4/9 | |
+| **Qwen3.8-27B** | **fence** | 3 | **25/27 (93%)**: 8, 9, 8 | 105–153 min/cycle, ~44 tok/s, median 7.4 min/task |
+| Qwen3.8-27B | native | 1 | 7/9 | |
+| Devstral Small 2 24B (template fixed) | fence / native | 1 + 1 | 2/9, 2/9 | ~49 tok/s; out |
+| Nemotron on 0.1.89 (control) | fence | 2 | 8/18 (44%): 5, 3 | same as its 0.1.88 41% → the gain is the MODEL |
+
+FINAL (queue done 23:06): Qwen3.6 native = fast + 81% (median 2.7 min/task); Qwen3.8 fence =
+93% but ~3x slower. Qwen3.8's one miss (fen3 callbacks-to-async) was a host stall, see below.
+
+GGUFs in `Brains/models/coding/`: `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, `Qwen3.8-27B-UD-Q4_K_M.gguf`,
+`Devstral-Small-2-24B-Instruct-2512-Q4_K_M.gguf` (unsloth). Launch profile used for all three:
+`65536:q8_0:0:0` (passed to the broker via `CODER_MODEL_PROFILES` in its process env).
+Two router changes are UNCOMMITTED (ask first): Qwen3.5+ get their card sampling
+(0.6 / 0.95 / top_k 20; `_QWEN35_PLUS_RE` in `_model_sampling`), and Mistral-family models get one
+leading system message (`_fit_messages_to_template`; Devstral's template raised "Only user,
+assistant and tool roles are supported"). Tests in `tests/test_coder_fences.py` (89 pass).
+php-modernize failed for every coder until Qwen3.8 (fen1 hit the 60-min cap with the work done;
+fen2 passed at the cap; fen3 passed in time).
+**Host issues seen in q38-fen3 callbacks-to-async (outcome "stalled"), fix tomorrow:**
+- The extension's search-loop guard aborted round 1 while the coder was batch-reading 6 files
+  (`search-loop guard aborted the stream … stopped for search loop`). False positive: a batch
+  of distinct read_file calls is not a search loop.
+- Round 2: `STALL: no activity for 243s … stream aborted (0 bytes, 0 payloads)`. Zero bytes means
+  the router never started streaming (not slow thinking). Check what the router did first (the
+  router log shows a yandex web search + web_knowledge store in that cycle; research_gate should
+  skip web search for attached-code refactors), and whether the 240-s idle watchdog should count
+  router status events as activity.
+
+**PLAN for 2026-11-25 (agreed with the user):**
+1. Read the final `cand-progress.log` lines (Qwen3.8 fen2/fen3, Devstral rerun, nemo89 control).
+   If Nemotron on 0.1.89 stays near 41%, the gain is the model. Propose switching the user's
+   coder to Qwen3.6-35B-A3B with `blossom.agent.nativeToolCalls=true` (needs `.env`
+   `CODER_MODELS`/`CODER_MODEL_PATH` + a `CODER_MODEL_PROFILES` entry, the router changes above,
+   and the user's own :8083 restart). Ask before touching `.env`.
+2. **New RAG crawl** (user's crawler: `C:\Users\Zepse\Documents\rag-web-crawler\out`, finished
+   2026-11-24). Sampled 10k rows per file:
+   - `rag_github.jsonl` **50.8 GB, ~15M chunks** (median 2.9k chars): 81% `code_sample` with
+     `metadata.language` (javascript, go, c, php, rust, cpp, java, …), 19% `documentation`
+     (READMEs; no language but `repo` + `path`). Also `repo`, `path`, `stars`. Repos are broad
+     (firebug, TheAlgorithms/Java, terraform-plugin-framework, RPi-Jukebox-RFID, …).
+   - `rag_corpus.jsonl` 1.0 GB and `rag_docs.jsonl` 802 MB: web docs (ARM reference, CAPEC,
+     C docs), almost no `language`.
+   - `rag_code.jsonl` 19 MB: doc code snippets, mostly PowerShell/Azure (the kind that derailed a
+     Python rename in cycle 0).
+   - `tools/import_crawl_corpus.py` only reads rag_docs/rag_code from `Mind/rag/web_crawl` and its
+     META_KEYS drop `repo`, `path`, `stars`.
+   Do NOT embed all of rag_github into Chroma: ~15M vectors (CPU MiniLM embedder, many hours;
+   the HNSW index would not fit in 32 GB RAM next to the models). A GPU only speeds the
+   embedding (~1–2 h instead of ~a day); Chroma's index build, RAM (~23 GB of vectors alone) and
+   disk (~70–100 GB) stay the same. Instead:
+   0. **Split chunks to ~1,000 chars** (user's request). The default embedder (all-MiniLM-L6-v2)
+      reads only the first ~256 tokens (~1,000 chars); GitHub chunks have a median of 2.9k, so
+      most of each chunk is invisible to search today. **Use cAST** (user's choice; arXiv
+      2506.15655, EMNLP Findings 2025): parse each code chunk with tree-sitter, walk the AST
+      top-down, keep a node whole if it fits the size budget, recursively split oversized nodes
+      into their children, then greedily merge adjacent small siblings up to the budget. Measure
+      size in non-whitespace characters as the paper does (budget ≈ what fits MiniLM's 256
+      tokens, tune on samples). Parsers: `tree-sitter` + `tree-sitter-language-pack` (most of
+      our languages; check GDScript, HLSL/GLSL and assembly grammars, which exist but may need
+      separate packages). Fallbacks: no grammar / parse error → line-based split at blank lines;
+      Markdown/RST docs → split at headings, then paragraphs. Keep `repo`/`path`/`language`/
+      `chunk_index` + a `part` index, and stamp the file path (+ enclosing class/function name
+      from the AST) on each part so a fragment still says where it came from. Splitting ~triples the
+      count (~45M), so every cap below applies AFTER splitting. Alternative to weigh: an embedder
+      with a longer window (e.g. 512-token or 8k-token models): fewer, larger chunks, but the
+      existing crawl_docs/crawl_code/coding_lessons collections must be re-embedded with it
+      (one vector space per store).
+   a. **Curate by the user's four focus areas** (refined 2026-11-24), total budget that fits
+      RAM: about 2M chunks after splitting (~3 GB of vectors + index):
+      - Web: JavaScript, TypeScript, PHP, Python, Rust, Go, Ruby, Java, C#, SQL, Bash, and the
+        frameworks React (+ Next.js), Vue + Nuxt, Node.js (+ Express), Laravel. No HTML/CSS
+        (user: "surface level").
+        Framework census (same sample, `crawl_framework_census.py`): python 5262 rows / 80 repos,
+        rust 4622 / 26, go 4276 / 55 (all strong); Node.js ~450 rows / 34 repos (Express only 7);
+        React ~580 rows but 8 repos (mostly OpenCut + a React course), Next.js 17; PHP 586 / 12
+        repos (Laravel/Symfony 2 repos); Vue ~60 / 6; **Nuxt 0**. Targeted crawl needed for
+        React/Next, Vue/Nuxt, Node/Express and Laravel (official docs + a few real projects each).
+      - Low-level: C, C++, Rust, Make.
+      - Game engines: C# (Unity / Godot .NET), C++ (Unreal / Godot core), GDScript, Lua,
+        shaders (HLSL, GLSL, Godot shading language).
+      - Reverse engineering: assembly (x86/x64, ARM/Thumb, MIPS, 6502/65816, Z80, 68000),
+        C/C++, Python (Ghidra/IDA/angr/pwntools scripting), Java (Ghidra scripts), Frida JS, YARA.
+      Drop: Kotlin, Swift, Scala, Elixir, R, Dart, Haskell, Perl, F#.
+      Census of rag_github (50k rows from 50 seek points; `crawl_lang_census.py` in the session
+      scratchpad tools/): c 7260 (94 repos), python 5262, rust 4622, go 4276, cpp 3441, csharp
+      2320, java 2096, typescript 2044, kotlin 1863, javascript 1805, swift 1416, ruby 777,
+      scala 700, bash 603, php 586, make 396, sql 205, svelte 76, vue 35, lua 26 (4 repos);
+      docs chunks are .md/.rst. **Missing: GDScript, shaders, assembly, Nuxt, RE-tool
+      scripts; Lua, Vue, React and Laravel are thin.** Those need a targeted crawl by the user's crawler (e.g. Godot docs +
+      godot-demo-projects, Unity manual/scripting API, shader references, x86/ARM instruction
+      references, retro CPU references, Ghidra/radare2/rizin/angr/pwntools/Frida docs).
+      - Shell / git / Linux (user asked 2026-11-24): bash, Make, Dockerfile, git commands, Linux
+        command line. Code has bash 603 rows over 83 repos (mostly CI/build scripts), make 396 / 66
+        repos, dockerfile 51 / 33. Docs have essentially none: git-scm.com 1 row, gnu.org 3, no
+        man7.org / tldr / Arch wiki in 120k sampled doc rows (`crawl_domain_census.py`). Targeted
+        crawl: git-scm.com/docs + the Pro Git book, the GNU Bash manual, man7.org (coreutils,
+        util-linux, procps, findutils, grep/sed/awk), tldr-pages (short command examples: very
+        good RAG material), the ShellCheck wiki (common bash mistakes), selected Arch wiki pages.
+      - **3DS homebrew / devkitPro** (user asked; KEEP as its own slice). Full-file scan of
+        rag_github (`crawl_keyword_scan.py`, 50 GB in ~5 min): libctru 4038 rows, devkitPro 4882,
+        3dsx 3882, Luma3DS 3731, citro3d 2999, citro2d 2843, devkitARM 2594, makerom 1203, Citra
+        1742. Repos: devkitPro/libctru, 3ds-examples, citro3d/citro2d, libogc, wut, pacman;
+        LumaTeam/Luma3DS (+ Rosalina plugins), smealum/ninjhax, derrekr/fastboot3DS;
+        rust3ds/ctru-rs + citro3d-rs; CIA/makerom tools; Citra/Cytrus; ports (Xash3DS,
+        undertale-3ds, dead-space-3ds-port, DSSH, ThirdTube). Select by these identifiers, not by
+        the phrase "Nintendo 3DS" (39k rows, mostly READMEs/guides).
+      **Doc crawls are heavily skewed by domain:** ffmpeg.org is ~45–52% of rag_docs and
+      rag_corpus, learn.microsoft.com ~30–37% (the PowerShell/Azure source), then github.com,
+      CWE/CAPEC, OWASP/OpenSSF, MDN, Go, ARM, rizin, Ghidra in the remaining sliver. The user
+      WANTS ffmpeg and Microsoft Learn kept. So do not cut them; ROUTE instead:
+      - Separate Chroma collections per topic: crawl_ffmpeg, crawl_mslearn (tag the product from
+        the URL path: powershell / azure / dotnet / cpp / windows-win32 / …), crawl_3ds
+        (devkitPro family), crawl_security (CWE/CAPEC/OWASP), crawl_re (ARM, rizin, Ghidra,
+        capstone, unicorn), and GitHub code per language (crawl_code_<lang>).
+      - `_crawl_reference_block` picks collections from the task: attached file extensions →
+        language collections; keywords / imports in the prompt (ffmpeg, libav*, PowerShell,
+        Azure, libctru/citro/3dsx, …) → topic collections. Unmatched topics are never searched.
+      - Chroma keeps a collection's HNSW index in RAM only once it is queried, so per-topic
+        collections also lift the single-index ~2M-chunk RAM ceiling: only the collections a
+        session actually touches are resident.
+      - rag_docs and rag_corpus look heavily overlapping (same top domains): dedupe by
+        `content_hash` / canonical URL before splitting.
+      **Targeted crawl list (for the user's crawler; none of these domains is in the current
+      doc crawls):**
+      - Godot: docs.godotengine.org/en/stable (manual, GDScript reference, class reference,
+        shading language), github.com/godotengine/godot-demo-projects.
+      - Unity: docs.unity3d.com/Manual and docs.unity3d.com/ScriptReference (C# scripting API),
+        Unity HLSL/ShaderLab docs, github.com/Unity-Technologies samples.
+      Engine-code scan of rag_github (full file): Unity strong (MonoBehaviour 12.9k rows:
+      Unity-Technologies game-programming-patterns-demo, SebLague, Microsoft.Unity.Analyzers,
+      MonoBehaviourTree; tagged csharp). Unreal ~1.2k rows from real plugins (FlowGraph,
+      OpenUnrealUtilities, HoudiniEngineForUnreal, RealtimeMeshComponent, Unreal.js, ROSIntegration,
+      PalworldModdingKit, unrealcpp). GLSL ok (gl_FragColor 3.4k), HLSL thin (SV_Target 152).
+      Godot essentially absent (func _ready 117 rows, mostly not Godot projects; "extends Node"
+      hits are JS AST libraries). Unity/Unreal slices select by these markers.
+      - Unreal: dev.epicgames.com/documentation/en-us/unreal-engine (programming & scripting,
+        C++ API reference, gameplay framework, Blueprints, materials/HLSL). Engine source
+        (EpicGames/UnrealEngine) is private on GitHub (needs an Epic-linked account), so use the
+        docs plus public sample/plugin repos.
+      - Shaders: Khronos GLSL spec/reference pages, Microsoft HLSL reference (learn.microsoft.com,
+        already crawled: tag it), The Book of Shaders.
+      - Web frameworks: react.dev, nextjs.org/docs, vuejs.org, nuxt.com/docs, nodejs.org/api,
+        expressjs.com, laravel.com/docs, php.net/manual.
+      - Shell / git / Linux: git-scm.com/docs + Pro Git, GNU Bash manual, man7.org, tldr-pages,
+        ShellCheck wiki, selected Arch wiki.
+      - Reverse engineering / assembly: x86 reference (felixcloutier.com/x86), ARM developer
+        docs, retro CPU references (6502/65816, Z80, 68000, MIPS), Ghidra docs + scripting API,
+        radare2/rizin book (rizin partly crawled), angr, pwntools, Frida docs.
+      - 3DS: libctru / citro2d / citro3d API docs (devkitPro), 3dbrew.org wiki.
+      Within the budget: balanced cap per language (small languages keep everything), cap per
+      repo so one big repo cannot fill a language,
+      prefer higher `stars`, dedupe by `content_hash`, and drop vendored / generated / minified /
+      lock files / test fixtures / license-only chunks. Map README/doc chunks to a language from
+      `path` (extension) or the repo's dominant language. Print the per-language counts for the
+      user before importing.
+   b. Language filter at retrieval: `_crawl_reference_block` gets the language of the attached
+      files (extension → language) and passes a Chroma `where={"language": …}` for code chunks;
+      docs fall back to the distance cutoff. Extend the importer to keep `repo`/`path`/`language`
+      and read the new files.
+   c. Add 1–2 C eval tasks (e.g. rename a struct field across .c/.h; split a module + headers)
+      so the C docs can show a benefit; the current 9 tasks are Python/JS/PHP only.
+   d. A/B crawl retrieval on vs off with the new coder (copy the curated collections into the
+      capsule Mind): Python/JS tasks = harm check, C tasks = benefit check.
+
+**Reading list (2026-11-24, mapped to the plan):**
+- Chunking (step 0): cAST, AST-based chunking with tree-sitter (EMNLP Findings 2025, arXiv
+  2506.15655): split oversized AST nodes, merge small siblings to a size limit; +4.3 Recall@5 on
+  RepoEval. Use this instead of blank-line splitting. Also arXiv 2605.04763 (controlled study of
+  chunking for code RAG).
+- Embedders: small long-window code embedders (Jina code embeddings 137M / 8k tokens; Qodo-Embed-1
+  1.5B) fit next to the coder; nomic-embed-code is 7B (too big beside a 20 GB coder). Benchmark
+  2–3 on our own queries before re-embedding.
+- Context: Chroma "Context rot" (trychroma.com/research/context-rot): accuracy falls with input
+  length and with distractors, even on easy tasks. Supports routing + few, short crawl chunks.
+  "Context as a Tool" (arXiv 2512.22087): context management for long-horizon SWE agents (session
+  compaction ideas).
+- Scaffold: Agentless (arXiv 2407.01489): localize → repair → validate with generated reproduction
+  tests and patch re-ranking (cf. our host-run tests). mini-SWE-agent / SWE-bench bash-only:
+  2.x moved from parsing text actions to tool calling (matches our native-tools result).
+- Training (LoRA later): SWE-Gym (arXiv 2412.21139), rejection-sampling fine-tuning on 491
+  successful trajectories; NOTE its self-improvement from the model's OWN samples was weaker than
+  learning from a stronger model's. SWE-smith (arXiv 2504.21798) synthesizes many task instances by
+  breaking real repos: could grow our 9-task eval set. Step rejection fine-tuning (arXiv
+  2605.10674); on-policy expert corrections (arXiv 2512.14895).
+
 **Next (eighth part, done above):** install 0.1.82, start broker + test router on :8093 (fresh capsule copy), run the
 9-task baseline, then alternating A/B cycles: (a) 0.1.82 vs the 6/9 result, (b) round cap 16
 vs 11. Restart the test router (and the user's :8083) to load the SemanticMemory change.
