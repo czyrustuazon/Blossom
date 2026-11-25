@@ -84,8 +84,48 @@ _collections: dict[tuple[str, str], Any] = {}
 _clients_lock = threading.Lock()
 
 
+def is_topic_crawl(name: str) -> bool:
+    """Per-topic crawl collections (crawl_code_<lang>, crawl_3ds, …; CrawlTopics.py). The legacy
+    crawl_docs / crawl_code pair stays in the main store."""
+    return name.startswith("crawl_") and name not in {COLLECTION_CRAWL_DOCS, COLLECTION_CRAWL_CODE}
+
+
+def crawl_store_dir(surface: str) -> Path:
+    """Topic-crawl collections live in their own Chroma dir beside the Mind's: millions of
+    rebuildable vectors stay out of the personal store, and the importer can build a staging
+    copy (CRAWL_CHROMA_DIR) without a second process writing the live Mind."""
+    override = os.getenv("CRAWL_CHROMA_DIR", "").strip()
+    return Path(override) if override else MindStores.chroma_dir(surface).parent / "crawl_chromadb"
+
+
 def collection_home(name: str) -> str | None:
+    if name not in COLLECTION_HOME and name.startswith("crawl_"):
+        return SURFACE_ASSISTANT
     return COLLECTION_HOME.get(name, SURFACE_COMPANION)
+
+
+_existing_cache: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def existing_collections(surface: str | None = None, ttl: float = 60.0) -> frozenset[str]:
+    """Collection names in a surface's main + crawl stores, creating nothing (cached ~1 min)."""
+    store = surface or current_surface() or SURFACE_ASSISTANT
+    cached = _existing_cache.get(store)
+    now = time.time()
+    if cached and now - cached[0] < ttl:
+        return cached[1]
+    names: set[str] = set()
+    for path in (MindStores.chroma_dir(store), crawl_store_dir(store)):
+        if not path.is_dir():
+            continue  # never create a store just to list it
+        try:
+            raw = _client_at(path).list_collections()
+            names.update(c if isinstance(c, str) else getattr(c, "name", str(c)) for c in raw)
+        except Exception:  # noqa: BLE001 — store locked / unreadable: treat as empty
+            logger.debug("list_collections failed for %s", path, exc_info=True)
+    result = frozenset(names)
+    _existing_cache[store] = (now, result)
+    return result
 
 
 def store_surface_for(name: str, surface: str | None = None) -> str | None:
@@ -103,8 +143,7 @@ def store_surface_for(name: str, surface: str | None = None) -> str | None:
     return None
 
 
-def _get_client(surface: str):
-    path = MindStores.chroma_dir(surface)
+def _client_at(path: Path):
     key = str(path)
     with _clients_lock:
         client = _clients.get(key)
@@ -118,6 +157,14 @@ def _get_client(surface: str):
         return client
 
 
+def _get_client(surface: str):
+    return _client_at(MindStores.chroma_dir(surface))
+
+
+def _store_path(name: str, store: str) -> Path:
+    return crawl_store_dir(store) if is_topic_crawl(name) else MindStores.chroma_dir(store)
+
+
 def _get_collection(name: str, *, surface: str | None = None):
     """Collection handle, or None when the active surface may not touch it."""
     store = store_surface_for(name, surface)
@@ -126,10 +173,11 @@ def _get_collection(name: str, *, surface: str | None = None):
             "Collection %s is not reachable from surface %s", name, surface or current_surface()
         )
         return None
-    key = (str(MindStores.chroma_dir(store)), name)
+    path = _store_path(name, store)
+    key = (str(path), name)
     coll = _collections.get(key)
     if coll is None:
-        coll = _get_client(store).get_or_create_collection(
+        coll = _client_at(path).get_or_create_collection(
             name=name,
             metadata={"hnsw:space": "cosine"},
         )

@@ -72,7 +72,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
 from LlamaServerManager import CODER_CTX, PERSONA_CTX, server_manager
-from LocalModels import coder_ladder, persona_brain_path, primary_coder
+from LocalModels import (
+    coder_catalog,
+    coder_label,
+    coder_ladder,
+    match_coder,
+    order_ladder,
+    persona_brain_path,
+    primary_coder,
+)
 from EditorContext import (
     EDITOR_TOKEN_BUDGET,
     build_task_brief,
@@ -122,11 +130,13 @@ from SemanticMemory import (
     COLLECTION_WEB,
     HARD_BANS_PROMPT_MAX_CHARS,
     HARD_BANS_TOP_K,
+    existing_collections,
     format_memories_for_prompt,
     learn_coding_lesson,
     query_coding_lessons,
     query_memories,
 )
+from CrawlTopics import TOPIC_COLLECTIONS, route_collections
 from FeedbackStore import (
     apply_correctness_feedback,
     ensure_feedback_table,
@@ -312,6 +322,72 @@ def _loaded_gguf_name() -> str:
 _AGENT_ROUND_CV: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "blossom_agent_round", default=False
 )
+# The coder the host picked for this request (`blossom_coder`: id, file name or a unique
+# substring of it). Empty = the CODER_MODELS order.
+_CODER_CHOICE_CV: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "blossom_coder_choice", default=""
+)
+# Set when the streaming client went away. The decode loop stops llama-server and the
+# request unwinds, so the brain lease frees for the host's next round (eval 2026-11-24,
+# q38-fen3: the host aborted round 1, the router kept decoding it to the token cap while
+# holding the lease, and round 2 sat at 0 bytes until the 240-s stall watchdog fired).
+_CANCEL_CV: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
+    "blossom_request_cancel", default=None
+)
+
+
+class RequestCancelled(BaseException):
+    """The client disconnected. BaseException so generic `except Exception` fallbacks
+    (next coder, sequential mode, stall pushes) never treat it as a model failure."""
+
+
+def _cancelled() -> bool:
+    event = _CANCEL_CV.get()
+    return bool(event and event.is_set())
+
+
+def _raise_if_cancelled() -> None:
+    if _cancelled():
+        raise RequestCancelled()
+
+
+def _coder_ladder() -> list:
+    """Available coders for this request, the host's pick first."""
+    return order_ladder(coder_ladder(available_only=True), _CODER_CHOICE_CV.get())
+
+
+LEASE_WAIT_NOTICE_SEC = float(os.getenv("LEASE_WAIT_NOTICE_SEC", "2"))
+
+
+@contextlib.contextmanager
+def _lease_for_request(progress: ProgressFn | None):
+    """swap_lock for one chat request. If another request still holds the brain, say so
+    once (the host sees a status instead of 0 bytes), and skip the work entirely when the
+    client left while this request waited."""
+    acquired = threading.Event()
+
+    def notice() -> None:
+        if not acquired.is_set():
+            _think(
+                progress,
+                "lease_wait",
+                "Waiting for the brain: another request is still running on it…",
+            )
+
+    timer = threading.Timer(LEASE_WAIT_NOTICE_SEC, notice)
+    timer.daemon = True
+    timer.start()
+    try:
+        with swap_lock:
+            acquired.set()
+            timer.cancel()
+            _raise_if_cancelled()
+            yield
+    finally:
+        acquired.set()
+        timer.cancel()
+
+
 # Tool-call rounds need exact JSON and fence syntax; at 1.0 the coder drifts into
 # malformed calls and "```</think>" loops. Plain coding answers keep the card's 1.0.
 CODER_AGENT_TEMPERATURE = float(os.getenv("CODER_AGENT_TEMPERATURE", "0.6"))
@@ -675,7 +751,7 @@ def _get_agent_execution_intel(
     _, _, run_agent_execution_turn = _agent_execution_imports()
 
     def complete_fn(messages: list[dict[str, str]], temperature: float) -> str:
-        ladders = coder_ladder(available_only=True)
+        ladders = _coder_ladder()
         if not ladders:
             raise RuntimeError(
                 "Agent execution requires a local coder GGUF or the agent sandbox only."
@@ -899,6 +975,7 @@ def _stream_local_chat(
 
     def run_pass(pass_messages: list[dict], visible: bool) -> tuple[list[dict], str | None]:
         """One streamed completion. Returns (native tool calls, finish_reason)."""
+        _raise_if_cancelled()
         stream = LOCAL_CLIENT.chat.completions.create(
             model=model,
             messages=_fit_messages_to_template(pass_messages),
@@ -912,6 +989,13 @@ def _stream_local_chat(
         chunk_no = 0
         for chunk in stream:
             chunk_no += 1
+            if _cancelled():
+                logger.info("client disconnected; stopping the llama-server stream (%s)", source)
+                try:
+                    stream.close()  # closes the HTTP response → llama-server stops decoding
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+                raise RequestCancelled()
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -1543,8 +1627,14 @@ def _persona_chat_messages(
 CRAWL_MAX_DISTANCE = float(os.getenv("CRAWL_MAX_DISTANCE", "0.45"))
 
 
-def _crawl_reference_block(focus: str) -> tuple[str, int]:
-    """Docs and code from the first-pass crawl, for the coder prompt only."""
+def _crawl_reference_block(
+    focus: str, attached_paths: list[str] | tuple[str, ...] = ()
+) -> tuple[str, int]:
+    """Docs and code from the crawl, for the coder prompt only.
+
+    Per-topic collections (CrawlTopics.py) when they exist: code from the attached files'
+    languages, docs/code from topics the ask names. Unmatched topics are never searched.
+    Until the topic import has run, the legacy crawl_docs / crawl_code pair is used."""
 
     def _stamp_url(hits: list[dict]) -> list[dict]:
         stamped = []
@@ -1565,12 +1655,30 @@ def _crawl_reference_block(focus: str) -> tuple[str, int]:
             if h.get("distance") is None or float(h["distance"]) <= CRAWL_MAX_DISTANCE
         ]
 
-    docs = _stamp_url(
-        _close(query_memories(focus, collection=COLLECTION_CRAWL_DOCS, top_k=4))
-    )
-    code = _stamp_url(
-        _close(query_memories(focus, collection=COLLECTION_CRAWL_CODE, top_k=3))
-    )
+    def _nearest(hits: list[dict], k: int) -> list[dict]:
+        return sorted(hits, key=lambda h: float(h.get("distance") or 0.0))[:k]
+
+    existing = existing_collections(SURFACE_ASSISTANT)
+    routed = [c for c in route_collections(focus, attached_paths) if c in existing]
+    if any(c.startswith("crawl_code_") or c in TOPIC_COLLECTIONS for c in existing):
+        doc_hits: list[dict] = []
+        code_hits: list[dict] = []
+        for coll in routed:
+            hits = _close(query_memories(focus, collection=coll, top_k=3))
+            for hit in hits:
+                is_code = coll.startswith("crawl_code_") or (
+                    str((hit.get("metadata") or {}).get("kind") or "") == "code_sample"
+                )
+                (code_hits if is_code else doc_hits).append(hit)
+        docs = _stamp_url(_nearest(doc_hits, 4))
+        code = _stamp_url(_nearest(code_hits, 3))
+    else:
+        docs = _stamp_url(
+            _close(query_memories(focus, collection=COLLECTION_CRAWL_DOCS, top_k=4))
+        )
+        code = _stamp_url(
+            _close(query_memories(focus, collection=COLLECTION_CRAWL_CODE, top_k=3))
+        )
     parts: list[str] = []
     if docs:
         parts.append(
@@ -1726,7 +1834,7 @@ def _local_coder_answer(
                 count=len(lessons),
             )
         _think(on_progress, "crawl_corpus", "Retrieving crawled docs and code…")
-        crawl_block, crawl_count = _crawl_reference_block(focus)
+        crawl_block, crawl_count = _crawl_reference_block(focus, attached)
         if crawl_block:
             lesson_block = (
                 f"{lesson_block}\n\n{crawl_block}" if lesson_block else crawl_block
@@ -2016,7 +2124,15 @@ def _get_coding_intel(
     web_block = "" if force_sequential else _gather_web_context(
         user_prompt, coding=True, on_progress=on_progress
     )
-    ladders = coder_ladder(available_only=True)
+    ladders = _coder_ladder()
+    choice = _CODER_CHOICE_CV.get()
+    if choice and ladders and match_coder(choice, ladders) is None:
+        _think(
+            on_progress,
+            "coder_choice",
+            f"Requested coder '{choice}' is not in CODER_MODELS or missing on disk; "
+            f"using {ladders[0].name}.",
+        )
     answer = ""
     answer_source = "local_coder"
     memory_id: str | None = None
@@ -2545,7 +2661,7 @@ def __run_chat_pipeline_inner(
     japanese = is_japanese_request(last_user_message)
     agent_execution = _should_use_agent_execution(last_user_message)
 
-    with swap_lock:
+    with _lease_for_request(progress):
         if agent_execution:
             route = "agent"
             _think(progress, "route", "Detected code-execution agent task.")
@@ -2820,8 +2936,18 @@ _SESSION_SUMMARY_SYSTEM = (
 )
 
 
-def _summarize_with_loaded_model(text: str, max_chars: int) -> tuple[str, str]:
-    """Summarize on whichever llama-server role is already up (no swap unless none is)."""
+_THINK_SPAN_RE = re.compile(r"<think>.*?(?:</think>|$)", re.S)
+
+
+def _summarize_with_loaded_model(text: str, max_chars: int, focus: str = "") -> tuple[str, str]:
+    """Summarize on whichever llama-server role is already up (no swap unless none is).
+
+    Thinking is switched off: Qwen3.5+/Nemotron spent the small max_tokens budget on
+    reasoning_content and returned an empty summary, so the host fell back to rules.
+    `focus` (the user's /compact note) says what the summary must keep in detail."""
+    system = _SESSION_SUMMARY_SYSTEM
+    if focus.strip():
+        system += f"\nThe user asked this summary to focus on: {focus.strip()[:500]}"
     with swap_lock:
         role = server_manager.current_role
         if not role or not server_manager.is_healthy():
@@ -2837,7 +2963,7 @@ def _summarize_with_loaded_model(text: str, max_chars: int) -> tuple[str, str]:
             response = LOCAL_CLIENT.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": _SESSION_SUMMARY_SYSTEM},
+                    {"role": "system", "content": system},
                     {
                         "role": "user",
                         "content": (
@@ -2849,8 +2975,10 @@ def _summarize_with_loaded_model(text: str, max_chars: int) -> tuple[str, str]:
                 temperature=0.2,
                 max_tokens=min(max(256, limit // 3), reply_cap),
                 stream=False,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
-            return _message_text(response.choices[0].message)[:limit]
+            raw = _message_text(response.choices[0].message)
+            return _THINK_SPAN_RE.sub("", raw).strip()[:limit]
 
         reply_tokens = min(max(256, max_chars // 3), ctx // 4)
         k = max(1, min(SUMMARY_PARALLEL, ctx // SUMMARY_MIN_SLICE_TOKENS))
@@ -2894,9 +3022,10 @@ async def summarize_session(request: Request):
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
     max_chars = max(500, min(int(body.get("max_chars") or 6000), 200_000))
+    focus = str(body.get("focus") or "")
     try:
         summary, role = await asyncio.get_running_loop().run_in_executor(
-            _executor, _summarize_with_loaded_model, text, max_chars
+            _executor, _summarize_with_loaded_model, text, max_chars, focus
         )
     except Exception as exc:
         logger.exception("Session summarize failed")
@@ -2904,11 +3033,24 @@ async def summarize_session(request: Request):
     return {"ok": True, "summary": summary, "role": role}
 
 
+@app.get("/v1/coders")
+async def list_coders():
+    """Coders a host can pick per request with `blossom_coder`, with the tool-call mode each
+    one does best in (hosts send OpenAI `tools` only for "native")."""
+    loaded = server_manager.current_model if server_manager.current_role == "coder" else None
+    return {
+        "coders": coder_catalog(),
+        "loaded": loaded.name if loaded else None,
+        "loaded_label": coder_label(loaded) if loaded else None,
+    }
+
+
 @app.get("/health")
 async def health():
     ladder = coder_ladder(available_only=False)
     available = [m.name for m in ladder if m.available]
     return {
+        "supports_coder_choice": True,
         "ok": True,
         "local": LLAMA_SERVER_URL,
         "active_role": server_manager.current_role,
@@ -3437,6 +3579,10 @@ async def route_chat(request: Request):
     agent_tools = body.get("tools") if isinstance(body.get("tools"), list) else None
     raw_ask = body.get("blossom_ask")
     ask = raw_ask.strip() if isinstance(raw_ask, str) else ""
+    raw_coder = body.get("blossom_coder")
+    _CODER_CHOICE_CV.set(raw_coder.strip() if isinstance(raw_coder, str) else "")
+    cancel_event = threading.Event()
+    _CANCEL_CV.set(cancel_event)
     locale = normalize_locale(
         body.get("blossom_locale")
         or body.get("locale")
@@ -3548,6 +3694,8 @@ async def route_chat(request: Request):
                     VOICE_ENABLED,
                 )
             queue.put(("stop", None))
+        except RequestCancelled:
+            logger.info("Client disconnected; request stopped and the brain released.")
         except HTTPException as exc:
             queue.put(("error", {"status_code": exc.status_code, "detail": exc.detail}))
         except Exception as exc:
@@ -3563,6 +3711,18 @@ async def route_chat(request: Request):
     ).start()
 
     async def event_stream():
+        finished = False
+        try:
+            async for line in _event_lines():
+                yield line
+            finished = True
+        finally:
+            if not finished:
+                # Client went away mid-stream (Starlette cancels this generator): stop the
+                # worker's llama-server decode so it releases the brain lease.
+                cancel_event.set()
+
+    async def _event_lines():
         streamed_parts: list[str] = []
         while True:
             kind, payload = await asyncio.to_thread(queue.get)

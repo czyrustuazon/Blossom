@@ -171,6 +171,65 @@ fen2 passed at the cap; fen3 passed in time).
   skip web search for attached-code refactors), and whether the 240-s idle watchdog should count
   router status events as activity.
 
+**Archives (2026-11-25):** the temp scratchpads of the 11/20–11/24 sessions (ee950be3, fcc3cbbf,
+52808fc0, c6a28c8a, 8339d2d3 — every eval trace/round file/score, router logs, queue scripts such as
+`cand_queue.ps1`) are in `C:\Users\Zepse\Documents\Blossom-archive\training-sessions-2026-11-20_to_24.7z`
+(paths inside = `<session>\scratchpad\…`); their capsule Minds in `capsule-minds-2026-11-20_to_24.7z`.
+Both tested OK; the temp originals were deleted. Scratchpad paths quoted below now live in those archives.
+
+**Twelfth part (2026-11-25): coder picker, both stalls fixed, /compact, crawl pipeline started.**
+Extension 0.1.90 built and installed in VS Code + Cursor. UNCOMMITTED in Blossom, Blossom
+Assistant and rag-web-crawler (ask before committing). The user's broker (:8085) and router
+(:8083) still run last night's code: **restart both** to get the new `.env` coder order and the fixes.
+- **Coder picker.** `.env`: `CODER_MODELS` = Qwen3.8-27B (default), Qwen3.6-35B-A3B, Nemotron;
+  `CODER_MODEL_PROFILES` gained `Qwen3.8-27B=65536:q8_0:0:0;Qwen3.6-35B-A3B=65536:q8_0:0:0` (the
+  broker reads it, so restart the broker); `CODER_TOOL_MODES=Qwen3.6=native;Qwen3.8=fence;Nemotron=fence`.
+  Router: `GET /v1/coders` (id, label, file, available, tool_mode, default); request field
+  `blossom_coder` puts that coder first for the request (`LocalModels.order_ladder`, `_CODER_CHOICE_CV`).
+  Extension: setting `blossom.agent.coder` ("" = router default), `blossom.agent.toolCallMode`
+  (auto = the coder's mode; `nativeToolCalls=true` still forces native in auto, so old eval `--set`s
+  work), status-bar item + "Blossom: Select Coder Model", and a coder menu in the chat box. A switch
+  reloads the GGUF on the next request (Qwen3.6: 23 s measured). For eval arms use
+  `--set blossom.agent.coder=<id>` (and `toolCallMode=fence|native` to override).
+- **Stall 2 (0 bytes for 243 s) — root cause:** `run_chat_pipeline` holds `swap_lock` (the broker
+  lease) for the whole coder call and nothing stopped llama-server when the client went away, so the
+  host's next round queued behind the aborted one until it hit the token cap. Fix: per-request cancel
+  event set when the SSE generator is closed; the decode loop closes the llama-server stream and
+  raises `RequestCancelled` (a BaseException, so the next-coder / sequential fallbacks never catch
+  it); a request that waited >2 s for the lease emits a `lease_wait` status. **Live check on a test
+  router:** round 2's first token came 1.0 s after round 1 was dropped (Qwen3.8; 0.9 s on Qwen3.6).
+- **Stall 1 (search-loop guard "false positive")** was really this: the coder made 6 real read_file
+  calls (455 chars), then role-played an `[AGENT TOOL TRANSCRIPT]` and "Let me re-read…" narration;
+  the guard fired at 5.7k chars. The host now stops the stream as soon as `FAKE_TOOL_OUTPUT_RE`
+  matches (everything after it was already discarded), and that abort now also frees the router.
+- **/compact and /summarize.** Auto compaction already existed (rolling chapter summary in
+  `blossom_session`). New: `/compact [focus]` (or the Compact button / command) folds everything but
+  the last exchange into the summary now; `/summarize [focus]` (command "Summarize Conversation into a
+  New Chat") opens a new tab seeded with one standalone summary + the files/edits ledger. Router
+  `/v1/blossom/summarize` takes `focus` and turns thinking off (Qwen3.5+/Nemotron spent the small
+  max_tokens on reasoning and returned an empty summary → rules fallback).
+- **Crawl (started):** `tools/crawl/cast_chunk.py` (cAST over tree-sitter-language-pack, installed;
+  grammars incl. gdscript/hlsl/glsl/asm/nasm), `PythonScripts/CrawlTopics.py` (routing, both sides),
+  `tools/crawl/build_topic_corpus.py` (scan → select → split → import; work dir
+  `Mind/rag/topic_build/`, gitignored; import defaults to a scratch Mind, `--real-mind` needs the
+  user's OK), `tools/crawl/tune_budget.py`. Budget = **450 non-whitespace chars**: MiniLM reads code
+  at ~3 chars/token, so ~1,000 raw chars would still be cut; at 450, 94% of code parts and 93% of doc
+  parts fit 256 tokens (median ~520 chars). A GitHub row splits into ~5.3 parts (not ~3), so the
+  ~2.3M-part budget is ~400k source rows. `_crawl_reference_block` routes by attached-file language +
+  ask keywords once `crawl_code_*`/topic collections exist, else keeps the legacy pair.
+  Docs: rag_docs + rag_corpus + rag_code = 985k rows but only **127k unique** after content_hash
+  dedupe (ffmpeg 62k, MS Learn 55k). 45 of 65 seed hosts in seeds.txt delivered <20 unique rows
+  (php.net 4, cppreference 0, git-scm 18, rizin book 4, libctru 4): listed again in the targeted crawl.
+- **Targeted crawl (crawler repo, new files):** `seeds_targeted.txt` (98 seeds; URLs from memory,
+  run `--config config.targeted.yaml crawl --sample 5` first), `github_repos_targeted.txt`,
+  `config.targeted.yaml` (own queue DB and outputs `out/rag_targeted.jsonl` /
+  `out/rag_github_targeted.jsonl`; the importer reads both). `github_ingest._CODE_EXT` gained
+  .gd/.gdshader/.hlsl/.glsl/.vert/.frag/.shader/.asm/.s/.yar/.mk/.cmake (Godot/shader/asm repos gave
+  README rows only). tldr pages live under `pages/`, which the ingest does not read yet.
+- Tests: router 124 pass (new `tests/test_coder_choice_and_cancel.py`, `tests/test_crawl_topics.py`),
+  eval tools 81, `tools/crawl/test_cast_chunk.py` 8, extension 12 check scripts (new
+  `npm run test:coder-choice`), crawler `test_github_ingest.py` 12.
+
 **PLAN for 2026-11-25 (agreed with the user):**
 1. Read the final `cand-progress.log` lines (Qwen3.8 fen2/fen3, Devstral rerun, nemo89 control).
    If Nemotron on 0.1.89 stays near 41%, the gain is the model. Propose switching the user's

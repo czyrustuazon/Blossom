@@ -30,6 +30,7 @@ Mind/logs/
 Mind/.store-migration.lock
 Mind/rag/web_crawl/*.jsonl
 Mind/rag/web_crawl/*.json
+Mind/rag/topic_build/
 
 # Logs
 *.log

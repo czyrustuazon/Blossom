@@ -112,6 +112,81 @@ def primary_coder() -> LocalModel:
     return ladder[0] if ladder else LocalModel(path=DEFAULT_CODER, kind="coder")
 
 
+# Coder picker (Blossom Assistant switches coders per request with `blossom_coder`).
+# Tool-call mode each coder scored best with on the refactor eval (2026-11-24):
+# Qwen3.8-27B fence 25/27 (native 7/9), Qwen3.6-35B-A3B native 22/27 (fence 4/9), Nemotron fence.
+# "substring=native|fence;…" — first match wins, unmatched files use "fence".
+DEFAULT_CODER_TOOL_MODES = "Qwen3.6=native;Qwen3.8=fence;Nemotron=fence"
+_KNOWN_CODER_LABELS = (
+    ("Qwen3.8-27B", "Qwen3.8 27B"),
+    ("Qwen3.6-35B-A3B", "Qwen3.6 35B-A3B"),
+    ("Nemotron-3.5-Lightning", "Nemotron 3.5 Lightning 30B"),
+    ("Qwen3-Coder-30B-A3B", "Qwen3-Coder 30B-A3B"),
+    ("Devstral-Small-2", "Devstral Small 2 24B"),
+    ("DeepSeek-Coder-V2-Lite", "DeepSeek-Coder-V2 Lite"),
+)
+
+
+def coder_id(path: Path) -> str:
+    """Stable id for a coder GGUF: the file stem, lower case."""
+    return path.stem.lower()
+
+
+def coder_label(path: Path) -> str:
+    for needle, label in _KNOWN_CODER_LABELS:
+        if needle.lower() in path.name.lower():
+            return label
+    return path.stem
+
+
+def coder_tool_mode(path: Path, rules: str | None = None) -> str:
+    raw = rules if rules is not None else os.getenv("CODER_TOOL_MODES", DEFAULT_CODER_TOOL_MODES)
+    for rule in raw.split(";"):
+        if "=" not in rule:
+            continue
+        needle, mode = (part.strip() for part in rule.split("=", 1))
+        if needle and needle.lower() in path.name.lower() and mode.lower() in {"native", "fence"}:
+            return mode.lower()
+    return "fence"
+
+
+def match_coder(choice: str | None, ladder: list[LocalModel]) -> LocalModel | None:
+    """The ladder entry a host's choice names: id, file name, or a unique substring of it."""
+    text = (choice or "").strip().lower()
+    if not text:
+        return None
+    for model in ladder:
+        if text in {coder_id(model.path), model.name.lower()}:
+            return model
+    hits = [m for m in ladder if text in m.name.lower()]
+    return hits[0] if len(hits) == 1 else None
+
+
+def order_ladder(ladder: list[LocalModel], choice: str | None) -> list[LocalModel]:
+    """The chosen coder first, the rest of the ladder after it as fallbacks."""
+    chosen = match_coder(choice, ladder)
+    if chosen is None:
+        return list(ladder)
+    return [chosen] + [m for m in ladder if m is not chosen]
+
+
+def coder_catalog() -> list[dict]:
+    """Coders a host can pick from: every CODER_MODELS entry; the first available is the default."""
+    ladder = coder_ladder(available_only=False)
+    default = next((m for m in ladder if m.available), None)
+    return [
+        {
+            "id": coder_id(m.path),
+            "label": coder_label(m.path),
+            "file": m.name,
+            "available": m.available,
+            "tool_mode": coder_tool_mode(m.path),
+            "default": m is default,
+        }
+        for m in ladder
+    ]
+
+
 def any_coder_available() -> bool:
     return bool(coder_ladder(available_only=True))
 
