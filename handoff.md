@@ -226,6 +226,20 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
   `out/rag_github_targeted.jsonl`; the importer reads both). `github_ingest._CODE_EXT` gained
   .gd/.gdshader/.hlsl/.glsl/.vert/.frag/.shader/.asm/.s/.yar/.mk/.cmake (Godot/shader/asm repos gave
   README rows only). tldr pages live under `pages/`, which the ingest does not read yet.
+- **Crawl pipeline run (2026-11-25):** scan 19.4M GitHub rows + 985k doc rows → select 481k rows →
+  split **2,334,278 parts** (2.16 GB, `Mind/rag/topic_build/split/`) → `import --real-mind` builds
+  `Mind/rag/topic_build/crawl_chromadb_staging` (~103 parts/s, ~6.3 h). When it ends:
+  `python tools/crawl/build_topic_corpus.py promote`, then restart the Assistant router (topic
+  collections live in their own store `Mind/assistant/crawl_chromadb`; `SemanticMemory.crawl_store_dir`;
+  the misc docs topic is `crawl_misc`, not the legacy `crawl_docs`). `rag_github.jsonl` → `.zst` (verified,
+  original removed). Crawler state copied from mainserver (`~/crawler/rag-web-crawler/data`) to the PC.
+- **Why php.net etc. delivered nothing (crawler bugs, fixed in rag-web-crawler `518fc87`):** `.php`
+  not in allow_extensions; urllib never inflated the gzip responses the crawler asked for (2,631 of
+  105k cached pages were compressed bytes → garbage rows and no links; `repair_gzip_cache.py` ran on
+  both copies, server backup `data/crawl.sqlite.before-gzip-repair`); global deny `/w/` hid all of
+  cppreference; YAML parsed `- /wiki/Special:` as a mapping (Wikipedia filters never worked); `.264`
+  read as an extension. Next crawl run re-fetches the repaired pages (their old rows get deletes).
+  mainserver is at `518fc87` (via git bundle); GitHub push needs the user's key passphrase.
 - Tests: router 124 pass (new `tests/test_coder_choice_and_cancel.py`, `tests/test_crawl_topics.py`),
   eval tools 81, `tools/crawl/test_cast_chunk.py` 8, extension 12 check scripts (new
   `npm run test:coder-choice`), crawler `test_github_ingest.py` 12.
