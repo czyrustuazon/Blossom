@@ -291,6 +291,39 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
 - Tests: router 114, eval tools 81, extension 12 check scripts (new cases in prompt-tier, session-history,
   live-thinking).
 
+**Fourteenth part (2026-11-26, ~02:20 UTC): targeted crawl unstuck (rag-web-crawler `56f68e6`).**
+- **State before:** after ~18 h the web crawl had 8.3k pages done and 93k pending at ~450 pages/h (one
+  page every ~8 s: delays 2–5 s, sequential). Pending was 56.5k ghidradocs.com (Ghidra javadoc), 11k
+  man7.org, 8.5k ghidra.re (same javadoc again), 6.9k cppreference, 2.9k git-scm. The GitHub part
+  finished: 56 repos, 17,668 rows, 6 failed (`out/rag_github_targeted.jsonl`, 51 MB).
+- **Bug 1, queue order:** `Store.pending()` sorted by depth then URL, so within a depth man7.org and
+  ghidradocs.com came before react.dev, vuejs.org, www.php.net, shellcheck, felixcloutier (each had
+  0–3 pages done). Now: uncached first, then the host with the FEWEST done pages (fair share), then
+  depth, URL. Host computed in SQL (0.55 s per call on the live 100k-row queue vs 0.34 s before).
+- **Bug 2, Unity:** docs.unity3d.com redirects to `docs.unity.com/en-us/engine/6000.6/…` (JS-rendered,
+  almost no links in the HTML, other host), so Unity found 13 URLs. Seeds are now the 6000.6 manual
+  (3,691 pages) + UnityEngine/UnityEditor type pages (1,285) from `docs.unity.com/sitemap/engine/*.xml`
+  (cap `docs.unity.com: 30000`). Each page also exists as clean `.md` (`<url>.md`), but its links drop
+  `/en-us`, so the HTML is crawled.
+- User kept the Ghidra caps at 25k each (asked: 8k + 2k was proposed).
+- **Restart:** mainserver fast-forwarded to `56f68e6` via git bundle; the crawl was stopped (Ctrl-C) and
+  restarted in tmux `ragtargeted-web` from `/tmp/restart_targeted.sh` (no Chromium/apt step); sudo
+  needs the user's password (no passwordless sudo). The pane stays open after exit (`exec bash`).
+  SSH as `zepse@mainserver` (plain `mainserver` maps to the Windows user and is refused).
+- **Targeted GitHub rows imported into the live crawl store** (store backed up first to
+  `Mind/assistant/crawl_chromadb.bak-2026-11-26`; Assistant router stopped during the import, restarted
+  with start-server's env). Batch 1 = the 56 repos (17,668 rows → 78,157 parts, work dir
+  `Mind/rag/topic_build_targeted_gh`, crawl-out `rag-web-crawler/out/targeted_gh`). Batch 2 = 17 more
+  Godot 4 repos (crawler `5d5fa5b`: Pixelorama, beehave, dialogic, dialogue manager, phantom-camera,
+  godot_voxel, godot-cpp, …; 3,957 rows → 21,300 parts, mostly `crawl_gamedev`, work dir `…_gh2`).
+  New collections `crawl_code_gdscript`, `crawl_code_shader`. Store now ~2.41M parts. Godot code
+  classifies into `crawl_gamedev`, not `crawl_code_gdscript`. Run the GitHub ingest on mainserver as
+  `.venv/bin/python -m rag_crawler --config config.targeted.yaml github` (run_linux.sh only skips sudo
+  when `github` is its FIRST argument). Rows of rewritten repos come as delete + upsert pairs.
+- **Not yet measured:** crawl retrieval has been live in the user's router since 2026-11-25 but every
+  eval ran without it (capsule excludes crawl_chromadb). Proposed next: 2 C tasks + crawl on/off A/B,
+  then Qwen3.8 at 128k, then a harder task set (refactor corpus is saturated at 9/9).
+
 **PLAN for 2026-11-25 (agreed with the user):**
 1. Read the final `cand-progress.log` lines (Qwen3.8 fen2/fen3, Devstral rerun, nemo89 control).
    If Nemotron on 0.1.89 stays near 41%, the gain is the model. Propose switching the user's
