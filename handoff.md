@@ -254,6 +254,10 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
 
 **Thirteenth part (2026-11-25 evening): long-chat memory, token counts, context windows. Extension
 0.1.91 → 0.1.95 (installed).**
+- **Status at the end:** committed and signed — Blossom `2a9c283`, Blossom Assistant `2a8f016` (not
+  pushed). `start-server.ps1` was restarted fresh (~20:40): broker, Assistant router :8083 and agent
+  sandbox :8082 run the new code and the new `.env` profiles; the old broker that had blocked :8083 and
+  the test router :8093 were stopped. The user still has to reload VS Code to switch to 0.1.95.
 - **Session-memory eval through the real extension:** `tools/eval/run_session.py` + corpus
   `session-memory/compaction-restore`. Turn 1 agrees on two settings without editing; padding turns run
   until auto compaction writes a chapter; a recall turn; `/compact`; VS Code is closed and the chat is
@@ -278,8 +282,9 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
 - **Context measured** (`tools/measure_ctx.py`, `MEASURE_MODEL`, `--fit 3072`, ~96k-token prompt, all
   ~20.3 GB): Qwen3.8 64k 39.8 tok/s, 128k 31.4, 256k q4 16.0, 256k q8 5.8; Qwen3.6 64k 79.8, 128k 70.5,
   256k q8 63.2. `.env` (not in git): Qwen3.8 `65536|131072:q8|262144:q4`, Qwen3.6 `65536|131072|262144`
-  all q8, `CODER_SESSION_CTX=Qwen3.8=131072` (session budget from the fast window). Broker + routers must
-  be restarted to load them.
+  all q8, `CODER_SESSION_CTX=Qwen3.8=131072` (session budget from the fast window). Loaded by the
+  restart above. The 128k/256k profiles are measured for VRAM and speed only: no refactor or session
+  eval has run on them yet.
 - **Live model-swap test** (broker `/v1/ensure`, 7 swaps): all clean, the old llama-server was always gone,
   VRAM never above one model; Qwen3.6 leaves only ~1.2 GB of 32 GB RAM free (page cache).
 - Gotcha: the broker lease lasts 120 s — long scripts must renew it from a thread.
@@ -460,9 +465,12 @@ vs 11. Restart the test router (and the user's :8083) to load the SemanticMemory
    answers prompts (plan card → Approve), saves `trace.log`, `summary.json`, `score.json`
    and `round-NN.md` (full prompt + router steps + reasoning + reply per round), closes it.
    Read the round files before theorizing.
-3. The user must restart their own ChatRouter (:8083) to get today's router fixes; only the
-   test router (:8093) was restarted. A 9-task real-extension run on 0.1.79 was started at
-   the end of the session (results not recorded here — rerun it).
+   Multi-turn memory: `python tools/eval/run_session.py --task compaction-restore --runs 2
+   --out <dir>` (same router rules). A noEdits turn that changes files makes the run INVALID.
+   Long scripts that hold the broker lease must renew it (120 s TTL).
+3. (2026-11-25) The user's broker and :8083 router run the latest code; there is no test router
+   running. Start one on :8093 from a capsule Mind copy before any eval (see "How to run a cycle";
+   exclude `Mind/assistant/crawl_chromadb` from the copy and point `CRAWL_CHROMA_DIR` at it).
 4. Next levers (all general, measure each with alternating cycles):
    - `dict-to-dataclass` runs out of rounds (13–15) one test short: raise the full-tier
      round cap (replica used 16) and measure.
