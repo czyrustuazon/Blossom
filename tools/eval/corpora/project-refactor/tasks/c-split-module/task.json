@@ -1,0 +1,15 @@
+{
+  "id": "c-split-module",
+  "title": "Split a mixed C utility module into a string module and a math module",
+  "domain": "c",
+  "tags": ["c", "split-module", "headers", "multi-file"],
+  "mode": "agent",
+  "prompt": "src/util.c and src/util.h mix string helpers and math helpers. Split them into two modules: src/strutil.c + src/strutil.h for the string functions and src/mathutil.c + src/mathutil.h for the math functions (UTIL_MAX_SAMPLES goes with math). Keep every function and macro name. Delete util.c and util.h. Every file, including the test driver, should include only the headers it actually uses, and private helpers must stay static and out of the headers. Update the README. Run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-26 so C crawl docs can show a benefit (crawl on/off A/B). Tests build with gcc from PATH. Acceptance builds with -Wmissing-prototypes/-Wmissing-declarations (each .c must include its own header) and checks include lists per file.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

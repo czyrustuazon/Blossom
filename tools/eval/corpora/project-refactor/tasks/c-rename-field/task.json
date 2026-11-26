@@ -1,0 +1,15 @@
+{
+  "id": "c-rename-field",
+  "title": "Rename a struct field across a C library, its tests, README and CSV output",
+  "domain": "c",
+  "tags": ["c", "rename", "multi-file", "struct", "decoy"],
+  "mode": "agent",
+  "prompt": "In this C project, rename the field `qty` of `struct item` to `quantity` everywhere it is used: the struct, every access (->, ., designated initializers, macros, offsetof), the test driver, the README, and the CSV report column (its header and the column name report_field_offset accepts). `struct order_line` also has a `qty` field: that one stays as it is. Do not keep the old name as an alias. Run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-26 so C crawl docs can show a benefit (crawl on/off A/B). Tests build with gcc from PATH (devkitPro msys2 gcc 15 on the eval host). Decoy: struct order_line.qty, mixed with item->qty on the same lines in order.c.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

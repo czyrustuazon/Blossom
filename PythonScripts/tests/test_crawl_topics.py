@@ -101,6 +101,23 @@ def test_crawl_block_keeps_the_legacy_pair_until_the_topic_import_ran():
     assert queried == [ChatRouter.COLLECTION_CRAWL_DOCS, ChatRouter.COLLECTION_CRAWL_CODE]
 
 
+def test_crawl_retrieval_off_queries_nothing(monkeypatch):
+    # The crawl on/off A/B: "off" must also skip the legacy pair, which a router without
+    # topic collections otherwise still queries.
+    queried: list[str] = []
+
+    def fake_query(focus, collection, top_k):
+        queried.append(collection)
+        return [{"text": "hit", "distance": 0.1, "metadata": {}}]
+
+    monkeypatch.setenv("CRAWL_RETRIEVAL", "0")
+    with patch.object(ChatRouter, "existing_collections", lambda surface=None: frozenset({"crawl_docs", "crawl_code_python"})), patch.object(
+        ChatRouter, "query_memories", fake_query
+    ):
+        assert ChatRouter._crawl_reference_block("rename a struct field", ["src/item.c"]) == ("", 0)
+    assert queried == []
+
+
 def test_topic_collections_live_in_the_assistant_store():
     assert SemanticMemory.collection_home("crawl_code_rust") == SemanticMemory.SURFACE_ASSISTANT
     assert SemanticMemory.collection_home("crawl_ffmpeg") == SemanticMemory.SURFACE_ASSISTANT

@@ -320,9 +320,24 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
   classifies into `crawl_gamedev`, not `crawl_code_gdscript`. Run the GitHub ingest on mainserver as
   `.venv/bin/python -m rag_crawler --config config.targeted.yaml github` (run_linux.sh only skips sudo
   when `github` is its FIRST argument). Rows of rewritten repos come as delete + upsert pairs.
-- **Not yet measured:** crawl retrieval has been live in the user's router since 2026-11-25 but every
-  eval ran without it (capsule excludes crawl_chromadb). Proposed next: 2 C tasks + crawl on/off A/B,
-  then Qwen3.8 at 128k, then a harder task set (refactor corpus is saturated at 9/9).
+- **Crawl on/off A/B (started 2026-11-25 22:23, overnight):** corpus now 11 tasks — new
+  `c-rename-field` (struct item.qty → quantity; decoy struct order_line.qty; a blind sed passes the
+  visible tests but fails 3 acceptance checks) and `c-split-module` (util → strutil + mathutil, strict
+  `-Wmissing-prototypes` build, per-file include checks; reference has `_delete.txt`). Tests build with
+  gcc from PATH (devkitPro msys2 gcc 15; build from the project root with relative paths, msys gcc cannot
+  resolve includes next to Windows absolute source paths). Router: `CRAWL_RETRIEVAL=0` disables the crawl
+  block completely (before, "no topic collections" still fell back to the legacy crawl_docs/crawl_code
+  pair, so every earlier eval had legacy crawl retrieval). Queue + results:
+  `C:\Users\Zepse\Documents\Blossom-evals\crawlab-2026-11-26\` (`crawl_ab_queue.ps1`, `progress.log`, one
+  folder per cycle; capsule incl. a crawl store copy; test router :8093; cycles on1, off1, on2, …).
+  Smoke: c-rename-field PASS on crawl-on (24 min, 7 rounds). **Caveat found by probing retrieval:** the C
+  tasks get NO crawl hits (nearest 0.47+ > CRAWL_MAX_DISTANCE 0.45, and the router also searches
+  crawl_code_python because the tests are .py), while 7 of the 9 others get ~3 loosely related snippets
+  from random repos per round (e.g. dict-to-dataclass → an SEO cost tracker). So this A/B measures HARM,
+  not benefit. Probe script: session scratchpad `crawl_probe.py`.
+- **Next after the A/B (user agreed):** an LSP-backed `rename_symbol` tool in the extension
+  (`vscode.executeDocumentRenameProvider`; type-aware, unlike sed), A/B on the rename tasks. Then Qwen3.8
+  at 128k, then a harder task set (corpus saturated at 9/9).
 
 **PLAN for 2026-11-25 (agreed with the user):**
 1. Read the final `cand-progress.log` lines (Qwen3.8 fen2/fen3, Devstral rerun, nemo89 control).

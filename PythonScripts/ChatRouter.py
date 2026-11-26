@@ -1700,7 +1700,10 @@ def _crawl_reference_block(
 
     Per-topic collections (CrawlTopics.py) when they exist: code from the attached files'
     languages, docs/code from topics the ask names. Unmatched topics are never searched.
-    Until the topic import has run, the legacy crawl_docs / crawl_code pair is used."""
+    Until the topic import has run, the legacy crawl_docs / crawl_code pair is used.
+    CRAWL_RETRIEVAL=0 turns all of it off (read per call; the crawl on/off eval A/B)."""
+    if os.getenv("CRAWL_RETRIEVAL", "1").strip().lower() in ("0", "false", "no", "off"):
+        return "", 0
 
     def _stamp_url(hits: list[dict]) -> list[dict]:
         stamped = []
