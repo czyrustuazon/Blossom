@@ -1,0 +1,6 @@
+{
+  "id": "session-memory",
+  "title": "Long-chat memory (compaction + saved-chat restore)",
+  "description": "Multi-turn sessions driven through the real extension by run_session.py. Early turns agree on facts without editing; padding turns push the chat past its session budget so auto compaction folds those turns into the running summary; /compact folds the rest; the window is closed and the chat reopened from .blossom/chats; the last turn must act on the early facts. Passing means the facts survived compaction and restore.",
+  "domains": ["python", "session"]
+}

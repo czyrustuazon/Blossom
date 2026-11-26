@@ -1,0 +1,69 @@
+{
+  "id": "compaction-restore",
+  "title": "Decisions from turn 1 survive auto compaction, /compact and a saved-chat restore",
+  "domain": "python",
+  "tags": ["session", "compaction", "archive", "multi-turn"],
+  "mode": "session",
+  "prompt": "Now implement the two settings changes we agreed on at the very start of this chat. Keep the tests passing.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "settings": {
+    "blossom.agent.sessionHistory": "always",
+    "blossom.agent.sessionHistoryMaxChars": 8000
+  },
+  "steps": [
+    {
+      "id": "decide",
+      "send": "Before we change any code I want us to agree on two settings changes. Do NOT edit any files in this turn. Decision 1: MAX_RETRIES in netclient/config.py becomes 7. Decision 2: USER_AGENT in netclient/config.py becomes \"blossom-probe/2.4\". We'll implement both later in this chat. Reply with a one-line confirmation only.",
+      "newChat": true,
+      "noEdits": true
+    },
+    {
+      "id": "pad",
+      "untilCompacted": [
+        "Don't edit anything. Walk me through netclient/client.py step by step: what fetch() does on success, on a 5xx, on a 4xx and on an OSError, and how the backoff delay grows. Quote the relevant lines.",
+        "Don't edit anything. Review netclient/cache.py for bugs and design problems. For each one, explain what goes wrong with a concrete example and how you would fix it.",
+        "Don't edit anything. Go through tests/test_client.py: say what each test proves, and list the behaviours of Client and ResponseCache that no test covers.",
+        "Don't edit anything. If we later wanted per-host retry limits, how would you change config.py and client.py? Sketch the design and its trade-offs in prose.",
+        "Don't edit anything. How would you add jitter to the backoff in netclient/client.py, and how would you test it deterministically? Explain in prose.",
+        "Don't edit anything. Explain how ResponseCache would behave under concurrent access from several threads, and what you would change to make it safe."
+      ],
+      "_why_extra": "0.1.92+ caps replies to ~15% of the budget in the session pack, so 4 padding turns left the 8k pack at ~6.0k, under the 6.4k trigger (v93s1, 2026-11-25). Padding continues until a chapter exists.",
+      "noEdits": true
+    },
+    {
+      "id": "pad-after",
+      "send": "Don't edit anything. In two short paragraphs, compare retrying with exponential backoff to retrying with a fixed delay for this client.",
+      "noEdits": true
+    },
+    {
+      "id": "pre-compact",
+      "send": "Don't edit anything. In one sentence: which file will the agreed settings changes go into?",
+      "noEdits": true,
+      "_why": "On the 8k budget auto compaction already leaves only the last exchange, so /compact (keeps 2) had nothing to fold in s1 (2026-11-25). This short turn gives it 2 messages to fold and checks recall before the restart."
+    },
+    {
+      "id": "compact",
+      "compact": "keep every settings decision we agreed on, with exact names and values"
+    },
+    { "id": "restart", "restart": true },
+    { "id": "implement", "send": "$prompt" }
+  ],
+  "facts": ["MAX_RETRIES", "7", "blossom-probe/2.4"],
+  "checks": [
+    {
+      "id": "visible_tests",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider tests",
+      "expect_exit": 0,
+      "description": "Project's own tests pass"
+    },
+    {
+      "id": "acceptance",
+      "type": "command",
+      "command": "python -m pytest -q -p no:cacheprovider _acceptance",
+      "expect_exit": 0,
+      "description": "Both turn-1 decisions applied, nothing else changed"
+    }
+  ]
+}

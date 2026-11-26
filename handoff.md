@@ -252,6 +252,40 @@ Assistant and rag-web-crawler (ask before committing). The user's broker (:8085)
   eval tools 81, `tools/crawl/test_cast_chunk.py` 8, extension 12 check scripts (new
   `npm run test:coder-choice`), crawler `test_github_ingest.py` 12.
 
+**Thirteenth part (2026-11-25 evening): long-chat memory, token counts, context windows. Extension
+0.1.91 → 0.1.95 (installed).**
+- **Session-memory eval through the real extension:** `tools/eval/run_session.py` + corpus
+  `session-memory/compaction-restore`. Turn 1 agrees on two settings without editing; padding turns run
+  until auto compaction writes a chapter; a recall turn; `/compact`; VS Code is closed and the chat is
+  reopened from `.blossom/chats`; the last turn must implement the two settings (hidden tests). New debug
+  MCP tools: `blossom_session_state`, `blossom_compact`, `blossom_archives`, `blossom_open_archive`.
+  Results: 0.1.91 the facts survived but the pack overflowed (11.4k / 8k) and the archive lagged; 0.1.93
+  2/2 pass (v93s1 re-scored: auto compaction first fired on the turn after padding). Refactor cycle on
+  0.1.91: 9/9.
+- **Bugs found and fixed:** plan/Approve card on "Do NOT edit" turns — 0.1.92's first fix removed the card
+  but also the answer-only tier, and v92s2 auto-applied config.py; now `isNoEditTurn` → "plan" tier first
+  (`promptTier.ts`). Per-turn session caps scale with the budget (30% user / 15% assistant, summary floor
+  ≤25% of small budgets, recent turns ≤60%). Archive re-saved when a background compaction lands.
+  Auto-scroll no longer snaps back while the user reads (Jump to latest button).
+- **UI:** thinking is one collapsible block per round with foldable rows; long thoughts split at sentence
+  ends, repeated sentences hidden and counted. Header line: real token totals, context vs budget,
+  compaction count (saved in the archive). Coder dropdown shows strengths (`LocalModels._KNOWN_CODER_NOTES`,
+  `CODER_NOTES` override).
+- **Router:** asks llama-server for usage (`stream_options.include_usage`) and sends a `token_usage`
+  thought. Session budget follows the coder window: `/v1/coders` adds `max_ctx` and
+  `session_budget_tokens`; `_local_coder_answer` trims to the loaded window. The fixed 200k budget had let
+  chats on the 64k Qwen coders fill the window before compaction started.
+- **Context measured** (`tools/measure_ctx.py`, `MEASURE_MODEL`, `--fit 3072`, ~96k-token prompt, all
+  ~20.3 GB): Qwen3.8 64k 39.8 tok/s, 128k 31.4, 256k q4 16.0, 256k q8 5.8; Qwen3.6 64k 79.8, 128k 70.5,
+  256k q8 63.2. `.env` (not in git): Qwen3.8 `65536|131072:q8|262144:q4`, Qwen3.6 `65536|131072|262144`
+  all q8, `CODER_SESSION_CTX=Qwen3.8=131072` (session budget from the fast window). Broker + routers must
+  be restarted to load them.
+- **Live model-swap test** (broker `/v1/ensure`, 7 swaps): all clean, the old llama-server was always gone,
+  VRAM never above one model; Qwen3.6 leaves only ~1.2 GB of 32 GB RAM free (page cache).
+- Gotcha: the broker lease lasts 120 s — long scripts must renew it from a thread.
+- Tests: router 114, eval tools 81, extension 12 check scripts (new cases in prompt-tier, session-history,
+  live-thinking).
+
 **PLAN for 2026-11-25 (agreed with the user):**
 1. Read the final `cand-progress.log` lines (Qwen3.8 fen2/fen3, Devstral rerun, nemo89 control).
    If Nemotron on 0.1.89 stays near 41%, the gain is the model. Propose switching the user's

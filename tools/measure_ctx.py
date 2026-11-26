@@ -19,7 +19,13 @@ sys.path.insert(0, str(ROOT / "PythonScripts"))
 from LlamaServerManager import _free_ram_mib, should_disable_mmap  # noqa: E402
 
 EXE = ROOT / "Brains" / "runtime" / "llama-server.exe"
-MODEL = ROOT / "Brains" / "models" / "coding" / "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+# MEASURE_MODEL: a GGUF path, absolute or relative to Brains/models/coding.
+_model_env = os.getenv("MEASURE_MODEL", "").strip()
+MODEL = (
+    (Path(_model_env) if Path(_model_env).is_absolute() else ROOT / "Brains" / "models" / "coding" / _model_env)
+    if _model_env
+    else ROOT / "Brains" / "models" / "coding" / "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+)
 PORT = 11500
 
 
@@ -69,10 +75,11 @@ def main() -> None:
         args += ["--n-cpu-moe", str(n_cpu_moe)]
         if should_disable_mmap(MODEL, n_cpu_moe, _free_ram_mib()):
             args.append("--no-mmap")
-    log = open(ROOT / "Mind" / f"measure-{ctx}-{cache}-{n_cpu_moe}.log", "w", encoding="utf-8")
+    log = open(ROOT / "Mind" / f"measure-{MODEL.stem}-{ctx}-{cache}-{n_cpu_moe}.log", "w", encoding="utf-8")
     t0 = time.time()
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT)
     result: dict = {
+        "model": MODEL.name,
         "ctx": ctx,
         "cache": cache,
         "n_cpu_moe": n_cpu_moe,

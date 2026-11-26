@@ -71,7 +71,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 
-from LlamaServerManager import CODER_CTX, PERSONA_CTX, server_manager
+from LlamaServerManager import (
+    CODER_CTX,
+    PERSONA_CTX,
+    gguf_context_length,
+    profiles_for_model,
+    server_manager,
+)
 from LocalModels import (
     coder_catalog,
     coder_label,
@@ -528,11 +534,40 @@ CODING_VOICE_REWRITE = os.getenv("CODING_VOICE_REWRITE", "false").strip().lower(
 }
 # Share of the largest coder window reserved for the Assistant's session pack
 # (blossom_session). Scales with CODER_CTX_SIZE / CODER_CTX_PROFILES.
+SESSION_CONTEXT_SHARE = float(os.getenv("SESSION_CONTEXT_SHARE", "0.35"))
 SESSION_CONTEXT_BUDGET = max(
     1024,
-    int(os.getenv("SESSION_CONTEXT_TOKENS", "0"))
-    or int(CODER_CTX * float(os.getenv("SESSION_CONTEXT_SHARE", "0.35"))),
+    int(os.getenv("SESSION_CONTEXT_TOKENS", "0")) or int(CODER_CTX * SESSION_CONTEXT_SHARE),
 )
+
+
+def _session_budget_for_ctx(ctx: int) -> int:
+    """Session-pack budget for a coder window: the share of THAT window, never more than
+    SESSION_CONTEXT_BUDGET. The fixed 200k budget let a chat on a 64k coder (Qwen3.8 /
+    Qwen3.6 profiles) fill the window long before the extension compacted (2026-11-25)."""
+    return max(1024, min(SESSION_CONTEXT_BUDGET, int(ctx * SESSION_CONTEXT_SHARE)))
+
+
+def _coder_max_ctx(path: Path) -> int:
+    """Largest window this coder is ever launched with: its biggest profile, capped to the
+    context the GGUF was trained for."""
+    largest = max((p.ctx for p in profiles_for_model(path)), default=CODER_CTX)
+    trained = gguf_context_length(path) if path.is_file() else None
+    return min(largest, trained) if trained else largest
+
+
+def _coder_session_ctx(path: Path, rules: str | None = None) -> int:
+    """Window the session budget is sized from. CODER_SESSION_CTX="needle=ctx;…" caps it below
+    the largest profile when that profile is a slow last resort (Qwen3.8 at 256k needs a q4
+    cache and runs ~16 tok/s), so a long chat stays inside the fast window."""
+    window = _coder_max_ctx(path)
+    raw = rules if rules is not None else os.getenv("CODER_SESSION_CTX", "")
+    for rule in raw.split(";"):
+        needle, _, value = rule.partition("=")
+        needle = needle.strip()
+        if needle and needle.lower() in path.name.lower() and value.strip().isdigit():
+            return min(window, int(value.strip()))
+    return window
 # System prompt, lessons, web, protocol, and the reply.
 CODER_RESERVE_TOKENS = int(os.getenv("CODER_REPLY_RESERVE", "4096")) + int(
     os.getenv("CODER_PROMPT_OVERHEAD", "6144")
@@ -973,6 +1008,23 @@ def _stream_local_chat(
         # 34k tokens / 138k chars with no limit until the run was killed.
         sampling["max_tokens"] = CODER_AGENT_MAX_TOKENS
 
+    # Real token counts from llama-server (stream_options.include_usage), summed over passes
+    # and sent to the client as a token_usage thought for the session token counter.
+    usage_total = {"prompt_tokens": 0, "completion_tokens": 0}
+
+    def note_usage(chunk) -> None:
+        usage = getattr(chunk, "usage", None)
+        if usage is None and isinstance(chunk, dict):
+            usage = chunk.get("usage")
+        if not usage:
+            return
+        for key in usage_total:
+            value = getattr(usage, key, None)
+            if value is None and isinstance(usage, dict):
+                value = usage.get(key)
+            if isinstance(value, int):
+                usage_total[key] += value
+
     def run_pass(pass_messages: list[dict], visible: bool) -> tuple[list[dict], str | None]:
         """One streamed completion. Returns (native tool calls, finish_reason)."""
         _raise_if_cancelled()
@@ -980,6 +1032,7 @@ def _stream_local_chat(
             model=model,
             messages=_fit_messages_to_template(pass_messages),
             stream=True,
+            stream_options={"include_usage": True},
             **sampling,
         )
         splitter = ThinkSplitter()
@@ -996,6 +1049,7 @@ def _stream_local_chat(
                 except Exception:  # noqa: BLE001 — best effort
                     pass
                 raise RequestCancelled()
+            note_usage(chunk)  # the usage chunk comes last, with no choices
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -1099,6 +1153,18 @@ def _stream_local_chat(
             meta["native_calls"] = emitted
     if finish_reason and meta is not None:
         meta["finish_reason"] = finish_reason
+    if usage_total["prompt_tokens"] or usage_total["completion_tokens"]:
+        if meta is not None:
+            meta["usage"] = dict(usage_total)
+        _think(
+            on_progress,
+            "token_usage",
+            f"{usage_total['prompt_tokens']} prompt + {usage_total['completion_tokens']} completion tokens",
+            source=source,
+            label=label,
+            log=False,
+            **usage_total,
+        )
     text = "".join(content_parts)
     if meta is not None:
         meta["raw"] = text  # exactly what on_content received, unstripped
@@ -1719,8 +1785,9 @@ def _local_coder_answer(
         packed_prompt, pack_stats = pack_editor_context_sequential(user_prompt)
         mode_label = "sequential"
     else:
-        session_block, session_tokens = _fit_session_context(session_context)
         live_ctx = server_manager.current_ctx or CODER_CTX
+        session_budget = _session_budget_for_ctx(live_ctx)
+        session_block, session_tokens = _fit_session_context(session_context, session_budget)
         packed_prompt, pack_stats = pack_editor_context(
             user_prompt,
             token_budget=max(
@@ -1734,9 +1801,9 @@ def _local_coder_answer(
                 on_progress,
                 "session_context",
                 f"Session context: ~{session_tokens} tokens "
-                f"(budget {SESSION_CONTEXT_BUDGET}).",
+                f"(budget {session_budget} of a {live_ctx} window).",
                 tokens=session_tokens,
-                budget=SESSION_CONTEXT_BUDGET,
+                budget=session_budget,
             )
     if pack_stats.get("packed") or pack_stats.get("mode") == "sequential":
         if pack_stats.get("mode") == "sequential":
@@ -3038,8 +3105,14 @@ async def list_coders():
     """Coders a host can pick per request with `blossom_coder`, with the tool-call mode each
     one does best in (hosts send OpenAI `tools` only for "native")."""
     loaded = server_manager.current_model if server_manager.current_role == "coder" else None
+    coders = coder_catalog()
+    # Same order as the catalog: each coder's largest window and the session budget that
+    # fits it, so the host compacts in time for the coder the user picked.
+    for entry, model in zip(coders, coder_ladder(available_only=False)):
+        entry["max_ctx"] = _coder_max_ctx(model.path)
+        entry["session_budget_tokens"] = _session_budget_for_ctx(_coder_session_ctx(model.path))
     return {
-        "coders": coder_catalog(),
+        "coders": coders,
         "loaded": loaded.name if loaded else None,
         "loaded_label": coder_label(loaded) if loaded else None,
     }

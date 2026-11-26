@@ -139,6 +139,43 @@ def coder_label(path: Path) -> str:
     return path.stem
 
 
+# What each coder is good at, from the real-extension refactor evals (9 tasks, 2026-11-23..25):
+# (file-name needle, short strength for menus, longer note for tooltips).
+_KNOWN_CODER_NOTES = (
+    ("Qwen3.8-27B", "most accurate · slower",
+     "Best for multi-file refactors and careful changes: 25/27 refactor tasks passed (93%). "
+     "Dense 27B, ~40 tok/s at 64k, ~31 at 128k; 256k only as a slow last resort (~16 tok/s). "
+     "Median ~7 min per task."),
+    ("Qwen3.6-35B-A3B", "fast · good accuracy · best for 256k",
+     "Best for quick edits, questions, fast iteration and very large inputs: 22/27 refactor tasks "
+     "(81%) with native tool calls; keeps ~63 tok/s even at the full 256k window. "
+     "Mixture-of-experts, median ~3 min per task."),
+    ("Nemotron-3.5-Lightning", "long context · least accurate",
+     "Trained for up to 1M tokens (launched at up to 262k here), but weakest at refactors: "
+     "~42% of tasks passed. Qwen3.6 now covers 256k faster and more accurately."),
+    ("Qwen3-Coder-30B-A3B", "fast · weak at refactors",
+     "7/27 refactor tasks passed in the 2026-11-24 A/B; fast but loses track in long agent loops."),
+    ("Devstral-Small-2", "weak at agent loops",
+     "2/9 refactor tasks passed (fence and native)."),
+)
+
+
+def coder_notes(path: Path, rules: str | None = None) -> tuple[str, str]:
+    """(short strength, longer note) for a coder file. CODER_NOTES="needle=short|long;…" wins."""
+    raw = rules if rules is not None else os.getenv("CODER_NOTES", "")
+    for rule in raw.split(";"):
+        if "=" not in rule:
+            continue
+        needle, text = (part.strip() for part in rule.split("=", 1))
+        if needle and needle.lower() in path.name.lower():
+            short, _, long = text.partition("|")
+            return short.strip(), (long.strip() or short.strip())
+    for needle, short, long in _KNOWN_CODER_NOTES:
+        if needle.lower() in path.name.lower():
+            return short, long
+    return "", ""
+
+
 def coder_tool_mode(path: Path, rules: str | None = None) -> str:
     raw = rules if rules is not None else os.getenv("CODER_TOOL_MODES", DEFAULT_CODER_TOOL_MODES)
     for rule in raw.split(";"):
@@ -174,17 +211,22 @@ def coder_catalog() -> list[dict]:
     """Coders a host can pick from: every CODER_MODELS entry; the first available is the default."""
     ladder = coder_ladder(available_only=False)
     default = next((m for m in ladder if m.available), None)
-    return [
-        {
-            "id": coder_id(m.path),
-            "label": coder_label(m.path),
-            "file": m.name,
-            "available": m.available,
-            "tool_mode": coder_tool_mode(m.path),
-            "default": m is default,
-        }
-        for m in ladder
-    ]
+    out = []
+    for m in ladder:
+        strength, note = coder_notes(m.path)
+        out.append(
+            {
+                "id": coder_id(m.path),
+                "label": coder_label(m.path),
+                "file": m.name,
+                "available": m.available,
+                "tool_mode": coder_tool_mode(m.path),
+                "default": m is default,
+                "strength": strength,
+                "note": note,
+            }
+        )
+    return out
 
 
 def any_coder_available() -> bool:

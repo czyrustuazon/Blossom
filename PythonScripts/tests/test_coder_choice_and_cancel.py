@@ -24,6 +24,7 @@ import ChatRouter  # noqa: E402
 from LocalModels import (  # noqa: E402
     LocalModel,
     coder_label,
+    coder_notes,
     coder_tool_mode,
     match_coder,
     order_ladder,
@@ -49,6 +50,45 @@ def test_tool_modes_follow_the_eval_results():
 def test_labels():
     assert coder_label(Q38.path) == "Qwen3.8 27B"
     assert coder_label(NEMO.path) == "Nemotron 3.5 Lightning 30B"
+
+
+def test_notes_say_what_each_coder_is_good_at():
+    assert coder_notes(Q38.path, rules="")[0] == "most accurate · slower"
+    assert coder_notes(Q36.path, rules="")[0] == "fast · good accuracy · best for 256k"
+    assert "long context" in coder_notes(NEMO.path, rules="")[0]
+    assert "93%" in coder_notes(Q38.path, rules="")[1]
+    assert coder_notes(Path("Other.gguf"), rules="") == ("", "")
+    # CODER_NOTES overrides: "needle=short|long"; short alone doubles as the note.
+    assert coder_notes(Q38.path, rules="Qwen3.8=my pick|Why I use it") == ("my pick", "Why I use it")
+    assert coder_notes(NEMO.path, rules="Nemotron=logs only") == ("logs only", "logs only")
+
+
+def test_session_budget_follows_the_coder_window():
+    """A 64k coder gets a 64k-sized session budget, not the fixed 200k one."""
+    share = ChatRouter.SESSION_CONTEXT_SHARE
+    cap = ChatRouter.SESSION_CONTEXT_BUDGET
+    assert ChatRouter._session_budget_for_ctx(65536) == min(cap, int(65536 * share))
+    assert ChatRouter._session_budget_for_ctx(65536) < 65536 // 2
+    assert ChatRouter._session_budget_for_ctx(10_000_000) == cap
+    assert ChatRouter._session_budget_for_ctx(1000) == 1024
+
+
+def test_coder_max_ctx_is_the_largest_profile():
+    with patch.object(ChatRouter, "profiles_for_model",
+                      lambda _p: [SimpleNamespace(ctx=65536), SimpleNamespace(ctx=262144)]):
+        assert ChatRouter._coder_max_ctx(Path("C:/nowhere/x.gguf")) == 262144
+    with patch.object(ChatRouter, "profiles_for_model", lambda _p: [SimpleNamespace(ctx=65536)]):
+        assert ChatRouter._coder_max_ctx(Path("C:/nowhere/x.gguf")) == 65536
+
+
+def test_session_ctx_can_stay_below_a_slow_largest_profile():
+    with patch.object(ChatRouter, "profiles_for_model",
+                      lambda _p: [SimpleNamespace(ctx=65536), SimpleNamespace(ctx=262144)]):
+        path = Path("C:/nowhere/Qwen3.8-27B-UD-Q4_K_M.gguf")
+        assert ChatRouter._coder_session_ctx(path, rules="Qwen3.8=131072") == 131072
+        assert ChatRouter._coder_session_ctx(path, rules="Nemotron=65536") == 262144
+        assert ChatRouter._coder_session_ctx(path, rules="Qwen3.8=999999") == 262144  # never above max
+        assert ChatRouter._coder_session_ctx(path, rules="") == 262144
 
 
 def test_choice_by_id_file_or_unique_substring():
@@ -133,6 +173,44 @@ def test_no_cancel_event_streams_normally():
             [{"role": "user", "content": "hi"}], model="m", temperature=0.6
         )
     assert out.strip() == "tok tok tok"
+
+
+def test_stream_asks_for_usage_and_reports_it_as_a_thought():
+    """llama-server's final usage chunk (no choices) becomes one token_usage thought."""
+    seen_kwargs: dict = {}
+
+    def chunks():
+        delta = SimpleNamespace(content="ok", reasoning_content=None, tool_calls=None)
+        yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason="stop")], usage=None)
+        yield SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=1200, completion_tokens=345))
+
+    def create(**kw):
+        seen_kwargs.update(kw)
+        return chunks()
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    events: list[dict] = []
+    meta: dict = {}
+    with patch.object(ChatRouter, "LOCAL_CLIENT", client):
+        out = ChatRouter._stream_local_chat(
+            [{"role": "user", "content": "hi"}], model="m", temperature=0.6,
+            on_progress=events.append, meta=meta,
+        )
+    assert out.strip() == "ok"
+    assert seen_kwargs["stream_options"] == {"include_usage": True}
+    usage = [e for e in events if e["step"] == "token_usage"]
+    assert len(usage) == 1
+    assert usage[0]["prompt_tokens"] == 1200 and usage[0]["completion_tokens"] == 345
+    assert meta["usage"] == {"prompt_tokens": 1200, "completion_tokens": 345}
+
+
+def test_stream_without_usage_sends_no_token_thought():
+    events: list[dict] = []
+    with patch.object(ChatRouter, "LOCAL_CLIENT", _client_returning(_Stream(2))):
+        ChatRouter._stream_local_chat(
+            [{"role": "user", "content": "hi"}], model="m", temperature=0.6, on_progress=events.append
+        )
+    assert not [e for e in events if e["step"] == "token_usage"]
 
 
 def test_waiting_request_says_so_and_skips_work_if_its_client_left():
