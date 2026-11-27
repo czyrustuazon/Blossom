@@ -1,0 +1,15 @@
+{
+  "id": "godot4-port-ui",
+  "title": "Port a Godot 3.5 HUD and settings autoload (scripts, scene, project file) to Godot 4.3",
+  "domain": "godot",
+  "tags": ["gdscript", "godot", "godot4", "migration", "ui", "knowledge"],
+  "mode": "agent",
+  "prompt": "This Godot 3.5 project holds the HUD and the settings autoload we reuse across our games. Port it to Godot 4.3: the scripts, scenes/HUD.tscn and project.godot, so it opens in Godot 4.3 with no errors or deprecated APIs left. Keep the behaviour: the HUD script still runs in the editor, lives stays a 0..10 inspector value with its setter, the score label still pops (scale 1.4 back to 1 over 0.25 s, back-out easing), each difficulty button still reports its index, the settings stay JSON in user://settings.json with volume snapped to 0.05, and the label layout and sizes stay the same. Update the README. There is no Godot on this machine; tests/ only runs static checks of the project files.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus). Crawl coverage: crawl_gamedev has godot-demo-projects 2d/tween (nearest ~0.30) and GDQuest UI code. Graded statically (no Godot binary): @tool, @export_range, property setters instead of setget, PackedStringArray, Engine.is_editor_hint(), signal.connect + Callable.bind, Tween node -> create_tween().tween_property, await, is_empty, FileAccess, JSON.parse_string/stringify, snapped, DisplayServer.window_set_mode, linear_to_db, .tscn margin_* -> offset_*, rect_min_size -> custom_minimum_size, align -> horizontal_alignment, Tween node removed from the scene, config_version=5.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

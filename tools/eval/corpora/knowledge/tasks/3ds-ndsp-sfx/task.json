@@ -1,0 +1,15 @@
+{
+  "id": "3ds-ndsp-sfx",
+  "title": "Implement 3DS sound effects with NDSP from romfs PCM files",
+  "domain": "3ds",
+  "tags": ["c", "3ds", "libctru", "ndsp", "audio", "knowledge"],
+  "mode": "agent",
+  "prompt": "Implement src/sound.c (interface in src/sound.h) for this Nintendo 3DS app with libctru's NDSP. The effects are romfs:/sfx/bounce.pcm and romfs:/sfx/score.pcm: raw signed 16-bit mono PCM at 22050 Hz. Load them in sound_init. The two effects must be able to play at the same time, and playing an effect that is still playing restarts it from the beginning. If NDSP cannot start (the user has not dumped the DSP firmware to sdmc:/3ds/dspfirm.cdc), sound_init returns false and the app keeps running muted, with sound_play and sound_exit doing nothing harmful. sound_exit releases everything. Document the firmware requirement in the README. tests/ builds the app with devkitARM; run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus). Crawl coverage: crawl_3ds has libctru ndsp.h/channel.h/romfs.h and 3ds-examples audio (nearest ~0.31). Acceptance runs sound.c on the host against a recording mock of the libctru NDSP/linear/DSP-cache/romfs API (real libctru headers for the types; fopen/fclose are macro-redirected so romfs:/ maps to the project's romfs/). Traps: linearAlloc (DSP cannot read heap memory), DSP_FlushDataCache, nsamples = bytes/2, channel rate/format, ndspChnWaveBufAdd silently ignores a buffer that is still queued (restart needs ndspChnWaveBufClear), separate channels, no ndspExit after a failed ndspInit. A sound.c that calls libctru functions outside NDSP/linear/romfs/stdio fails the host build (false negative risk).",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

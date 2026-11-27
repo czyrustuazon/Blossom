@@ -1,0 +1,15 @@
+{
+  "id": "git-contributors",
+  "title": "Release-notes contributor list from git: co-author trailers, mailmap, ranges",
+  "domain": "git",
+  "tags": ["bash", "git", "trailers", "mailmap", "knowledge", "weak-crawl-control"],
+  "mode": "agent",
+  "prompt": "Rewrite tools/contributors.sh (bash) to list the people to thank for a revision range: the first argument, default HEAD. Print one line per person, `<commits><TAB><Name> <email>`, sorted by commit count (highest first) and then by name. A commit credits its author and everyone named in its Co-authored-by: trailers, each person once per commit. Apply the repository's .mailmap to authors and co-authors alike, treat emails case-insensitively (print them in lowercase; when the names differ, use the name from the newest commit), and skip merge commits. It must also work when run from a subdirectory of the repository. Document the script in the README. Run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus) as the weak-crawl control: crawl_code_bash only has loosely related release scripts (nearest ~0.36) and no git-scm docs yet. Traps: %aN/%aE (mailmap), %(trailers:key=Co-authored-by,valueonly) instead of grepping the message (a 'Co-authored-by:' mid-body line is not a trailer), case-insensitive trailer key, git check-mailmap for co-authors, --no-merges (the merge carries a trailer), once per commit, range argument. Runs with msys2 bash + git from C:\\devkitPro.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

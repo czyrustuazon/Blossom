@@ -1,0 +1,15 @@
+{
+  "id": "3ds-citro2d-port",
+  "title": "Port a 3DS game's CPU framebuffer drawing and console to citro2d",
+  "domain": "3ds",
+  "tags": ["c", "3ds", "libctru", "citro2d", "citro3d", "knowledge"],
+  "mode": "agent",
+  "prompt": "This Nintendo 3DS Pong game (libctru, devkitARM) draws the top screen by writing pixels into the framebuffer on the CPU and shows the controls on the bottom screen with the libctru console. Port the drawing to citro2d so the GPU does it: on the top screen the same net, paddles and ball as solid rectangles and the score as system-font text such as \"3 - 2\" centred near the top; on the bottom screen the line \"START: quit  D-Pad/ABXY: move\" as citro2d text instead of the console. No CPU framebuffer access, console or manual buffer swapping may remain. Keep src/game.c and src/game.h untouched and keep the render.h interface. Free everything you create when the game exits. Update the README. tests/ builds the game with devkitARM; run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus). Crawl coverage: crawl_3ds has devkitPro/3ds-examples and libctru/citro2d sources (nearest ~0.29-0.31). Needs devkitARM + libctru + citro2d in C:\\devkitPro (DEVKITPRO_WIN) and host gcc. Traps: C3D_Init/C2D_Init/C2D_Prepare, C3D_FrameBegin/End instead of gfxSwapBuffers, C2D_SceneBegin per target, text buffer must be cleared when re-parsed each frame, C2D_Fini before C3D_Fini. Acceptance reads undefined symbols of the devkitARM objects (C2D_DrawRectSolid -> C2D_DrawRectangle, C2D_SceneBegin -> C3D_FrameDrawOn).",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

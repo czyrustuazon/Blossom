@@ -1,0 +1,6 @@
+{
+  "id": "knowledge",
+  "title": "Knowledge-heavy tasks (agent loop)",
+  "description": "Tasks that need API knowledge the coder is weak on and the crawl store covers (libctru/citro2d/NDSP, Godot 4, Ghidra scripting), plus one git task as a weak-crawl control. Built for the crawl retrieval on/off A/B: the project-refactor corpus can only show crawl harm, this one can show benefit. Each task ships a project plus hidden acceptance tests graded with the real toolchain where this PC has it (devkitARM, Ghidra 12.1.2 headless, git + msys bash).",
+  "domains": ["3ds", "godot", "reverse-engineering", "git"]
+}

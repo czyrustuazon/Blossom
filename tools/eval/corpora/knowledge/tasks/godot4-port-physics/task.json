@@ -1,0 +1,15 @@
+{
+  "id": "godot4-port-physics",
+  "title": "Port a Godot 3.5 platformer (scripts, scenes, project file) to Godot 4.3",
+  "domain": "godot",
+  "tags": ["gdscript", "godot", "godot4", "migration", "knowledge"],
+  "mode": "agent",
+  "prompt": "This is a small Godot 3.5 game. Port it to Godot 4.3: the scripts, the scenes and project.godot, so it opens in Godot 4.3 and plays the same with no errors or deprecated APIs left. Keep every tuning value (speeds, jump velocity, gravity and its 0..2000 editor range, timer durations, spawn offsets) and keep the gameplay as it is. Update the README. There is no Godot on this machine; tests/ only runs static checks of the project files.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus). Crawl coverage: crawl_gamedev has GDQuest + godot-demo-projects Godot 4 code (nearest ~0.35-0.38), crawl_code_gdscript sparse. Graded statically (no Godot binary): @export/@export_range/@onready, CharacterBody2D with built-in velocity (an own `var velocity` is an error in 4), move_and_slide(), get_slide_collision_count/get_collider, await ... .timeout, signal.connect(callable), instantiate(), deg_to_rad/randf_range, Time.get_ticks_msec, Godot 4 node types in .tscn, config_version=5, $paths match scene node names. Upgrade: run `godot --headless --check-only` once Godot 4 is installed.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}

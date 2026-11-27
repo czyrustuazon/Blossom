@@ -1,0 +1,15 @@
+{
+  "id": "ghidra-callsite-report",
+  "title": "Write a headless Ghidra script that reports call sites of named functions",
+  "domain": "reverse-engineering",
+  "tags": ["ghidra", "java", "headless", "xrefs", "knowledge"],
+  "mode": "agent",
+  "prompt": "Add ghidra_scripts/CallSiteReport.java, a Ghidra script we run headless as `-postScript CallSiteReport.java <out.json> <name> [<name> ...]`. It writes a JSON object to <out.json> with one key per name; each value is the list of call sites of that function, as objects {\"caller\": <name of the function containing the call>, \"address\": <address of the call instruction as Ghidra prints it>}, sorted by address. Count only real calls: a function whose address is only stored in a table or pointer is not called there. A name can also be an imported library function such as getenv; then report the calls into it through the import thunk. A name that is not in the program maps to an empty list. Add a line about it to the README. tests/test_callsite_report.py runs it headless on samples/login.c; run the tests when you are done.",
+  "project_dir": "project",
+  "hidden_dir": "hidden",
+  "notes": "Added 2026-11-27 for the crawl on/off A/B (knowledge corpus). Crawl coverage: crawl_re has ghidra-mcp / GhidraMCP scripts (nearest ~0.31). Needs Ghidra 12.1.2 (GHIDRA_INSTALL_DIR) + msys gcc/objdump on PATH. Traps: getScriptArgs, RefType.isCall vs the pointer table's data refs, import thunks (thunk function named like the import), sorting, a space in the output path. Acceptance compares with objdump's direct call list.",
+  "checks": [
+    {"id": "visible_tests", "type": "command", "command": "python -m pytest -q -p no:cacheprovider tests", "expect_exit": 0, "description": "Project's own tests pass"},
+    {"id": "acceptance", "type": "command", "command": "python -m pytest -q -p no:cacheprovider _acceptance", "expect_exit": 0, "description": "Hidden acceptance tests pass"}
+  ]
+}
